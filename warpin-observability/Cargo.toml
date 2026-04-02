@@ -1,0 +1,12 @@
+[package]
+name = "warpin-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tracing and observability setup for the Warpin framework"
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true

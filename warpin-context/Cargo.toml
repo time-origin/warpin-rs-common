@@ -1,0 +1,12 @@
+[package]
+name = "warpin-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Request context and state management for the Warpin framework"
+
+[dependencies]
+warpin-types.workspace = true
+serde.workspace = true

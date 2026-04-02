@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "warpin-types",
+    "warpin-errors",
+    "warpin-config",
+    "warpin-http",
+    "warpin-grpc",
+    "warpin-auth",
+    "warpin-context",
+    "warpin-observability",
+    "warpin-storage",
+    "warpin-event-bus",
+    "warpin-capability",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.2.0"
+license = "MIT"
+authors = ["Warpin Engineering <dev@warpin.io>"]
+repository = "https://github.com/warpin/warpin-rs"
+
+[workspace.dependencies]
+# ── 异步运行时 ──
+tokio = { version = "1.50.0", features = ["full"] }
+futures = "0.3.32"
+async-trait = "0.1.89"
+
+# ── HTTP / Web ──
+axum = "0.8.8"
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["trace", "cors", "fs"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
+
+# ── gRPC ──
+tonic = "0.14.5"
+
+# ── 序列化 ──
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# ── 错误处理 ──
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+
+# ── 可观测性 ──
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+# ── 数据库 ──
+sea-orm = { version = "2.0.0-rc.36", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+
+# ── API 文档 ──
+utoipa = { version = "5.4", features = ["axum_extras", "chrono", "uuid"] }
+
+# ── 基础类型 ──
+uuid = { version = "1.22.0", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+bytes = "1"
+
+# ── 消息队列 ──
+rdkafka = { version = "0.39.0", features = ["tokio"] }
+
+# ── 配置 ──
+config = "0.15.19"
+
+# ── Workspace 内部互依赖 ──
+warpin-types  = { path = "warpin-types",  version = "0.2.0" }
+warpin-errors = { path = "warpin-errors", version = "0.2.0" }
+warpin-config = { path = "warpin-config", version = "0.2.0" }

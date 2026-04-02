@@ -1,0 +1,17 @@
+[package]
+name = "warpin-event-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generic async event bus abstraction with Kafka and no-op backends"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+rdkafka.workspace = true

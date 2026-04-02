@@ -1,0 +1,13 @@
+[package]
+name = "warpin-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Capability registry, policy evaluation, and capability descriptor primitives"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
