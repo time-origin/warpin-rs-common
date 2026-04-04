@@ -62,6 +62,9 @@ bytes = "1"
 # ── 消息队列 ──
 rdkafka = { version = "0.39.0", features = ["tokio"] }
 
+# ── JWT ──
+jsonwebtoken = "9.3"
+
 # ── 配置 ──
 config = "0.15.19"
 
