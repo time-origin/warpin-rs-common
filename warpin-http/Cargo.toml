@@ -10,10 +10,13 @@ description = "HTTP server, router, and middleware for the Warpin framework"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
@@ -22,3 +25,4 @@ warpin-errors.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

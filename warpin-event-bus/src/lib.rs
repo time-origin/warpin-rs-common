@@ -99,6 +99,13 @@ pub trait EventBus: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct NoOpEventBus;
 
+impl NoOpEventBus {
+    /// Create a new no-op event bus.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait]
 impl EventBus for NoOpEventBus {
     async fn publish(&self, event: BusEvent) -> Result<()> {
@@ -183,6 +190,11 @@ impl KafkaEventBus {
             producer,
             queue_timeout: Duration::from_millis(config.producer_timeout_ms),
         })
+    }
+
+    /// Access the underlying rdkafka `FutureProducer`.
+    pub(crate) fn producer(&self) -> &FutureProducer {
+        &self.producer
     }
 
     pub fn with_broker(broker_url: impl Into<String>) -> Result<Self> {
@@ -586,6 +598,222 @@ impl EventConsumerImpl {
 }
 
 // ---------------------------------------------------------------------------
+// TypedEnvelope — schema-versioned event envelope
+// ---------------------------------------------------------------------------
+
+/// A typed, schema-versioned event envelope that wraps a serializable payload.
+///
+/// `TypedEnvelope` provides schema evolution support by including a `schema_version`
+/// field. Consumers can use this to handle backward-compatible changes.
+///
+/// # Schema Evolution Strategy
+/// - Producers increment `schema_version` when adding new fields
+/// - Consumers must handle unknown `schema_version` gracefully (log warning, process known fields)
+/// - Fields are additive-only (never remove or rename)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedEnvelope<T: Serialize> {
+    /// Unique event identifier (UUID v4)
+    pub event_id: String,
+    /// Kafka partition key (typically trace_id or tenant_id)
+    pub partition_key: String,
+    /// The event payload
+    pub payload: T,
+    /// ISO 8601 timestamp when the event was produced
+    pub produced_at: String,
+    /// Schema version for evolution support (starts at 1)
+    pub schema_version: u32,
+}
+
+impl<T: Serialize> TypedEnvelope<T> {
+    /// Create a new TypedEnvelope with the current timestamp.
+    pub fn new(event_id: String, partition_key: String, payload: T, schema_version: u32) -> Self {
+        Self {
+            event_id,
+            partition_key,
+            payload,
+            produced_at: chrono::Utc::now().to_rfc3339(),
+            schema_version,
+        }
+    }
+
+    /// Convert this typed envelope into a BusEvent for publishing.
+    ///
+    /// The entire envelope (including metadata) is serialized to JSON and placed
+    /// in `payload_json`. The `topic` and `tenant_id` must be provided by the
+    /// caller.
+    pub fn into_bus_event(self, topic: &str, tenant_id: &str) -> Result<BusEvent> {
+        let payload_json = serde_json::to_string(&self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize TypedEnvelope: {e}"))?;
+
+        Ok(BusEvent {
+            topic: topic.to_string(),
+            trace_id: self.partition_key,
+            tenant_id: tenant_id.to_string(),
+            payload_json,
+            produced_at: self.produced_at,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BatchPublisher — best-effort batch publishing
+// ---------------------------------------------------------------------------
+
+/// Result of a batch publish operation.
+#[derive(Debug, Clone)]
+pub struct BatchResult {
+    /// Number of successfully published events
+    pub succeeded: usize,
+    /// Failed events with their errors
+    pub failures: Vec<BatchFailure>,
+}
+
+/// A single failure within a batch publish.
+#[derive(Debug, Clone)]
+pub struct BatchFailure {
+    /// Index of the failed event in the original batch
+    pub index: usize,
+    /// Error description
+    pub error: String,
+}
+
+impl BatchResult {
+    /// Returns true if all events were published successfully.
+    pub fn all_succeeded(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Total number of events in the batch.
+    pub fn total(&self) -> usize {
+        self.succeeded + self.failures.len()
+    }
+}
+
+/// Trait for publishing a batch of events with per-event failure reporting.
+///
+/// Implementations should attempt to publish all events and report
+/// individual failures without aborting the entire batch.
+#[async_trait]
+pub trait BatchPublisher: Send + Sync {
+    /// Publish a batch of events. Returns a result indicating success/failure per event.
+    async fn publish_batch(&self, events: Vec<BusEvent>) -> Result<BatchResult>;
+}
+
+#[async_trait]
+impl BatchPublisher for KafkaEventBus {
+    async fn publish_batch(&self, events: Vec<BusEvent>) -> Result<BatchResult> {
+        use futures::future::join_all;
+
+        if events.is_empty() {
+            return Ok(BatchResult {
+                succeeded: 0,
+                failures: vec![],
+            });
+        }
+
+        // Pre-filter: reject events with empty tenant_id
+        let mut failures = Vec::new();
+        let valid_events: Vec<(usize, &BusEvent)> = events
+            .iter()
+            .enumerate()
+            .filter(|(idx, event)| {
+                if event.tenant_id.is_empty() {
+                    failures.push(BatchFailure {
+                        index: *idx,
+                        error: "tenant_id must not be empty".to_string(),
+                    });
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        let futures: Vec<_> = valid_events
+            .iter()
+            .map(|(idx, event)| {
+                let idx = *idx;
+                let producer = self.producer().clone();
+                let topic = event.topic.clone();
+                let key = event.trace_id.clone();
+                let payload = event.payload_json.clone();
+                async move {
+                    let record = FutureRecord::to(&topic)
+                        .key(&key)
+                        .payload(&payload);
+                    match producer
+                        .send(record, Timeout::After(Duration::from_secs(5)))
+                        .await
+                    {
+                        Ok(_) => Ok(idx),
+                        Err((e, _)) => Err((idx, format!("{e}"))),
+                    }
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let mut succeeded = 0;
+        for result in results {
+            match result {
+                Ok(_) => succeeded += 1,
+                Err((index, error)) => failures.push(BatchFailure { index, error }),
+            }
+        }
+
+        Ok(BatchResult {
+            succeeded,
+            failures,
+        })
+    }
+}
+
+#[async_trait]
+impl BatchPublisher for NoOpEventBus {
+    async fn publish_batch(&self, events: Vec<BusEvent>) -> Result<BatchResult> {
+        let count = events.len();
+        for event in &events {
+            tracing::debug!(
+                topic = %event.topic,
+                trace_id = %event.trace_id,
+                "NoOp batch publish"
+            );
+        }
+        Ok(BatchResult {
+            succeeded: count,
+            failures: vec![],
+        })
+    }
+}
+
+#[async_trait]
+impl BatchPublisher for EventBusImpl {
+    async fn publish_batch(&self, events: Vec<BusEvent>) -> Result<BatchResult> {
+        match self {
+            EventBusImpl::NoOp(bus) => bus.publish_batch(events).await,
+            EventBusImpl::Kafka(bus) => bus.publish_batch(events).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommitStrategy — consumer offset commit strategy
+// ---------------------------------------------------------------------------
+
+/// Strategy for committing consumer offsets.
+#[derive(Debug, Clone, Default)]
+pub enum CommitStrategy {
+    /// Let rdkafka auto-commit offsets periodically.
+    #[default]
+    AutoCommit,
+    /// Manually commit synchronously after processing.
+    ManualSync,
+    /// Manually commit asynchronously after processing.
+    ManualAsync,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -702,5 +930,105 @@ mod tests {
         let debug = format!("{msg:?}");
         assert!(debug.contains("test.topic"));
         assert!(debug.contains("trace-1"));
+    }
+
+    // ── TypedEnvelope tests ──────────────────────────────────
+
+    #[test]
+    fn test_typed_envelope_serialization() {
+        let envelope = TypedEnvelope::new(
+            "evt-123".into(),
+            "trace-456".into(),
+            serde_json::json!({"key": "value"}),
+            1,
+        );
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("schema_version"));
+        assert!(json.contains("evt-123"));
+    }
+
+    #[test]
+    fn test_typed_envelope_into_bus_event() {
+        let envelope = TypedEnvelope::new(
+            "evt-123".into(),
+            "trace-456".into(),
+            serde_json::json!({"key": "value"}),
+            1,
+        );
+        let bus_event = envelope.into_bus_event("test.topic", "tenant-1").unwrap();
+        assert_eq!(bus_event.topic, "test.topic");
+        assert_eq!(bus_event.tenant_id, "tenant-1");
+        assert_eq!(bus_event.trace_id, "trace-456");
+    }
+
+    // ── BatchPublisher tests ─────────────────────────────────
+
+    #[test]
+    fn test_batch_result_all_succeeded() {
+        let result = BatchResult {
+            succeeded: 5,
+            failures: vec![],
+        };
+        assert!(result.all_succeeded());
+        assert_eq!(result.total(), 5);
+    }
+
+    #[test]
+    fn test_batch_result_with_failures() {
+        let result = BatchResult {
+            succeeded: 3,
+            failures: vec![
+                BatchFailure {
+                    index: 1,
+                    error: "timeout".into(),
+                },
+                BatchFailure {
+                    index: 3,
+                    error: "full".into(),
+                },
+            ],
+        };
+        assert!(!result.all_succeeded());
+        assert_eq!(result.total(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_noop_batch_publisher() {
+        let bus = NoOpEventBus::new();
+        let events = vec![
+            BusEvent {
+                topic: "test".into(),
+                trace_id: "t1".into(),
+                tenant_id: "tenant".into(),
+                payload_json: "{}".into(),
+                produced_at: "2026-01-01T00:00:00Z".into(),
+            },
+            BusEvent {
+                topic: "test".into(),
+                trace_id: "t2".into(),
+                tenant_id: "tenant".into(),
+                payload_json: "{}".into(),
+                produced_at: "2026-01-01T00:00:00Z".into(),
+            },
+        ];
+        let result = bus.publish_batch(events).await.unwrap();
+        assert!(result.all_succeeded());
+        assert_eq!(result.succeeded, 2);
+    }
+
+    #[tokio::test]
+    async fn test_noop_batch_publisher_empty() {
+        let bus = EventBusImpl::NoOp(NoOpEventBus::new());
+        let result = bus.publish_batch(vec![]).await.unwrap();
+        assert!(result.all_succeeded());
+        assert_eq!(result.total(), 0);
+    }
+
+    // ── CommitStrategy tests ─────────────────────────────────
+
+    #[test]
+    fn test_commit_strategy_default() {
+        let strategy: CommitStrategy = Default::default();
+        assert!(matches!(strategy, CommitStrategy::AutoCommit));
     }
 }

@@ -1,4 +1,7 @@
+pub mod adapter;
 pub mod apidoc;
+pub mod client;
+pub mod endpoint;
 mod headers;
 mod middleware;
 mod response;
@@ -17,3 +20,8 @@ pub use router::{
     build_http_app_with_root,
 };
 pub use server::serve;
+
+// ── Model endpoint abstraction ──────────────────────────────────────
+pub use adapter::{ApiAdapter, OpenAICompatibleAdapter};
+pub use client::EndpointClient;
+pub use endpoint::{ResolvedEndpoint, build_auth_headers};
