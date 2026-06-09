@@ -23,11 +23,11 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    FromQueryResult, Schema, Statement,
-};
 use sea_orm::sea_query::Table;
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult, Schema,
+    Statement,
+};
 use serde::Serialize;
 use std::marker::PhantomData;
 use tracing::info;
@@ -122,12 +122,7 @@ where
 
     db.execute(&create_stmt)
         .await
-        .with_context(|| {
-            format!(
-                "failed to create table '{}'",
-                E::default().table_name()
-            )
-        })?;
+        .with_context(|| format!("failed to create table '{}'", E::default().table_name()))?;
 
     Ok(())
 }
@@ -162,14 +157,12 @@ where
             .add_column(&mut alter_col_def)
             .to_owned();
 
-        db.execute(&alter_stmt)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to add column '{}' to table '{}'",
-                    col_name, table_name
-                )
-            })?;
+        db.execute(&alter_stmt).await.with_context(|| {
+            format!(
+                "failed to add column '{}' to table '{}'",
+                col_name, table_name
+            )
+        })?;
 
         added.push(col_name);
     }
@@ -304,10 +297,7 @@ impl SchemaPlan {
 /// columns as needed. Operations are **additive only** — nothing is ever dropped.
 ///
 /// Returns a [`SchemaSyncReport`] summarizing what was done.
-pub async fn sync_schema(
-    db: &DatabaseConnection,
-    plan: &SchemaPlan,
-) -> Result<SchemaSyncReport> {
+pub async fn sync_schema(db: &DatabaseConnection, plan: &SchemaPlan) -> Result<SchemaSyncReport> {
     let mut report = SchemaSyncReport {
         entities_registered: plan.len(),
         ..Default::default()

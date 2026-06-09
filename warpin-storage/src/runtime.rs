@@ -3,9 +3,7 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::{
-    DatabaseSettings, SchemaPlan, SchemaSyncReport, connect, health_check, sync_schema,
-};
+use crate::{DatabaseSettings, SchemaPlan, SchemaSyncReport, connect, health_check, sync_schema};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DatabaseBootstrapOptions {

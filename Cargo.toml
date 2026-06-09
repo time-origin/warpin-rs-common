@@ -12,6 +12,7 @@ members = [
     "warpin-storage",
     "warpin-event-bus",
     "warpin-capability",
+    "warpin-dingtalk",
 ]
 
 [workspace.package]
@@ -69,3 +70,4 @@ config = "0.15.19"
 warpin-types  = { path = "warpin-types",  version = "0.2.0" }
 warpin-errors = { path = "warpin-errors", version = "0.2.0" }
 warpin-config = { path = "warpin-config", version = "0.2.0" }
+warpin-dingtalk = { path = "warpin-dingtalk", version = "0.2.0" }
