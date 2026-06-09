@@ -1,16 +1,13 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+//! Authentication and authorization primitives for the Warpin framework.
+//!
+//! Provides:
+//! - JWT token generation and verification via `JwtManager`
+//! - `Claims` struct for encoding user identity and tenant scope
+//! - Axum middleware for extracting and validating JWT from requests
+//! - `AuthUser` extractor for handler functions
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: Uuid,
-    pub tenant_id: String,
-    pub exp: DateTime<Utc>,
-}
+mod jwt;
+mod middleware;
 
-impl Claims {
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
-        now >= self.exp
-    }
-}
+pub use jwt::{Claims, JwtConfig, JwtManager};
+pub use middleware::{AuthUser, JwtAuthLayer};
