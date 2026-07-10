@@ -65,8 +65,7 @@ impl EndpointClient {
     pub async fn call(&self, endpoint: &ResolvedEndpoint, body: Value) -> Result<Value> {
         let mut current = endpoint;
         let mut depth: usize = 0;
-        let mut last_error: anyhow::Error =
-            anyhow!("endpoint call failed with no attempts made");
+        let mut last_error: anyhow::Error = anyhow!("endpoint call failed with no attempts made");
 
         loop {
             match self.send_once(current, &body).await {
@@ -75,7 +74,8 @@ impl EndpointClient {
                     // Non-retryable errors (client 4xx except 408/429)
                     // should not trigger fallback — the request itself
                     // is the problem, not the endpoint.
-                    if err.downcast_ref::<EndpointError>()
+                    if err
+                        .downcast_ref::<EndpointError>()
                         .is_some_and(|e| matches!(e, EndpointError::NonRetryable(_)))
                     {
                         return Err(err);
@@ -226,8 +226,7 @@ mod tests {
     #[tokio::test]
     async fn call_to_unreachable_host_returns_error() {
         let client = EndpointClient::new();
-        let endpoint =
-            ResolvedEndpoint::new("http://127.0.0.1:1").with_timeout_ms(500);
+        let endpoint = ResolvedEndpoint::new("http://127.0.0.1:1").with_timeout_ms(500);
 
         let result = client
             .call(&endpoint, serde_json::json!({"test": true}))
@@ -241,10 +240,9 @@ mod tests {
         let client = EndpointClient::new();
 
         let fb = ResolvedEndpoint::new("http://127.0.0.1:1").with_timeout_ms(500);
-        let primary =
-            ResolvedEndpoint::new("http://127.0.0.1:1")
-                .with_timeout_ms(500)
-                .with_fallback(fb);
+        let primary = ResolvedEndpoint::new("http://127.0.0.1:1")
+            .with_timeout_ms(500)
+            .with_fallback(fb);
 
         let result = client
             .call(&primary, serde_json::json!({"test": true}))
@@ -267,8 +265,7 @@ mod tests {
 
     #[test]
     fn test_model_param_merged_into_body() {
-        let endpoint = ResolvedEndpoint::new("https://api.example.com")
-            .with_model("gpt-4o");
+        let endpoint = ResolvedEndpoint::new("https://api.example.com").with_model("gpt-4o");
         let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
 
         let merged = merge_endpoint_params(&endpoint, &body);
@@ -308,14 +305,20 @@ mod tests {
         });
         let merged = merge_endpoint_params(&endpoint, &body);
 
-        assert_eq!(merged["temperature"], 0.3, "body key must not be overridden");
-        assert_eq!(merged["max_tokens"], 100, "new key from extra_params must appear");
+        assert_eq!(
+            merged["temperature"], 0.3,
+            "body key must not be overridden"
+        );
+        assert_eq!(
+            merged["max_tokens"], 100,
+            "new key from extra_params must appear"
+        );
     }
 
     #[test]
     fn test_fallback_uses_its_own_model_param() {
-        let fallback = ResolvedEndpoint::new("https://fallback.example.com")
-            .with_model("gpt-3.5-turbo");
+        let fallback =
+            ResolvedEndpoint::new("https://fallback.example.com").with_model("gpt-3.5-turbo");
         let primary = ResolvedEndpoint::new("https://primary.example.com")
             .with_model("gpt-4o")
             .with_fallback(fallback);
@@ -336,56 +339,89 @@ mod tests {
 
     #[test]
     fn test_400_does_not_trigger_fallback() {
-        assert!(!is_retryable_status(400), "400 Bad Request must not be retryable");
+        assert!(
+            !is_retryable_status(400),
+            "400 Bad Request must not be retryable"
+        );
     }
 
     #[test]
     fn test_401_does_not_trigger_fallback() {
-        assert!(!is_retryable_status(401), "401 Unauthorized must not be retryable");
+        assert!(
+            !is_retryable_status(401),
+            "401 Unauthorized must not be retryable"
+        );
     }
 
     #[test]
     fn test_403_does_not_trigger_fallback() {
-        assert!(!is_retryable_status(403), "403 Forbidden must not be retryable");
+        assert!(
+            !is_retryable_status(403),
+            "403 Forbidden must not be retryable"
+        );
     }
 
     #[test]
     fn test_404_does_not_trigger_fallback() {
-        assert!(!is_retryable_status(404), "404 Not Found must not be retryable");
+        assert!(
+            !is_retryable_status(404),
+            "404 Not Found must not be retryable"
+        );
     }
 
     #[test]
     fn test_422_does_not_trigger_fallback() {
-        assert!(!is_retryable_status(422), "422 Unprocessable Entity must not be retryable");
+        assert!(
+            !is_retryable_status(422),
+            "422 Unprocessable Entity must not be retryable"
+        );
     }
 
     #[test]
     fn test_429_triggers_fallback() {
-        assert!(is_retryable_status(429), "429 Too Many Requests must be retryable");
+        assert!(
+            is_retryable_status(429),
+            "429 Too Many Requests must be retryable"
+        );
     }
 
     #[test]
     fn test_500_triggers_fallback() {
-        assert!(is_retryable_status(500), "500 Internal Server Error must be retryable");
+        assert!(
+            is_retryable_status(500),
+            "500 Internal Server Error must be retryable"
+        );
     }
 
     #[test]
     fn test_502_triggers_fallback() {
-        assert!(is_retryable_status(502), "502 Bad Gateway must be retryable");
+        assert!(
+            is_retryable_status(502),
+            "502 Bad Gateway must be retryable"
+        );
     }
 
     #[test]
     fn test_503_triggers_fallback() {
-        assert!(is_retryable_status(503), "503 Service Unavailable must be retryable");
+        assert!(
+            is_retryable_status(503),
+            "503 Service Unavailable must be retryable"
+        );
     }
 
     #[test]
     fn test_504_triggers_fallback() {
-        assert!(is_retryable_status(504), "504 Gateway Timeout must be retryable");
+        assert!(
+            is_retryable_status(504),
+            "504 Gateway Timeout must be retryable"
+        );
     }
 
     #[test]
     fn test_408_triggers_fallback() {
-        assert!(is_retryable_status(408), "408 Request Timeout must be retryable");
+        assert!(
+            is_retryable_status(408),
+            "408 Request Timeout must be retryable"
+        );
     }
 }

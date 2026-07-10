@@ -100,9 +100,7 @@ impl OpenAICompatibleAdapter {
             .and_then(Value::as_str)
             .map(String::from);
 
-        let tool_calls = response
-            .pointer("/choices/0/message/tool_calls")
-            .cloned();
+        let tool_calls = response.pointer("/choices/0/message/tool_calls").cloned();
 
         let usage = response.get("usage").cloned();
 

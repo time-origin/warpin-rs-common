@@ -442,10 +442,7 @@ impl KafkaEventConsumer {
             .set("group.id", &config.group_id)
             .set("client.id", &config.client_id)
             .set("auto.offset.reset", &config.auto_offset_reset)
-            .set(
-                "enable.auto.commit",
-                config.enable_auto_commit.to_string(),
-            )
+            .set("enable.auto.commit", config.enable_auto_commit.to_string())
             .set(
                 "auto.commit.interval.ms",
                 config.auto_commit_interval_ms.to_string(),
@@ -738,9 +735,7 @@ impl BatchPublisher for KafkaEventBus {
                 let key = event.trace_id.clone();
                 let payload = event.payload_json.clone();
                 async move {
-                    let record = FutureRecord::to(&topic)
-                        .key(&key)
-                        .payload(&payload);
+                    let record = FutureRecord::to(&topic).key(&key).payload(&payload);
                     match producer
                         .send(record, Timeout::After(Duration::from_secs(5)))
                         .await

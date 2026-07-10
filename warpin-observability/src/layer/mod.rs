@@ -90,8 +90,10 @@ impl Visit for AuditVisitor {
         if name == "event_type" {
             self.event_type = Some(value.to_string());
         } else {
-            self.fields
-                .insert(name.to_string(), serde_json::Value::String(value.to_string()));
+            self.fields.insert(
+                name.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
         }
     }
 
@@ -136,11 +138,7 @@ impl<S> Layer<S> for AuditLayer
 where
     S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         // Only capture events targeted at "audit"
         if event.metadata().target() != "audit" {
             return;

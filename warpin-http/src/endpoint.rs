@@ -1,4 +1,4 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 /// A fully-resolved model endpoint ready for HTTP dispatch.
 ///
@@ -92,7 +92,10 @@ pub fn build_auth_headers(auth_type: &str, credential: Option<&str>) -> HeaderMa
             // No headers needed — auth is handled externally or not required.
         }
         other => {
-            tracing::warn!(auth_type = other, "unsupported auth_type, returning empty headers");
+            tracing::warn!(
+                auth_type = other,
+                "unsupported auth_type, returning empty headers"
+            );
         }
     }
 
@@ -106,14 +109,18 @@ mod tests {
     #[test]
     fn api_key_sets_bearer_header() {
         let headers = build_auth_headers("api_key", Some("sk-test-123"));
-        let auth = headers.get(AUTHORIZATION).expect("Authorization header missing");
+        let auth = headers
+            .get(AUTHORIZATION)
+            .expect("Authorization header missing");
         assert_eq!(auth.to_str().unwrap(), "Bearer sk-test-123");
     }
 
     #[test]
     fn bearer_token_sets_bearer_header() {
         let headers = build_auth_headers("bearer_token", Some("tok-abc"));
-        let auth = headers.get(AUTHORIZATION).expect("Authorization header missing");
+        let auth = headers
+            .get(AUTHORIZATION)
+            .expect("Authorization header missing");
         assert_eq!(auth.to_str().unwrap(), "Bearer tok-abc");
     }
 

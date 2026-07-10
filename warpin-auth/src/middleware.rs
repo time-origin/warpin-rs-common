@@ -43,10 +43,7 @@ where
             .extensions
             .get::<AuthUser>()
             .cloned()
-            .ok_or((
-                StatusCode::UNAUTHORIZED,
-                "authentication required",
-            ))
+            .ok_or((StatusCode::UNAUTHORIZED, "authentication required"))
     }
 }
 
@@ -189,9 +186,7 @@ mod tests {
         Router::new()
             .route(
                 "/protected",
-                get(|auth: AuthUser| async move {
-                    format!("hello {}", auth.claims.user_id())
-                }),
+                get(|auth: AuthUser| async move { format!("hello {}", auth.claims.user_id()) }),
             )
             .layer(JwtAuthLayer::new(jwt))
     }
