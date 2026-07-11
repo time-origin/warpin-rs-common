@@ -45,6 +45,8 @@ serde_json = "1.0.149"
 serde_jcs = "=0.2.0"
 sha2 = "0.10.9"
 hex = "0.4.3"
+ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
+zeroize = "1.8.2"
 
 # ── 错误处理 ──
 anyhow = "1.0.102"

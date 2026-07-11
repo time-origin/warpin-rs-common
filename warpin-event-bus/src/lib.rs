@@ -19,6 +19,22 @@
 //!
 //! `KafkaEventBus::publish` rejects any event whose `tenant_id` is empty to
 //! prevent accidentally delivering un-scoped events.
+//!
+//! # Durable Producer Attestation
+//!
+//! [`ProducerAttestationSigner`] authenticates durable record coordinates and
+//! bytes with a producer-owned Ed25519 private key. Consumers pass raw Kafka
+//! topic, key, payload, and headers to [`ProducerAttestationVerifier::verify`]
+//! before deserializing the payload. Authorization and tenant routing must use
+//! only the returned [`VerifiedProducerAttestation`]; similarly named payload
+//! fields are untrusted claims that applications must compare with the
+//! verified identity.
+//!
+//! Successful signature verification is not replay protection. A consumer
+//! must persist and deduplicate the verified event ID in a tenant-scoped inbox
+//! before committing its Kafka offset. Operators keep each private key only in
+//! its producing service and configure overlapping old and new public keys on
+//! consumers during bounded key rotation.
 
 use std::time::Duration;
 
@@ -31,6 +47,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
+
+mod attestation;
+pub use attestation::{
+    AttestationConfigurationError, AttestationVerificationError, ProducerAttestationSigner,
+    ProducerAttestationVerifier, VerifiedProducerAttestation,
+};
 
 // ---------------------------------------------------------------------------
 // BusEvent envelope
