@@ -13,7 +13,6 @@ const MAX_CAPTURE_DEPTH: usize = 128;
 const MAX_CAPTURE_NODES: usize = 100_000;
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 const MAX_COLLECTION_ITEMS: usize = 100_000;
-const MAX_INITIAL_CAPACITY: usize = 1_024;
 
 #[derive(Default)]
 struct CaptureBudget {
@@ -60,11 +59,11 @@ impl CaptureBudget {
         Ok(())
     }
 
-    fn validate_size_hint(&self, hint: usize) -> Result<usize, CaptureError> {
+    fn validate_size_hint(&self, hint: usize) -> Result<(), CaptureError> {
         if hint > MAX_COLLECTION_ITEMS.saturating_sub(self.collection_items) {
             return Err(CaptureError);
         }
-        Ok(hint.min(MAX_INITIAL_CAPACITY))
+        Ok(())
     }
 }
 
@@ -425,11 +424,11 @@ impl<'a> SequenceCapture<'a> {
         size_hint: usize,
         variant: Option<&'static str>,
     ) -> Result<Self, CaptureError> {
-        let capacity = budget.validate_size_hint(size_hint)?;
+        budget.validate_size_hint(size_hint)?;
         Ok(Self {
             budget,
             child_depth,
-            values: Vec::with_capacity(capacity),
+            values: Vec::new(),
             variant,
             failed: false,
         })
@@ -439,6 +438,9 @@ impl<'a> SequenceCapture<'a> {
     where
         T: Serialize + ?Sized,
     {
+        if self.failed {
+            return Err(CaptureError);
+        }
         let result = (|| {
             self.budget.claim_collection_item()?;
             self.values.push(value.serialize(CaptureSerializer {
@@ -447,6 +449,10 @@ impl<'a> SequenceCapture<'a> {
             })?);
             Ok(())
         })();
+        self.latch(result)
+    }
+
+    fn latch<T>(&mut self, result: Result<T, CaptureError>) -> Result<T, CaptureError> {
         if result.is_err() {
             self.failed = true;
         }
@@ -518,12 +524,12 @@ impl<'a> ObjectCapture<'a> {
         size_hint: usize,
         variant: Option<&'static str>,
     ) -> Result<Self, CaptureError> {
-        let capacity = budget.validate_size_hint(size_hint)?;
+        budget.validate_size_hint(size_hint)?;
         Ok(Self {
             budget,
             child_depth,
-            entries: Vec::with_capacity(capacity),
-            seen: HashSet::with_capacity(capacity),
+            entries: Vec::new(),
+            seen: HashSet::new(),
             pending_key: None,
             variant,
             failed: false,
@@ -534,6 +540,9 @@ impl<'a> ObjectCapture<'a> {
     where
         T: Serialize + ?Sized,
     {
+        if self.failed {
+            return Err(CaptureError);
+        }
         let result = (|| {
             self.budget.claim_collection_item()?;
             self.budget.claim_bytes(key.len())?;
@@ -549,10 +558,19 @@ impl<'a> ObjectCapture<'a> {
             ));
             Ok(())
         })();
+        self.latch(result)
+    }
+
+    fn latch<T>(&mut self, result: Result<T, CaptureError>) -> Result<T, CaptureError> {
         if result.is_err() {
             self.failed = true;
         }
         result
+    }
+
+    fn reject<T>(&mut self) -> Result<T, CaptureError> {
+        self.failed = true;
+        Err(CaptureError)
     }
 
     fn finish(self) -> Result<CapturedValue, CaptureError> {
@@ -575,35 +593,28 @@ impl SerializeMap for ObjectCapture<'_> {
     where
         T: Serialize + ?Sized,
     {
-        if self.pending_key.is_some() {
-            return Err(CaptureError);
+        if self.failed || self.pending_key.is_some() {
+            return self.reject();
         }
         let result = key.serialize(MapKeySerializer {
             budget: &mut *self.budget,
             depth: self.child_depth,
         });
-        match result {
-            Ok(key) => {
-                self.pending_key = Some(key);
-                Ok(())
-            }
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
+        let key = self.latch(result)?;
+        self.pending_key = Some(key);
+        Ok(())
     }
 
     fn serialize_value<T>(&mut self, value: &T) -> Result<(), Self::Error>
     where
         T: Serialize + ?Sized,
     {
+        if self.failed {
+            return Err(CaptureError);
+        }
         let key = match self.pending_key.take() {
             Some(key) => key,
-            None => {
-                self.failed = true;
-                return Err(CaptureError);
-            }
+            None => return self.reject(),
         };
         self.insert(key, value)
     }

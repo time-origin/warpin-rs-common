@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use serde::Serialize;
-use serde::ser::{SerializeMap, SerializeSeq};
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 
 use super::*;
 
@@ -114,6 +114,152 @@ fn typed_duplicate_map_keys_and_nonfinite_values_are_rejected() {
     ));
     assert!(matches!(
         canonical_bytes(&9_007_199_254_740_992_f64),
+        Err(IntegrityError::Canonicalization)
+    ));
+}
+
+#[test]
+fn typed_map_rejects_an_ignored_second_key_before_the_pending_value() {
+    struct IgnoredSecondKey;
+    impl Serialize for IgnoredSecondKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_key("first")?;
+            let _ignored = map.serialize_key("second");
+            let _ignored = map.serialize_value(&1);
+            map.end()
+        }
+    }
+
+    assert!(matches!(
+        canonical_bytes(&IgnoredSecondKey),
+        Err(IntegrityError::Canonicalization)
+    ));
+}
+
+#[test]
+fn typed_map_keeps_every_ignored_state_and_capture_error_sticky() {
+    struct NonFinite;
+    impl Serialize for NonFinite {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_f64(f64::NAN)
+        }
+    }
+
+    struct MissingKey;
+    impl Serialize for MissingKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            let _ignored = map.serialize_value(&1);
+            let _ignored = map.serialize_entry("recovery", &1);
+            map.end()
+        }
+    }
+
+    struct InvalidKey;
+    impl Serialize for InvalidKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            let _ignored = map.serialize_key(&NonFinite);
+            let _ignored = map.serialize_entry("recovery", &1);
+            map.end()
+        }
+    }
+
+    struct InvalidValue;
+    impl Serialize for InvalidValue {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_key("bad")?;
+            let _ignored = map.serialize_value(&NonFinite);
+            let _ignored = map.serialize_entry("recovery", &1);
+            map.end()
+        }
+    }
+
+    struct BudgetFailure;
+    impl Serialize for BudgetFailure {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let oversized = "x".repeat(1_048_577);
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_key("oversized")?;
+            let _ignored = map.serialize_value(&oversized);
+            map.end()
+        }
+    }
+
+    for rejected in [
+        canonical_bytes(&MissingKey),
+        canonical_bytes(&InvalidKey),
+        canonical_bytes(&InvalidValue),
+        canonical_bytes(&BudgetFailure),
+    ] {
+        assert!(matches!(rejected, Err(IntegrityError::Canonicalization)));
+    }
+}
+
+#[test]
+fn typed_sequences_and_structs_keep_ignored_capture_errors_sticky() {
+    struct NonFinite;
+    impl Serialize for NonFinite {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_f64(f64::NAN)
+        }
+    }
+
+    struct IgnoredSequenceError;
+    impl Serialize for IgnoredSequenceError {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut sequence = serializer.serialize_seq(Some(1))?;
+            let _ignored = sequence.serialize_element(&NonFinite);
+            let _ignored = sequence.serialize_element(&1);
+            sequence.end()
+        }
+    }
+
+    struct IgnoredStructError;
+    impl Serialize for IgnoredStructError {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut object = serializer.serialize_struct("IgnoredStructError", 2)?;
+            let _ignored = object.serialize_field("bad", &NonFinite);
+            let _ignored = object.serialize_field("recovery", &1);
+            object.end()
+        }
+    }
+
+    assert!(matches!(
+        canonical_bytes(&IgnoredSequenceError),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&IgnoredStructError),
         Err(IntegrityError::Canonicalization)
     ));
 }
@@ -262,6 +408,62 @@ fn typed_capture_enforces_shared_resource_budgets_without_panicking() {
         canonical_bytes(&vec![0_u8; 100_001]),
         Err(IntegrityError::Canonicalization)
     ));
+}
+
+#[test]
+fn typed_capture_does_not_retain_capacity_from_untrusted_empty_hints() {
+    struct EmptySequence;
+    impl Serialize for EmptySequence {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_seq(Some(1_024))?.end()
+        }
+    }
+
+    struct EmptyObject;
+    impl Serialize for EmptyObject {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_map(Some(1_024))?.end()
+        }
+    }
+
+    struct ManyEmptyContainers;
+    impl Serialize for ManyEmptyContainers {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut outer = serializer.serialize_seq(Some(2_000))?;
+            for index in 0..2_000 {
+                if index % 2 == 0 {
+                    outer.serialize_element(&EmptySequence)?;
+                } else {
+                    outer.serialize_element(&EmptyObject)?;
+                }
+            }
+            outer.end()
+        }
+    }
+
+    let captured = crate::capture::capture_typed(&ManyEmptyContainers).expect("within budget");
+    let crate::capture::CapturedValue::Array(children) = captured else {
+        panic!("expected outer array");
+    };
+    assert_eq!(children.len(), 2_000);
+    let retained_child_capacity: usize = children
+        .iter()
+        .map(|child| match child {
+            crate::capture::CapturedValue::Array(values) => values.capacity(),
+            crate::capture::CapturedValue::Object(entries) => entries.capacity(),
+            _ => panic!("expected empty container"),
+        })
+        .sum();
+    assert_eq!(retained_child_capacity, 0);
 }
 
 #[test]
