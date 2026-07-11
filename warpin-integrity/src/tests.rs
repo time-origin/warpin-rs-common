@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::{cell::Cell, collections::BTreeMap};
 
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
@@ -141,6 +141,74 @@ fn explicit_profiles_have_stable_and_distinct_number_contracts() {
         digest_bound(&binding, &1e30_f64).expect("default bound full"),
         digest_bound_with_profile(&binding, &1e30_f64, full).expect("explicit bound full")
     );
+}
+
+#[test]
+fn integer_map_keys_are_profile_independent_json_strings() {
+    let profile = CanonicalProfile::IJsonSafeIntegers;
+    let numeric_u64 = BTreeMap::from([(9_007_199_254_740_993_u64, "u64")]);
+    let string_u64 = BTreeMap::from([("9007199254740993".to_owned(), "u64")]);
+    assert_eq!(
+        canonical_bytes_with_profile(&numeric_u64, profile).expect("numeric u64 key"),
+        canonical_bytes_with_profile(&string_u64, profile).expect("string u64 key")
+    );
+
+    let numeric_u128 = BTreeMap::from([(u128::MAX, "u128")]);
+    let string_u128 = BTreeMap::from([(u128::MAX.to_string(), "u128")]);
+    assert_eq!(
+        canonical_bytes_with_profile(&numeric_u128, profile).expect("numeric u128 key"),
+        canonical_bytes_with_profile(&string_u128, profile).expect("string u128 key")
+    );
+
+    struct NumericStringCollision;
+    impl Serialize for NumericStringCollision {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry(&u128::MAX, &1)?;
+            map.serialize_entry(&u128::MAX.to_string(), &2)?;
+            map.end()
+        }
+    }
+    assert!(matches!(
+        canonical_bytes_with_profile(&NumericStringCollision, profile),
+        Err(IntegrityError::Canonicalization)
+    ));
+}
+
+#[test]
+fn zero_mantissas_and_full_profile_extreme_exponents_are_stable() {
+    let enormous = "9".repeat(80);
+    let safe = CanonicalProfile::IJsonSafeIntegers;
+    for input in [
+        format!("0e{enormous}"),
+        format!("-0e-{enormous}"),
+        format!("0.000E+{enormous}"),
+    ] {
+        assert_eq!(
+            String::from_utf8(
+                canonical_bytes_from_json_with_profile(&input, safe).expect("mathematical zero")
+            )
+            .expect("UTF-8"),
+            "0"
+        );
+    }
+
+    let full = CanonicalProfile::Rfc8785;
+    assert_eq!(
+        String::from_utf8(
+            canonical_bytes_from_json_with_profile(&format!("1e-{enormous}"), full)
+                .expect("binary64 underflow")
+        )
+        .expect("UTF-8"),
+        "0"
+    );
+    assert!(matches!(
+        canonical_bytes_from_json_with_profile(&format!("1e{enormous}"), full),
+        Err(IntegrityError::Canonicalization)
+    ));
 }
 
 #[test]

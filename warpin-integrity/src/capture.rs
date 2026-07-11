@@ -726,11 +726,9 @@ impl Serializer for MapKeySerializer<'_> {
         self.stringify(value)
     }
     fn serialize_i64(self, value: i64) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_i128(i128::from(value), self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_i128(self, value: i128) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_i128(value, self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_u8(self, value: u8) -> Result<Self::Ok, Self::Error> {
@@ -743,11 +741,9 @@ impl Serializer for MapKeySerializer<'_> {
         self.stringify(value)
     }
     fn serialize_u64(self, value: u64) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_u128(u128::from(value), self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_u128(self, value: u128) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_u128(value, self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_f32(self, _value: f32) -> Result<Self::Ok, Self::Error> {

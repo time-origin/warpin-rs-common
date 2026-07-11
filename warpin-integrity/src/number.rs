@@ -92,6 +92,13 @@ pub(crate) fn parse_json_number(
         Some(value) => (true, value),
         None => (false, lexeme),
     };
+    let mantissa_end = unsigned.find(['e', 'E']).unwrap_or(unsigned.len());
+    if unsigned[..mantissa_end]
+        .bytes()
+        .all(|byte| matches!(byte, b'0' | b'.'))
+    {
+        return Ok(CapturedNumber::U64(0));
+    }
     let (mantissa, exponent) = split_exponent(unsigned)?;
     let (integer, fraction) = match mantissa.split_once('.') {
         Some((integer, fraction)) => (integer, fraction),
