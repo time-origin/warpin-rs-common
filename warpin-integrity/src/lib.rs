@@ -248,7 +248,10 @@ fn canonicalize_captured(value: &CapturedValue) -> Result<Vec<u8>, IntegrityErro
     serde_jcs::to_vec(value).map_err(|_| IntegrityError::Canonicalization)
 }
 
-fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+/// Returns the SHA-256 digest of arbitrary bytes without applying JSON
+/// canonicalization. Use the typed or JSON helpers when semantic JSON
+/// equivalence is required.
+pub fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest(format!(
         "{SHA256_PREFIX}{}",
         hex::encode(Sha256::digest(bytes))

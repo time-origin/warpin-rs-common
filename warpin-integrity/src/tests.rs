@@ -746,3 +746,15 @@ fn typed_and_raw_json_share_the_same_tree() {
     let raw = digest_from_json(r#"{"label":"stable","alpha":7}"#).expect("raw");
     assert_eq!(typed, raw);
 }
+
+#[test]
+fn raw_byte_digest_is_stable_and_distinct_from_json_semantics() {
+    assert_eq!(
+        crate::digest_bytes(b"abc").as_str(),
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_ne!(
+        crate::digest_bytes(br#"{"a": 1}"#),
+        digest_from_json(r#"{"a": 1}"#).expect("semantic JSON digest")
+    );
+}

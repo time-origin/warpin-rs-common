@@ -11,6 +11,7 @@ members = [
     "warpin-context",
     "warpin-observability",
     "warpin-storage",
+    "warpin-object-storage",
     "warpin-event-bus",
     "warpin-capability",
     "warpin-dingtalk",
@@ -63,6 +64,8 @@ utoipa = { version = "5.4", features = ["axum_extras", "chrono", "uuid"] }
 uuid = { version = "1.22.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 bytes = "1"
+url = "2.5.8"
+object_store = { version = "0.14.0", default-features = false }
 
 # ── 消息队列 ──
 rdkafka = { version = "0.39.0", features = ["tokio"] }
@@ -78,3 +81,4 @@ warpin-types  = { path = "warpin-types",  version = "0.2.2" }
 warpin-errors = { path = "warpin-errors", version = "0.2.2" }
 warpin-config = { path = "warpin-config", version = "0.2.2" }
 warpin-dingtalk = { path = "warpin-dingtalk", version = "0.2.2" }
+warpin-integrity = { path = "warpin-integrity", version = "0.1.1" }
