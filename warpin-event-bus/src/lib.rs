@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,180 @@ impl BusEvent {
 }
 
 // ---------------------------------------------------------------------------
+// DurableEventRecord
+// ---------------------------------------------------------------------------
+
+const MAX_DURABLE_TENANT_ID_BYTES: usize = 256;
+const MAX_DURABLE_KEY_BYTES: usize = 4 * 1024;
+const MAX_DURABLE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DURABLE_HEADERS: usize = 32;
+const MAX_DURABLE_HEADER_VALUE_BYTES: usize = 4 * 1024;
+
+/// One immutable Kafka record header. Header values are treated as sensitive
+/// transport metadata and are redacted from `Debug` output.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DurableEventHeader {
+    name: String,
+    value: Vec<u8>,
+}
+
+impl DurableEventHeader {
+    pub fn new(name: impl Into<String>, value: Vec<u8>) -> Result<Self> {
+        let header = Self {
+            name: name.into(),
+            value,
+        };
+        if header.name.is_empty()
+            || header.name.len() > 64
+            || !header.name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+            || header.value.is_empty()
+            || header.value.len() > MAX_DURABLE_HEADER_VALUE_BYTES
+        {
+            return Err(anyhow!("durable event header is invalid"));
+        }
+        Ok(header)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for DurableEventHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableEventHeader")
+            .field("name", &self.name)
+            .field("value_len", &self.value.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An explicitly keyed Kafka record for durable outbox delivery.
+///
+/// Unlike [`BusEvent`], this contract preserves an arbitrary binary partition
+/// key. This is required for aggregate ordering schemes such as
+/// `tenant_id || NUL || aggregate_id`. The key and payload are deliberately
+/// omitted from `Debug` output.
+#[derive(Clone)]
+pub struct DurableEventRecord {
+    topic: String,
+    tenant_id: String,
+    key: Vec<u8>,
+    payload: Vec<u8>,
+    headers: Vec<DurableEventHeader>,
+}
+
+impl DurableEventRecord {
+    pub fn new(
+        topic: impl Into<String>,
+        tenant_id: impl Into<String>,
+        key: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        let record = Self {
+            topic: topic.into(),
+            tenant_id: tenant_id.into(),
+            key,
+            payload,
+            headers: Vec::new(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.topic.is_empty()
+            || matches!(self.topic.as_str(), "." | "..")
+            || self.topic.len() > 249
+            || !self
+                .topic
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(anyhow!("durable event topic is invalid"));
+        }
+        if self.tenant_id.is_empty()
+            || self.tenant_id.len() > MAX_DURABLE_TENANT_ID_BYTES
+            || self.tenant_id.trim() != self.tenant_id
+            || self.tenant_id.chars().any(char::is_control)
+        {
+            return Err(anyhow!("durable event tenant_id is invalid"));
+        }
+        if self.key.is_empty() || self.key.len() > MAX_DURABLE_KEY_BYTES {
+            return Err(anyhow!("durable event key is invalid"));
+        }
+        if self.payload.is_empty() || self.payload.len() > MAX_DURABLE_PAYLOAD_BYTES {
+            return Err(anyhow!("durable event payload is invalid"));
+        }
+        if self.headers.len() > MAX_DURABLE_HEADERS {
+            return Err(anyhow!("durable event has too many headers"));
+        }
+        let mut names = std::collections::HashSet::with_capacity(self.headers.len());
+        if self
+            .headers
+            .iter()
+            .any(|header| !names.insert(&header.name))
+        {
+            return Err(anyhow!("duplicate durable event headers are forbidden"));
+        }
+        Ok(())
+    }
+
+    pub fn with_headers(mut self, headers: Vec<DurableEventHeader>) -> Result<Self> {
+        self.headers = headers;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn headers(&self) -> &[DurableEventHeader] {
+        &self.headers
+    }
+}
+
+impl std::fmt::Debug for DurableEventRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableEventRecord")
+            .field("topic", &self.topic)
+            .field("tenant_id", &self.tenant_id)
+            .field("key_len", &self.key.len())
+            .field("payload_len", &self.payload.len())
+            .field("header_count", &self.headers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Broker acknowledgement returned only after Kafka confirms delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableDeliveryReceipt {
+    pub partition: i32,
+    pub offset: i64,
+}
+
+// ---------------------------------------------------------------------------
 // EventBus trait
 // ---------------------------------------------------------------------------
 
@@ -87,6 +262,16 @@ pub trait EventBus: Send + Sync {
     /// unavailable; callers are responsible for deciding retry vs. fall-back
     /// strategy.
     async fn publish(&self, event: BusEvent) -> Result<()>;
+}
+
+/// Publisher used by transactional outbox workers that require an explicit
+/// binary partition key and a broker acknowledgement.
+///
+/// A disabled/no-op transport must return an error; otherwise an outbox could
+/// be marked delivered without a durable side effect.
+#[async_trait]
+pub trait DurableEventPublisher: Send + Sync {
+    async fn publish_durable(&self, record: DurableEventRecord) -> Result<DurableDeliveryReceipt>;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +301,15 @@ impl EventBus for NoOpEventBus {
             "EventBus no-op publish"
         );
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DurableEventPublisher for NoOpEventBus {
+    async fn publish_durable(&self, _record: DurableEventRecord) -> Result<DurableDeliveryReceipt> {
+        Err(anyhow!(
+            "durable event publishing is unavailable on the no-op transport"
+        ))
     }
 }
 
@@ -171,6 +365,7 @@ impl std::fmt::Debug for KafkaEventBus {
 
 impl KafkaEventBus {
     pub fn new(config: KafkaEventBusConfig) -> Result<Self> {
+        validate_durable_producer_overrides(&config.extra_config)?;
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", &config.broker_url)
@@ -181,6 +376,16 @@ impl KafkaEventBus {
         for (key, value) in &config.extra_config {
             client_config.set(key.as_str(), value.as_str());
         }
+        // A `DurableDeliveryReceipt` is an outbox commit boundary. These
+        // properties are applied last so no caller override can turn a local
+        // enqueue into a false broker acknowledgement.
+        client_config
+            .set("acks", "all")
+            .set("enable.idempotence", "true")
+            .set("max.in.flight.requests.per.connection", "5")
+            .set("message.send.max.retries", i32::MAX.to_string())
+            .set("queuing.strategy", "fifo")
+            .set("delivery.report.only.error", "false");
 
         let producer: FutureProducer = client_config
             .create()
@@ -203,6 +408,25 @@ impl KafkaEventBus {
             ..KafkaEventBusConfig::default()
         })
     }
+}
+
+fn validate_durable_producer_overrides(overrides: &[(String, String)]) -> Result<()> {
+    for (key, value) in overrides {
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        let unsafe_override = match key.as_str() {
+            "acks" | "request.required.acks" => !matches!(value.as_str(), "all" | "-1"),
+            "enable.idempotence" => value != "true",
+            "delivery.report.only.error" => value != "false",
+            _ => false,
+        };
+        if unsafe_override {
+            return Err(anyhow!(
+                "Kafka producer override '{key}' is incompatible with durable delivery"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -259,6 +483,67 @@ impl EventBus for KafkaEventBus {
     }
 }
 
+#[async_trait]
+impl DurableEventPublisher for KafkaEventBus {
+    async fn publish_durable(&self, record: DurableEventRecord) -> Result<DurableDeliveryReceipt> {
+        record.validate()?;
+        let topic = record.topic;
+        let tenant_id = record.tenant_id;
+        let key_len = record.key.len();
+        let payload_len = record.payload.len();
+        let header_count = record.headers.len();
+        let headers = record.headers.into_iter().fold(
+            OwnedHeaders::new_with_capacity(header_count),
+            |headers, header| {
+                headers.insert(Header {
+                    key: &header.name,
+                    value: Some(header.value.as_slice()),
+                })
+            },
+        );
+        let kafka_record = FutureRecord::to(topic.as_str())
+            .key(record.key.as_slice())
+            .payload(record.payload.as_slice())
+            .headers(headers);
+        match self
+            .producer
+            .send(kafka_record, Timeout::After(self.queue_timeout))
+            .await
+        {
+            Ok(delivery) => {
+                tracing::debug!(
+                    topic = %topic,
+                    tenant_id = %tenant_id,
+                    key_len,
+                    payload_len,
+                    header_count,
+                    partition = delivery.partition,
+                    offset = delivery.offset,
+                    "durable Kafka publish succeeded"
+                );
+                Ok(DurableDeliveryReceipt {
+                    partition: delivery.partition,
+                    offset: delivery.offset,
+                })
+            }
+            Err((error, _message)) => {
+                tracing::error!(
+                    topic = %topic,
+                    tenant_id = %tenant_id,
+                    key_len,
+                    payload_len,
+                    header_count,
+                    error_kind = "kafka_delivery_failed",
+                    "durable Kafka publish failed"
+                );
+                Err(anyhow!(
+                    "durable Kafka publish failed for topic {topic}: {error}"
+                ))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EventBusImpl -- runtime switchable
 // ---------------------------------------------------------------------------
@@ -275,6 +560,16 @@ impl EventBus for EventBusImpl {
         match self {
             EventBusImpl::NoOp(inner) => inner.publish(event).await,
             EventBusImpl::Kafka(inner) => inner.publish(event).await,
+        }
+    }
+}
+
+#[async_trait]
+impl DurableEventPublisher for EventBusImpl {
+    async fn publish_durable(&self, record: DurableEventRecord) -> Result<DurableDeliveryReceipt> {
+        match self {
+            EventBusImpl::NoOp(inner) => inner.publish_durable(record).await,
+            EventBusImpl::Kafka(inner) => inner.publish_durable(record).await,
         }
     }
 }
@@ -816,6 +1111,95 @@ pub enum CommitStrategy {
 mod tests {
     use super::*;
 
+    #[test]
+    fn durable_record_validates_scope_topic_key_and_payload() {
+        let record = DurableEventRecord::new(
+            "astro.execution.external-job.commands.v1",
+            "tenant-a",
+            b"tenant-a\0job-a".to_vec(),
+            br#"{"externalJobId":"job-a"}"#.to_vec(),
+        )
+        .expect("valid durable record");
+        assert_eq!(record.topic(), "astro.execution.external-job.commands.v1");
+        assert_eq!(record.tenant_id(), "tenant-a");
+        assert_eq!(record.key(), b"tenant-a\0job-a");
+        assert_eq!(record.payload(), br#"{"externalJobId":"job-a"}"#);
+
+        for invalid in [
+            DurableEventRecord::new("", "tenant-a", b"key".to_vec(), b"{}".to_vec()),
+            DurableEventRecord::new(".", "tenant-a", b"key".to_vec(), b"{}".to_vec()),
+            DurableEventRecord::new("..", "tenant-a", b"key".to_vec(), b"{}".to_vec()),
+            DurableEventRecord::new("topic", "", b"key".to_vec(), b"{}".to_vec()),
+            DurableEventRecord::new("topic", "tenant-a", Vec::new(), b"{}".to_vec()),
+            DurableEventRecord::new("topic", "tenant-a", b"key".to_vec(), Vec::new()),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[test]
+    fn durable_record_debug_redacts_binary_key_and_payload() {
+        let record = DurableEventRecord::new(
+            "topic",
+            "tenant-a",
+            b"secret-key".to_vec(),
+            b"secret-payload".to_vec(),
+        )
+        .expect("valid durable record")
+        .with_headers(vec![
+            DurableEventHeader::new("x-trace-id", b"secret-trace".to_vec()).expect("valid header"),
+        ])
+        .expect("valid header collection");
+        let debug = format!("{record:?}");
+        assert!(debug.contains("key_len"));
+        assert!(debug.contains("payload_len"));
+        assert!(debug.contains("header_count"));
+        assert!(!debug.contains("secret-key"));
+        assert!(!debug.contains("secret-payload"));
+        assert!(!debug.contains("secret-trace"));
+        assert_eq!(record.headers()[0].name(), "x-trace-id");
+        assert_eq!(record.headers()[0].value(), b"secret-trace");
+    }
+
+    #[test]
+    fn durable_record_rejects_duplicate_or_ambiguous_headers() {
+        let record = DurableEventRecord::new("topic", "tenant-a", b"key".to_vec(), b"{}".to_vec())
+            .expect("valid durable record");
+        assert!(
+            record
+                .clone()
+                .with_headers(vec![
+                    DurableEventHeader::new("x-tenant-id", b"tenant-a".to_vec()).unwrap(),
+                    DurableEventHeader::new("x-tenant-id", b"tenant-b".to_vec()).unwrap(),
+                ])
+                .is_err()
+        );
+        for invalid in [
+            DurableEventHeader::new("", b"value".to_vec()),
+            DurableEventHeader::new("X Tenant", b"value".to_vec()),
+            DurableEventHeader::new("x-empty", Vec::new()),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn noop_bus_rejects_durable_publish_instead_of_claiming_delivery() {
+        let bus = EventBusImpl::NoOp(NoOpEventBus::new());
+        let record = DurableEventRecord::new(
+            "topic",
+            "tenant-a",
+            b"tenant-a\0aggregate-a".to_vec(),
+            b"{}".to_vec(),
+        )
+        .expect("valid durable record");
+        let error = bus
+            .publish_durable(record)
+            .await
+            .expect_err("no-op transport cannot acknowledge durable delivery");
+        assert!(error.to_string().contains("durable"));
+    }
+
     #[tokio::test]
     async fn noop_bus_succeeds() {
         let bus = NoOpEventBus;
@@ -839,6 +1223,24 @@ mod tests {
         assert_eq!(cfg.linger_ms, 5);
         assert_eq!(cfg.client_id, "warpin-service");
         assert!(cfg.extra_config.is_empty());
+    }
+
+    #[test]
+    fn kafka_bus_rejects_configuration_that_can_false_ack_durable_delivery() {
+        for (key, value) in [
+            ("acks", "0"),
+            ("acks", "1"),
+            ("request.required.acks", "0"),
+            ("enable.idempotence", "false"),
+            ("delivery.report.only.error", "true"),
+        ] {
+            let result = KafkaEventBus::new(KafkaEventBusConfig {
+                broker_url: "localhost:19099".into(),
+                extra_config: vec![(key.into(), value.into())],
+                ..KafkaEventBusConfig::default()
+            });
+            assert!(result.is_err(), "unsafe {key}={value} must fail closed");
+        }
     }
 
     #[tokio::test]
