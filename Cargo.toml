@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "warpin-integrity",
     "warpin-types",
     "warpin-errors",
     "warpin-config",
@@ -40,6 +41,9 @@ tonic = "0.14.5"
 # ── 序列化 ──
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+serde_jcs = "=0.2.0"
+sha2 = "0.10.9"
+hex = "0.4.3"
 
 # ── 错误处理 ──
 anyhow = "1.0.102"
