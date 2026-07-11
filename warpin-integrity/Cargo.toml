@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Strict RFC 8785 canonical JSON and SHA-256 integrity digests"
 keywords = ["integrity", "json", "jcs", "rfc8785", "sha256"]
 categories = ["cryptography", "encoding"]
+include = ["src/**", "Cargo.toml", "LICENSE"]
 
 [dependencies]
 serde.workspace = true

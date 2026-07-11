@@ -6,22 +6,31 @@ use serde::ser::{
 };
 use serde::{Serialize, Serializer};
 
-use crate::IntegrityError;
 use crate::number::{CapturedNumber, map_ser_error};
+use crate::{CanonicalProfile, IntegrityError};
 
 const MAX_CAPTURE_DEPTH: usize = 128;
 const MAX_CAPTURE_NODES: usize = 100_000;
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 const MAX_COLLECTION_ITEMS: usize = 100_000;
 
-#[derive(Default)]
 struct CaptureBudget {
+    profile: CanonicalProfile,
     nodes: usize,
     bytes: usize,
     collection_items: usize,
 }
 
 impl CaptureBudget {
+    fn new(profile: CanonicalProfile) -> Self {
+        Self {
+            profile,
+            nodes: 0,
+            bytes: 0,
+            collection_items: 0,
+        }
+    }
+
     fn ensure_depth(depth: usize) -> Result<(), CaptureError> {
         if depth > MAX_CAPTURE_DEPTH {
             return Err(CaptureError);
@@ -147,11 +156,14 @@ impl ser::Error for CaptureError {
     }
 }
 
-pub(crate) fn capture_typed<T>(value: &T) -> Result<CapturedValue, IntegrityError>
+pub(crate) fn capture_typed<T>(
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<CapturedValue, IntegrityError>
 where
     T: Serialize + ?Sized,
 {
-    let mut budget = CaptureBudget::default();
+    let mut budget = CaptureBudget::new(profile);
     value
         .serialize(CaptureSerializer {
             budget: &mut budget,
@@ -217,14 +229,14 @@ impl<'a> Serializer for CaptureSerializer<'a> {
 
     fn serialize_i64(mut self, value: i64) -> Result<Self::Ok, Self::Error> {
         self.claim_node()?;
-        CapturedNumber::from_i128(i128::from(value))
+        CapturedNumber::from_i128(i128::from(value), self.budget.profile)
             .map(CapturedValue::Number)
             .map_err(map_ser_error)
     }
 
     fn serialize_i128(mut self, value: i128) -> Result<Self::Ok, Self::Error> {
         self.claim_node()?;
-        CapturedNumber::from_i128(value)
+        CapturedNumber::from_i128(value, self.budget.profile)
             .map(CapturedValue::Number)
             .map_err(map_ser_error)
     }
@@ -243,14 +255,14 @@ impl<'a> Serializer for CaptureSerializer<'a> {
 
     fn serialize_u64(mut self, value: u64) -> Result<Self::Ok, Self::Error> {
         self.claim_node()?;
-        CapturedNumber::from_u128(u128::from(value))
+        CapturedNumber::from_u128(u128::from(value), self.budget.profile)
             .map(CapturedValue::Number)
             .map_err(map_ser_error)
     }
 
     fn serialize_u128(mut self, value: u128) -> Result<Self::Ok, Self::Error> {
         self.claim_node()?;
-        CapturedNumber::from_u128(value)
+        CapturedNumber::from_u128(value, self.budget.profile)
             .map(CapturedValue::Number)
             .map_err(map_ser_error)
     }
@@ -261,7 +273,7 @@ impl<'a> Serializer for CaptureSerializer<'a> {
 
     fn serialize_f64(mut self, value: f64) -> Result<Self::Ok, Self::Error> {
         self.claim_node()?;
-        CapturedNumber::from_f64(value)
+        CapturedNumber::from_f64(value, self.budget.profile)
             .map(CapturedValue::Number)
             .map_err(map_ser_error)
     }
@@ -714,11 +726,11 @@ impl Serializer for MapKeySerializer<'_> {
         self.stringify(value)
     }
     fn serialize_i64(self, value: i64) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_i128(i128::from(value)).map_err(map_ser_error)?;
+        CapturedNumber::from_i128(i128::from(value), self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_i128(self, value: i128) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_i128(value).map_err(map_ser_error)?;
+        CapturedNumber::from_i128(value, self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_u8(self, value: u8) -> Result<Self::Ok, Self::Error> {
@@ -731,11 +743,11 @@ impl Serializer for MapKeySerializer<'_> {
         self.stringify(value)
     }
     fn serialize_u64(self, value: u64) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_u128(u128::from(value)).map_err(map_ser_error)?;
+        CapturedNumber::from_u128(u128::from(value), self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_u128(self, value: u128) -> Result<Self::Ok, Self::Error> {
-        CapturedNumber::from_u128(value).map_err(map_ser_error)?;
+        CapturedNumber::from_u128(value, self.budget.profile).map_err(map_ser_error)?;
         self.stringify(value)
     }
     fn serialize_f32(self, _value: f32) -> Result<Self::Ok, Self::Error> {

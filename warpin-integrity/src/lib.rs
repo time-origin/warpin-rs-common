@@ -4,6 +4,12 @@
 //! untrusted JSON with bounded resources and duplicate-key rejection, and then
 //! delegates RFC 8785 JSON Canonicalization Scheme output to `serde_jcs`.
 //! Arrays are always preserved in caller-provided order.
+//!
+//! The default APIs implement the complete RFC 8785 binary64 number model.
+//! [`CanonicalProfile::IJsonSafeIntegers`] is an explicit stricter profile for
+//! protocols that forbid mathematical integers outside `[-(2^53-1), 2^53-1]`
+//! and reject nonzero numeric underflow. ProtoJSON `int64`, `uint64`, and other
+//! exact decimal values should be projected as JSON strings before hashing.
 
 mod capture;
 mod json;
@@ -20,6 +26,19 @@ use crate::json::parse_captured_json;
 
 const SHA256_PREFIX: &str = "sha256:";
 const BINDING_LABEL_MAX_LEN: usize = 128;
+
+/// Numeric contract applied before RFC 8785 canonical serialization.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CanonicalProfile {
+    /// Complete RFC 8785 behavior using ECMAScript binary64 number semantics.
+    #[default]
+    Rfc8785,
+    /// RFC 8785 plus a strict interoperable mathematical-integer domain.
+    ///
+    /// Mathematical integers must be within `[-(2^53-1), 2^53-1]`, including
+    /// raw spellings such as `1.0` and `1e0`. Nonzero underflow is rejected.
+    IJsonSafeIntegers,
+}
 
 /// Errors returned by strict parsing, canonicalization, and digest validation.
 ///
@@ -44,8 +63,8 @@ pub enum IntegrityError {
         /// One-based source column.
         column: usize,
     },
-    /// A value violated JCS or the I-JSON safe number contract.
-    #[error("value cannot be canonicalized as RFC 8785 JSON")]
+    /// A value violated JCS or the selected numeric profile.
+    #[error("value cannot be canonicalized under the selected profile")]
     Canonicalization,
     /// A digest did not have the required lowercase SHA-256 representation.
     #[error("digest must use sha256 followed by 64 lowercase hexadecimal characters")]
@@ -114,23 +133,46 @@ impl DigestBinding {
 
 /// Parses bounded untrusted JSON while rejecting duplicate decoded object keys.
 pub fn parse_json_strict(input: &str) -> Result<serde_json::Value, IntegrityError> {
-    parse_captured_json(input)?.into_json()
+    parse_captured_json(input, CanonicalProfile::Rfc8785)?.into_json()
 }
 
 /// Captures a typed value once and returns RFC 8785 canonical UTF-8 bytes.
 ///
-/// Integer values are limited to I-JSON's interoperable safe domain
-/// `[-(2^53-1), 2^53-1]`. Non-finite floats are rejected.
+/// This default uses [`CanonicalProfile::Rfc8785`]. Typed integers are accepted
+/// only when conversion to binary64 is lossless; non-finite floats are rejected.
 pub fn canonical_bytes<T>(value: &T) -> Result<Vec<u8>, IntegrityError>
 where
     T: Serialize + ?Sized,
 {
-    canonicalize_captured(&capture_typed(value)?)
+    canonical_bytes_with_profile(value, CanonicalProfile::Rfc8785)
 }
 
-/// Strictly parses untrusted JSON and returns its RFC 8785 canonical bytes.
+/// Captures a typed value once using an explicit numeric profile.
+pub fn canonical_bytes_with_profile<T>(
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<Vec<u8>, IntegrityError>
+where
+    T: Serialize + ?Sized,
+{
+    canonicalize_captured(&capture_typed(value, profile)?)
+}
+
+/// Strictly parses untrusted JSON using the complete RFC 8785 number model.
+///
+/// Raw numbers are interpreted as ECMAScript binary64 values. Protocols that
+/// require exact `int64` or decimal semantics must encode those values as JSON
+/// strings before canonicalization.
 pub fn canonical_bytes_from_json(input: &str) -> Result<Vec<u8>, IntegrityError> {
-    canonicalize_captured(&parse_captured_json(input)?)
+    canonical_bytes_from_json_with_profile(input, CanonicalProfile::Rfc8785)
+}
+
+/// Strictly parses untrusted JSON using an explicit numeric profile.
+pub fn canonical_bytes_from_json_with_profile(
+    input: &str,
+    profile: CanonicalProfile,
+) -> Result<Vec<u8>, IntegrityError> {
+    canonicalize_captured(&parse_captured_json(input, profile)?)
 }
 
 /// Returns the SHA-256 digest of a typed value's canonical representation.
@@ -138,12 +180,31 @@ pub fn digest_typed<T>(value: &T) -> Result<Sha256Digest, IntegrityError>
 where
     T: Serialize + ?Sized,
 {
-    canonical_bytes(value).map(|bytes| digest_bytes(&bytes))
+    digest_typed_with_profile(value, CanonicalProfile::Rfc8785)
+}
+
+/// Digests a typed value using an explicit numeric profile.
+pub fn digest_typed_with_profile<T>(
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<Sha256Digest, IntegrityError>
+where
+    T: Serialize + ?Sized,
+{
+    canonical_bytes_with_profile(value, profile).map(|bytes| digest_bytes(&bytes))
 }
 
 /// Strictly parses untrusted JSON and digests its canonical representation.
 pub fn digest_from_json(input: &str) -> Result<Sha256Digest, IntegrityError> {
-    canonical_bytes_from_json(input).map(|bytes| digest_bytes(&bytes))
+    digest_from_json_with_profile(input, CanonicalProfile::Rfc8785)
+}
+
+/// Strictly parses and digests JSON using an explicit numeric profile.
+pub fn digest_from_json_with_profile(
+    input: &str,
+    profile: CanonicalProfile,
+) -> Result<Sha256Digest, IntegrityError> {
+    canonical_bytes_from_json_with_profile(input, profile).map(|bytes| digest_bytes(&bytes))
 }
 
 /// Digests a typed value with explicit domain and profile separation.
@@ -154,6 +215,18 @@ pub fn digest_bound<T>(binding: &DigestBinding, value: &T) -> Result<Sha256Diges
 where
     T: Serialize + ?Sized,
 {
+    digest_bound_with_profile(binding, value, CanonicalProfile::Rfc8785)
+}
+
+/// Digests a bound typed value using an explicit numeric profile.
+pub fn digest_bound_with_profile<T>(
+    binding: &DigestBinding,
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<Sha256Digest, IntegrityError>
+where
+    T: Serialize + ?Sized,
+{
     #[derive(Serialize)]
     struct BoundValue<'a, T: ?Sized> {
         domain: &'a str,
@@ -161,11 +234,14 @@ where
         value: &'a T,
     }
 
-    digest_typed(&BoundValue {
-        domain: &binding.domain,
-        profile: &binding.profile,
-        value,
-    })
+    digest_typed_with_profile(
+        &BoundValue {
+            domain: &binding.domain,
+            profile: &binding.profile,
+            value,
+        },
+        profile,
+    )
 }
 
 fn canonicalize_captured(value: &CapturedValue) -> Result<Vec<u8>, IntegrityError> {

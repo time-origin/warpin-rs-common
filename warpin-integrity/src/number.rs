@@ -1,6 +1,6 @@
 use serde::ser;
 
-use crate::IntegrityError;
+use crate::{CanonicalProfile, IntegrityError};
 
 pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -12,24 +12,54 @@ pub(crate) enum CapturedNumber {
 }
 
 impl CapturedNumber {
-    pub(crate) fn from_i128(value: i128) -> Result<Self, IntegrityError> {
-        let minimum = -i128::from(MAX_SAFE_INTEGER);
-        let maximum = i128::from(MAX_SAFE_INTEGER);
-        if !(minimum..=maximum).contains(&value) {
-            return Err(IntegrityError::Canonicalization);
+    pub(crate) fn from_i128(
+        value: i128,
+        profile: CanonicalProfile,
+    ) -> Result<Self, IntegrityError> {
+        match profile {
+            CanonicalProfile::Rfc8785 => {
+                if !integer_is_exact_binary64(value.unsigned_abs()) {
+                    return Err(IntegrityError::Canonicalization);
+                }
+                Ok(i64::try_from(value).map_or(Self::F64(value as f64), Self::I64))
+            }
+            CanonicalProfile::IJsonSafeIntegers => {
+                let minimum = -i128::from(MAX_SAFE_INTEGER);
+                let maximum = i128::from(MAX_SAFE_INTEGER);
+                if !(minimum..=maximum).contains(&value) {
+                    return Err(IntegrityError::Canonicalization);
+                }
+                Ok(Self::I64(value as i64))
+            }
         }
-        Ok(Self::I64(value as i64))
     }
 
-    pub(crate) fn from_u128(value: u128) -> Result<Self, IntegrityError> {
-        if value > u128::from(MAX_SAFE_INTEGER) {
-            return Err(IntegrityError::Canonicalization);
+    pub(crate) fn from_u128(
+        value: u128,
+        profile: CanonicalProfile,
+    ) -> Result<Self, IntegrityError> {
+        match profile {
+            CanonicalProfile::Rfc8785 => {
+                if !integer_is_exact_binary64(value) {
+                    return Err(IntegrityError::Canonicalization);
+                }
+                Ok(u64::try_from(value).map_or(Self::F64(value as f64), Self::U64))
+            }
+            CanonicalProfile::IJsonSafeIntegers => {
+                if value > u128::from(MAX_SAFE_INTEGER) {
+                    return Err(IntegrityError::Canonicalization);
+                }
+                Ok(Self::U64(value as u64))
+            }
         }
-        Ok(Self::U64(value as u64))
     }
 
-    pub(crate) fn from_f64(value: f64) -> Result<Self, IntegrityError> {
-        if !value.is_finite() || (value.fract() == 0.0 && value.abs() > MAX_SAFE_INTEGER as f64) {
+    pub(crate) fn from_f64(value: f64, profile: CanonicalProfile) -> Result<Self, IntegrityError> {
+        if !value.is_finite()
+            || (profile == CanonicalProfile::IJsonSafeIntegers
+                && value.fract() == 0.0
+                && value.abs() > MAX_SAFE_INTEGER as f64)
+        {
             return Err(IntegrityError::Canonicalization);
         }
         Ok(Self::F64(value))
@@ -47,7 +77,17 @@ impl CapturedNumber {
     }
 }
 
-pub(crate) fn parse_json_number(lexeme: &str) -> Result<CapturedNumber, IntegrityError> {
+pub(crate) fn parse_json_number(
+    lexeme: &str,
+    profile: CanonicalProfile,
+) -> Result<CapturedNumber, IntegrityError> {
+    if profile == CanonicalProfile::Rfc8785 {
+        let value = lexeme
+            .parse::<f64>()
+            .map_err(|_| IntegrityError::Canonicalization)?;
+        return CapturedNumber::from_f64(value, profile);
+    }
+
     let (negative, unsigned) = match lexeme.strip_prefix('-') {
         Some(value) => (true, value),
         None => (false, lexeme),
@@ -65,9 +105,9 @@ pub(crate) fn parse_json_number(lexeme: &str) -> Result<CapturedNumber, Integrit
 
     if let Some(magnitude) = normalized_integer(&digits, scale)? {
         if negative {
-            return CapturedNumber::from_i128(-i128::from(magnitude));
+            return CapturedNumber::from_i128(-i128::from(magnitude), profile);
         }
-        return CapturedNumber::from_u128(u128::from(magnitude));
+        return CapturedNumber::from_u128(u128::from(magnitude), profile);
     }
 
     let value = lexeme
@@ -77,6 +117,12 @@ pub(crate) fn parse_json_number(lexeme: &str) -> Result<CapturedNumber, Integrit
         return Err(IntegrityError::Canonicalization);
     }
     Ok(CapturedNumber::F64(value))
+}
+
+fn integer_is_exact_binary64(magnitude: u128) -> bool {
+    let significant_bits = u128::BITS - magnitude.leading_zeros();
+    let discarded_bits = significant_bits.saturating_sub(53);
+    discarded_bits == 0 || magnitude.trailing_zeros() >= discarded_bits
 }
 
 fn split_exponent(value: &str) -> Result<(&str, i64), IntegrityError> {
@@ -144,5 +190,5 @@ pub(crate) fn map_ser_error<E>(_error: IntegrityError) -> E
 where
     E: ser::Error,
 {
-    E::custom("value cannot be represented in the I-JSON safe number domain")
+    E::custom("value cannot be represented without canonical numeric loss")
 }

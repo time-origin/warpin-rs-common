@@ -1,15 +1,18 @@
 use std::collections::HashSet;
 
-use crate::IntegrityError;
 use crate::capture::CapturedValue;
 use crate::number::parse_json_number;
+use crate::{CanonicalProfile, IntegrityError};
 
 const MAX_INPUT_BYTES: usize = 1_048_576;
 const MAX_NESTING_DEPTH: usize = 128;
 const MAX_NUMBER_BYTES: usize = 1_024;
 const MAX_STRING_BYTES: usize = 262_144;
 
-pub(crate) fn parse_captured_json(input: &str) -> Result<CapturedValue, IntegrityError> {
+pub(crate) fn parse_captured_json(
+    input: &str,
+    profile: CanonicalProfile,
+) -> Result<CapturedValue, IntegrityError> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(IntegrityError::InvalidJson { line: 1, column: 1 });
     }
@@ -17,6 +20,7 @@ pub(crate) fn parse_captured_json(input: &str) -> Result<CapturedValue, Integrit
         input,
         bytes: input.as_bytes(),
         index: 0,
+        profile,
     };
     parser.skip_whitespace();
     let value = parser.parse_value(0)?;
@@ -31,6 +35,7 @@ struct Parser<'a> {
     input: &'a str,
     bytes: &'a [u8],
     index: usize,
+    profile: CanonicalProfile,
 }
 
 impl Parser<'_> {
@@ -178,7 +183,7 @@ impl Parser<'_> {
         if lexeme.len() > MAX_NUMBER_BYTES {
             return Err(IntegrityError::Canonicalization);
         }
-        parse_json_number(lexeme).map(CapturedValue::Number)
+        parse_json_number(lexeme, self.profile).map(CapturedValue::Number)
     }
 
     fn consume_digits(&mut self) {

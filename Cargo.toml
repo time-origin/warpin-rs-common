@@ -21,7 +21,7 @@ edition = "2024"
 version = "0.2.2"
 license = "MIT"
 authors = ["Warpin Engineering <dev@warpin.io>"]
-repository = "https://github.com/warpin/warpin-rs"
+repository = "https://github.com/time-origin/warpin-rs-common"
 
 [workspace.dependencies]
 # ── 异步运行时 ──

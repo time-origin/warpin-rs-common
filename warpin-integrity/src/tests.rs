@@ -36,6 +36,114 @@ fn canonicalizes_utf16_key_order_escaping_and_rfc_numbers() {
 }
 
 #[test]
+fn default_canonicalization_accepts_the_full_rfc8785_number_domain() {
+    assert_eq!(
+        String::from_utf8(canonical_bytes_from_json("1E30").expect("RFC 8785 number"))
+            .expect("UTF-8"),
+        "1e+30"
+    );
+    assert_eq!(
+        String::from_utf8(canonical_bytes(&1e30_f64).expect("finite typed float")).expect("UTF-8"),
+        "1e+30"
+    );
+}
+
+#[test]
+fn explicit_profiles_have_stable_and_distinct_number_contracts() {
+    let full = CanonicalProfile::Rfc8785;
+    let safe = CanonicalProfile::IJsonSafeIntegers;
+
+    for (input, expected) in [
+        ("1E30", "1e+30"),
+        ("9007199254740993", "9007199254740992"),
+        ("9007199254740993.0", "9007199254740992"),
+        ("9007199254740993e0", "9007199254740992"),
+        ("1e-400", "0"),
+    ] {
+        assert_eq!(
+            String::from_utf8(
+                canonical_bytes_from_json_with_profile(input, full).expect("full RFC 8785")
+            )
+            .expect("UTF-8"),
+            expected
+        );
+    }
+    for rejected in [
+        "1E30",
+        "9007199254740992",
+        "9007199254740993.0",
+        "9007199254740993e0",
+        "1e-400",
+    ] {
+        assert!(matches!(
+            canonical_bytes_from_json_with_profile(rejected, safe),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    assert_eq!(
+        canonical_bytes_from_json_with_profile("1E30", safe)
+            .expect_err("safe profile rejects the value")
+            .to_string(),
+        "value cannot be canonicalized under the selected profile"
+    );
+
+    assert_eq!(
+        String::from_utf8(
+            canonical_bytes_with_profile(&9_007_199_254_740_992_u64, full)
+                .expect("exact binary64 integer")
+        )
+        .expect("UTF-8"),
+        "9007199254740992"
+    );
+    assert!(matches!(
+        canonical_bytes_with_profile(&9_007_199_254_740_993_u64, full),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes_with_profile(&9_007_199_254_740_992_u64, safe),
+        Err(IntegrityError::Canonicalization)
+    ));
+    let exact_i128 = 1_i128 << 100;
+    assert!(canonical_bytes_with_profile(&exact_i128, full).is_ok());
+    assert!(matches!(
+        canonical_bytes_with_profile(&(exact_i128 + 1), full),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes_with_profile(&exact_i128, safe),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert_eq!(
+        String::from_utf8(
+            canonical_bytes_with_profile(&1e30_f64, full).expect("finite full-profile float")
+        )
+        .expect("UTF-8"),
+        "1e+30"
+    );
+    assert!(matches!(
+        canonical_bytes_with_profile(&1e30_f64, safe),
+        Err(IntegrityError::Canonicalization)
+    ));
+
+    let full_digest = digest_from_json_with_profile("1E30", full).expect("full digest");
+    assert_eq!(
+        full_digest.as_str(),
+        "sha256:7412d94bdf30adfa71080e057185e1a8de86e2e99a8350b011df8ac41ed5a6e3"
+    );
+    assert_eq!(digest_from_json("1E30").expect("default full"), full_digest);
+    assert_eq!(
+        digest_typed(&1e30_f64).expect("default typed full"),
+        digest_typed_with_profile(&1e30_f64, full).expect("explicit typed full")
+    );
+
+    let binding = DigestBinding::new("warpin.integrity", "rfc8785-v1").expect("binding");
+    assert_eq!(
+        digest_bound(&binding, &1e30_f64).expect("default bound full"),
+        digest_bound_with_profile(&binding, &1e30_f64, full).expect("explicit bound full")
+    );
+}
+
+#[test]
 fn strict_parser_rejects_nested_and_escaped_duplicate_keys_without_echoing_values() {
     for input in [
         r#"{"secret":"first","secret":"second"}"#,
@@ -113,7 +221,10 @@ fn typed_duplicate_map_keys_and_nonfinite_values_are_rejected() {
         Err(IntegrityError::Canonicalization)
     ));
     assert!(matches!(
-        canonical_bytes(&9_007_199_254_740_992_f64),
+        canonical_bytes_with_profile(
+            &9_007_199_254_740_992_f64,
+            CanonicalProfile::IJsonSafeIntegers
+        ),
         Err(IntegrityError::Canonicalization)
     ));
 }
@@ -266,6 +377,7 @@ fn typed_sequences_and_structs_keep_ignored_capture_errors_sticky() {
 
 #[test]
 fn raw_mathematical_integers_use_i_json_safe_domain() {
+    let profile = CanonicalProfile::IJsonSafeIntegers;
     for unsafe_integer in [
         "9007199254740992",
         "9007199254740993",
@@ -275,7 +387,7 @@ fn raw_mathematical_integers_use_i_json_safe_domain() {
         "-9007199254740993.0",
     ] {
         assert!(matches!(
-            canonical_bytes_from_json(unsafe_integer),
+            canonical_bytes_from_json_with_profile(unsafe_integer, profile),
             Err(IntegrityError::Canonicalization)
         ));
     }
@@ -288,7 +400,8 @@ fn raw_mathematical_integers_use_i_json_safe_domain() {
         ("9007199254740991.5", "9007199254740992"),
     ] {
         assert_eq!(
-            String::from_utf8(canonical_bytes_from_json(safe).expect("safe")).expect("UTF-8"),
+            String::from_utf8(canonical_bytes_from_json_with_profile(safe, profile).expect("safe"))
+                .expect("UTF-8"),
             expected
         );
     }
@@ -296,9 +409,15 @@ fn raw_mathematical_integers_use_i_json_safe_domain() {
 
 #[test]
 fn raw_overflow_underflow_and_malformed_numbers_fail_closed() {
-    for value in ["1e400", "-1e400", "1e-400", "-1e-400"] {
+    for value in ["1e400", "-1e400"] {
         assert!(matches!(
             canonical_bytes_from_json(value),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    for value in ["1e-400", "-1e-400"] {
+        assert!(matches!(
+            canonical_bytes_from_json_with_profile(value, CanonicalProfile::IJsonSafeIntegers),
             Err(IntegrityError::Canonicalization)
         ));
     }
@@ -450,7 +569,8 @@ fn typed_capture_does_not_retain_capacity_from_untrusted_empty_hints() {
         }
     }
 
-    let captured = crate::capture::capture_typed(&ManyEmptyContainers).expect("within budget");
+    let captured = crate::capture::capture_typed(&ManyEmptyContainers, CanonicalProfile::Rfc8785)
+        .expect("within budget");
     let crate::capture::CapturedValue::Array(children) = captured else {
         panic!("expected outer array");
     };
@@ -468,27 +588,28 @@ fn typed_capture_does_not_retain_capacity_from_untrusted_empty_hints() {
 
 #[test]
 fn typed_integer_domain_is_uniform_for_all_widths() {
+    let profile = CanonicalProfile::IJsonSafeIntegers;
     for value in [9_007_199_254_740_992_i64, i64::MAX] {
         assert!(matches!(
-            canonical_bytes(&value),
+            canonical_bytes_with_profile(&value, profile),
             Err(IntegrityError::Canonicalization)
         ));
     }
     for value in [9_007_199_254_740_992_u64, u64::MAX] {
         assert!(matches!(
-            canonical_bytes(&value),
+            canonical_bytes_with_profile(&value, profile),
             Err(IntegrityError::Canonicalization)
         ));
     }
     for rejected in [
-        canonical_bytes(&i128::MIN),
-        canonical_bytes(&i128::MAX),
-        canonical_bytes(&u128::MAX),
+        canonical_bytes_with_profile(&i128::MIN, profile),
+        canonical_bytes_with_profile(&i128::MAX, profile),
+        canonical_bytes_with_profile(&u128::MAX, profile),
     ] {
         assert!(matches!(rejected, Err(IntegrityError::Canonicalization)));
     }
-    assert!(canonical_bytes(&9_007_199_254_740_991_i64).is_ok());
-    assert!(canonical_bytes(&-9_007_199_254_740_991_i64).is_ok());
+    assert!(canonical_bytes_with_profile(&9_007_199_254_740_991_i64, profile).is_ok());
+    assert!(canonical_bytes_with_profile(&-9_007_199_254_740_991_i64, profile).is_ok());
 }
 
 #[test]
