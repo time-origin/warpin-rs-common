@@ -1,0 +1,357 @@
+use std::cell::Cell;
+
+use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq};
+
+use super::*;
+
+#[test]
+fn canonicalizes_key_order_nested_values_and_arrays() {
+    let bytes = canonical_bytes_from_json(r#"{"b":1,"a":{"z":true,"x":null},"v":[2,1]}"#)
+        .expect("valid JSON canonicalizes");
+    assert_eq!(
+        String::from_utf8(bytes).expect("JCS is UTF-8"),
+        r#"{"a":{"x":null,"z":true},"b":1,"v":[2,1]}"#
+    );
+}
+
+#[test]
+fn canonicalizes_utf16_key_order_escaping_and_rfc_numbers() {
+    let unicode = canonical_bytes_from_json(
+        "{\"\\uFFFD\":1,\"😀\":2,\"text\":\"line\\nquote\\\"slash\\\\\\u000f\"}",
+    )
+    .expect("Unicode JSON canonicalizes");
+    assert_eq!(
+        String::from_utf8(unicode).expect("JCS is UTF-8"),
+        "{\"text\":\"line\\nquote\\\"slash\\\\\\u000f\",\"😀\":2,\"�\":1}"
+    );
+    let numbers = canonical_bytes_from_json(
+        "[333333333.33333329,1E-7,4.50,2e-3,0.000000000000000000000000001,-0]",
+    )
+    .expect("finite numbers canonicalize");
+    assert_eq!(
+        String::from_utf8(numbers).expect("JCS is UTF-8"),
+        "[333333333.3333333,1e-7,4.5,0.002,1e-27,0]"
+    );
+}
+
+#[test]
+fn strict_parser_rejects_nested_and_escaped_duplicate_keys_without_echoing_values() {
+    for input in [
+        r#"{"secret":"first","secret":"second"}"#,
+        r#"{"outer":{"token":"first","token":"second"}}"#,
+        r#"[{"credential":"first","\u0063redential":"second"}]"#,
+    ] {
+        let error = parse_json_strict(input).expect_err("duplicates are ambiguous");
+        assert!(matches!(error, IntegrityError::DuplicateKey { .. }));
+        let display = error.to_string();
+        for sensitive in ["secret", "token", "credential", "first", "second"] {
+            assert!(!display.contains(sensitive));
+        }
+    }
+}
+
+#[test]
+fn typed_serialization_is_invoked_exactly_once() {
+    struct Stateful<'a>(&'a Cell<usize>);
+    impl Serialize for Stateful<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let call = self.0.get();
+            self.0.set(call + 1);
+            if call == 0 {
+                serializer.serialize_str("first")
+            } else {
+                serializer.serialize_f64(f64::NAN)
+            }
+        }
+    }
+    let calls = Cell::new(0);
+    let canonical = canonical_bytes(&Stateful(&calls)).expect("single capture");
+    assert_eq!(calls.get(), 1);
+    assert_eq!(String::from_utf8(canonical).expect("UTF-8"), r#""first""#);
+}
+
+#[test]
+fn typed_duplicate_map_keys_and_nonfinite_values_are_rejected() {
+    struct DuplicateMap;
+    impl Serialize for DuplicateMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("same", &1)?;
+            map.serialize_entry("same", &2)?;
+            map.end()
+        }
+    }
+    struct IgnoredDuplicateMap;
+    impl Serialize for IgnoredDuplicateMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(2))?;
+            map.serialize_entry("same", &1)?;
+            let _ignored = map.serialize_entry("same", &2);
+            map.end()
+        }
+    }
+    assert!(matches!(
+        canonical_bytes(&DuplicateMap),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&IgnoredDuplicateMap),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&f64::NAN),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&9_007_199_254_740_992_f64),
+        Err(IntegrityError::Canonicalization)
+    ));
+}
+
+#[test]
+fn raw_mathematical_integers_use_i_json_safe_domain() {
+    for unsafe_integer in [
+        "9007199254740992",
+        "9007199254740993",
+        "9007199254740993.0",
+        "9007199254740993e0",
+        "-9007199254740992",
+        "-9007199254740993.0",
+    ] {
+        assert!(matches!(
+            canonical_bytes_from_json(unsafe_integer),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    for (safe, expected) in [
+        ("9007199254740991", "9007199254740991"),
+        ("9007199254740991.0", "9007199254740991"),
+        ("9007199254740991e0", "9007199254740991"),
+        ("-9007199254740991", "-9007199254740991"),
+        ("15e-1", "1.5"),
+        ("9007199254740991.5", "9007199254740992"),
+    ] {
+        assert_eq!(
+            String::from_utf8(canonical_bytes_from_json(safe).expect("safe")).expect("UTF-8"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn raw_overflow_underflow_and_malformed_numbers_fail_closed() {
+    for value in ["1e400", "-1e400", "1e-400", "-1e-400"] {
+        assert!(matches!(
+            canonical_bytes_from_json(value),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    assert_eq!(
+        String::from_utf8(canonical_bytes_from_json("0e-400").expect("zero")).expect("UTF-8"),
+        "0"
+    );
+    for value in ["+1", "01", "--1", "1 trailing", "1.", ".1", "1e"] {
+        assert!(matches!(
+            canonical_bytes_from_json(value),
+            Err(IntegrityError::InvalidJson { .. })
+        ));
+    }
+}
+
+#[test]
+fn raw_parser_enforces_depth_input_and_number_resource_bounds() {
+    let too_deep = format!("{}0{}", "[".repeat(130), "]".repeat(130));
+    assert!(matches!(
+        canonical_bytes_from_json(&too_deep),
+        Err(IntegrityError::InvalidJson { .. })
+    ));
+
+    let oversized_number = "1".repeat(1_025);
+    assert!(matches!(
+        canonical_bytes_from_json(&oversized_number),
+        Err(IntegrityError::Canonicalization)
+    ));
+
+    let oversized_input = format!("\"{}\"", "x".repeat(1_048_576));
+    assert!(matches!(
+        canonical_bytes_from_json(&oversized_input),
+        Err(IntegrityError::InvalidJson { .. })
+    ));
+}
+
+#[test]
+fn typed_capture_enforces_shared_resource_budgets_without_panicking() {
+    struct HugeHint;
+    impl Serialize for HugeHint {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_seq(Some(usize::MAX))?.end()
+        }
+    }
+
+    struct Nested(usize);
+    impl Serialize for Nested {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            if self.0 == 0 {
+                return serializer.serialize_unit();
+            }
+            let mut sequence = serializer.serialize_seq(Some(1))?;
+            sequence.serialize_element(&Nested(self.0 - 1))?;
+            sequence.end()
+        }
+    }
+
+    struct RecursiveKey(usize);
+    impl Serialize for RecursiveKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            if self.0 == 0 {
+                serializer.serialize_str("key")
+            } else {
+                serializer.serialize_newtype_struct("RecursiveKey", &RecursiveKey(self.0 - 1))
+            }
+        }
+    }
+    struct DeepKeyMap;
+    impl Serialize for DeepKeyMap {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(&RecursiveKey(130), &1)?;
+            map.end()
+        }
+    }
+
+    let huge_hint = std::panic::catch_unwind(|| canonical_bytes(&HugeHint));
+    assert!(matches!(
+        huge_hint,
+        Ok(Err(IntegrityError::Canonicalization))
+    ));
+    assert!(matches!(
+        canonical_bytes(&Nested(130)),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&DeepKeyMap),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&"x".repeat(1_048_577)),
+        Err(IntegrityError::Canonicalization)
+    ));
+    assert!(matches!(
+        canonical_bytes(&vec![0_u8; 100_001]),
+        Err(IntegrityError::Canonicalization)
+    ));
+}
+
+#[test]
+fn typed_integer_domain_is_uniform_for_all_widths() {
+    for value in [9_007_199_254_740_992_i64, i64::MAX] {
+        assert!(matches!(
+            canonical_bytes(&value),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    for value in [9_007_199_254_740_992_u64, u64::MAX] {
+        assert!(matches!(
+            canonical_bytes(&value),
+            Err(IntegrityError::Canonicalization)
+        ));
+    }
+    for rejected in [
+        canonical_bytes(&i128::MIN),
+        canonical_bytes(&i128::MAX),
+        canonical_bytes(&u128::MAX),
+    ] {
+        assert!(matches!(rejected, Err(IntegrityError::Canonicalization)));
+    }
+    assert!(canonical_bytes(&9_007_199_254_740_991_i64).is_ok());
+    assert!(canonical_bytes(&-9_007_199_254_740_991_i64).is_ok());
+}
+
+#[test]
+fn semantic_digests_binding_and_protojson_vector_are_stable() {
+    let left = digest_from_json(r#"{"alpha":1,"nested":{"x":"same","y":2}}"#).expect("digest");
+    let reordered = digest_from_json(r#"{"nested":{"y":2,"x":"same"},"alpha":1}"#).expect("digest");
+    let changed =
+        digest_from_json(r#"{"alpha":1,"nested":{"x":"changed","y":2}}"#).expect("digest");
+    assert_eq!(left, reordered);
+    assert_ne!(left, changed);
+    assert_eq!(left.as_str().len(), 71);
+
+    let binding = DigestBinding::new("astro.event", "protojson-jcs-v1").expect("binding");
+    let order = serde_json::json!({"steps":["second", "first"]});
+    assert_ne!(
+        digest_bound(&binding, &order).expect("bound"),
+        digest_bound(&binding, &serde_json::json!({"steps":["first", "second"]})).expect("bound")
+    );
+
+    let protojson = r#"{"status":"COST_SETTLEMENT_STATUS_SETTLED","quantityDecimal":"12.5","microunits":"1250000","metadata":{"tenantId":"tenant_a","occurredAt":"2026-07-11T10:05:01Z","eventId":"evt_1"}}"#;
+    assert_eq!(
+        digest_from_json(protojson)
+            .expect("ProtoJSON digest")
+            .as_str(),
+        "sha256:9814f428f0a53d8b6d6f5887da362371c4533c51c1535b05f02c6cf7c08b9431"
+    );
+}
+
+#[test]
+fn digest_and_binding_validation_are_strict_and_redacted() {
+    let valid = format!("sha256:{}", "a".repeat(64));
+    assert_eq!(
+        valid.parse::<Sha256Digest>().expect("valid").as_str(),
+        valid
+    );
+    for invalid in [
+        "",
+        "sha256:abc",
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ] {
+        assert!(matches!(
+            invalid.parse::<Sha256Digest>(),
+            Err(IntegrityError::InvalidDigest)
+        ));
+    }
+    for label in ["", "line\nbreak", "\u{7f}"] {
+        let error = DigestBinding::new(label, "profile").expect_err("invalid");
+        if !label.is_empty() {
+            assert!(!error.to_string().contains(label));
+        }
+    }
+}
+
+#[test]
+fn typed_and_raw_json_share_the_same_tree() {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        alpha: u64,
+        label: &'a str,
+    }
+    let typed = digest_typed(&Payload {
+        alpha: 7,
+        label: "stable",
+    })
+    .expect("typed");
+    let raw = digest_from_json(r#"{"label":"stable","alpha":7}"#).expect("raw");
+    assert_eq!(typed, raw);
+}
