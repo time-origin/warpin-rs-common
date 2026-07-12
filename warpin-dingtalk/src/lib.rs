@@ -591,7 +591,7 @@ pub struct ProcessCodeByNameResponse {
 
 impl ProcessCodeByNameResponse {
     fn into_result(self) -> ProcessCodeByNameResult {
-        self.result.unwrap_or_else(|| ProcessCodeByNameResult {
+        self.result.unwrap_or(ProcessCodeByNameResult {
             process_code: self.process_code,
             name: self.name,
             extra: self.extra,
