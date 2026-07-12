@@ -1,6 +1,13 @@
+#![doc = include_str!("../README.md")]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub mod exact_metering;
+pub use exact_metering::{
+    ExactMeteringError, ExactRate, ExactUsageQuantity, NonNegativeMicrounits, SettlementRounding,
+};
 
 /// Multi-dimensional scope for request context.
 ///
