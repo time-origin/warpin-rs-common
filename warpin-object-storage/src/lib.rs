@@ -15,6 +15,9 @@ const MAX_KEY_BYTES: usize = 1_024;
 const MAX_URL_BYTES: usize = 2_048;
 const MAX_OPTION_KEY_BYTES: usize = 128;
 const MAX_OPTION_VALUE_BYTES: usize = 4_096;
+const MAX_ENCRYPTION_IDENTITY_BYTES: usize = 64;
+const SHA256_FINGERPRINT_PREFIX: &str = "sha256:";
+const SHA256_HEX_BYTES: usize = 64;
 
 #[derive(Clone)]
 pub struct ObjectStoreSettings {
@@ -163,6 +166,333 @@ pub struct ObjectWriteReceipt {
     pub e_tag: Option<String>,
     pub version: Option<String>,
     pub idempotent_replay: bool,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ManagedEncryptionIdentity {
+    provider: String,
+    algorithm: String,
+    key_identity_fingerprint: Option<String>,
+}
+
+impl ManagedEncryptionIdentity {
+    fn parse(
+        provider: &str,
+        algorithm: &str,
+        key_identity_fingerprint: Option<&str>,
+    ) -> Result<Self, EncryptionPolicyError> {
+        if !is_safe_encryption_identity(provider) || !is_safe_encryption_identity(algorithm) {
+            return Err(EncryptionPolicyError::InvalidEncryptionIdentity);
+        }
+        if key_identity_fingerprint.is_some_and(|value| !is_sha256_fingerprint(value)) {
+            return Err(EncryptionPolicyError::InvalidKeyIdentityFingerprint);
+        }
+        Ok(Self {
+            provider: provider.to_owned(),
+            algorithm: algorithm.to_owned(),
+            key_identity_fingerprint: key_identity_fingerprint.map(str::to_owned),
+        })
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum EncryptionRequirementKind {
+    Managed(ManagedEncryptionIdentity),
+    DevelopmentOrTestPlaintext,
+}
+
+/// Describes the minimum encryption evidence required for an artifact write.
+///
+/// Provider-specific request options remain the responsibility of storage adapters.
+/// The development/test variant must never be selected implicitly by a backend.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EncryptionRequirement {
+    kind: EncryptionRequirementKind,
+}
+
+impl EncryptionRequirement {
+    /// Requires managed encryption with an exact provider and algorithm identity.
+    ///
+    /// `key_identity_fingerprint`, when present, is a non-secret SHA-256 fingerprint
+    /// of the expected key identity. Raw key identifiers, ARNs, URLs, and credentials
+    /// are intentionally rejected.
+    pub fn managed(
+        provider: &str,
+        algorithm: &str,
+        key_identity_fingerprint: Option<&str>,
+    ) -> Result<Self, EncryptionPolicyError> {
+        Ok(Self {
+            kind: EncryptionRequirementKind::Managed(ManagedEncryptionIdentity::parse(
+                provider,
+                algorithm,
+                key_identity_fingerprint,
+            )?),
+        })
+    }
+
+    /// Explicitly permits plaintext only for a development or test deployment.
+    pub const fn development_or_test_plaintext() -> Self {
+        Self {
+            kind: EncryptionRequirementKind::DevelopmentOrTestPlaintext,
+        }
+    }
+
+    pub const fn is_managed(&self) -> bool {
+        matches!(self.kind, EncryptionRequirementKind::Managed(_))
+    }
+}
+
+impl fmt::Debug for EncryptionRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptionRequirement")
+            .field("mode", &encryption_mode_name(self.is_managed()))
+            .field("identity", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for EncryptionRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(encryption_mode_name(self.is_managed()))
+    }
+}
+
+/// Provider-neutral policy used to verify observed encryption evidence.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ArtifactEncryptionPolicy {
+    requirement: EncryptionRequirement,
+}
+
+impl ArtifactEncryptionPolicy {
+    pub const fn new(requirement: EncryptionRequirement) -> Self {
+        Self { requirement }
+    }
+
+    pub const fn requirement(&self) -> &EncryptionRequirement {
+        &self.requirement
+    }
+
+    /// Verifies encryption evidence and returns a wrapper that records that the
+    /// receipt passed this policy. Idempotent replays follow the same checks as new
+    /// writes and therefore cannot bypass a stronger requirement.
+    pub fn verify_receipt(
+        &self,
+        receipt: ObjectWriteReceipt,
+        attestation: Option<EncryptionAttestation>,
+    ) -> Result<EncryptionVerifiedObjectWriteReceipt, EncryptionPolicyError> {
+        let attestation = attestation.ok_or(EncryptionPolicyError::MissingAttestation)?;
+        self.verify_attestation(&attestation)?;
+        Ok(EncryptionVerifiedObjectWriteReceipt {
+            receipt,
+            attestation,
+        })
+    }
+
+    fn verify_attestation(
+        &self,
+        attestation: &EncryptionAttestation,
+    ) -> Result<(), EncryptionPolicyError> {
+        let EncryptionRequirementKind::Managed(required) = &self.requirement.kind else {
+            return Ok(());
+        };
+        let EncryptionAttestationKind::Managed(observed) = &attestation.kind else {
+            return Err(EncryptionPolicyError::ManagedEncryptionRequired);
+        };
+        if observed.provider != required.provider {
+            return Err(EncryptionPolicyError::ProviderMismatch);
+        }
+        if observed.algorithm != required.algorithm {
+            return Err(EncryptionPolicyError::AlgorithmMismatch);
+        }
+        if required.key_identity_fingerprint.is_some()
+            && observed.key_identity_fingerprint != required.key_identity_fingerprint
+        {
+            return Err(EncryptionPolicyError::KeyIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ArtifactEncryptionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArtifactEncryptionPolicy")
+            .field("requirement", &self.requirement)
+            .finish()
+    }
+}
+
+impl fmt::Display for ArtifactEncryptionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "artifact encryption policy: {}",
+            self.requirement
+        )
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum EncryptionAttestationKind {
+    Managed(ManagedEncryptionIdentity),
+    DevelopmentOrTestPlaintext,
+}
+
+/// Sanitized evidence describing encryption observed by a storage adapter.
+///
+/// The type intentionally cannot contain provider response bodies or raw key
+/// locators, and its formatting implementations never expose identity values.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EncryptionAttestation {
+    kind: EncryptionAttestationKind,
+}
+
+impl EncryptionAttestation {
+    pub fn managed(
+        provider: &str,
+        algorithm: &str,
+        key_identity_fingerprint: Option<&str>,
+    ) -> Result<Self, EncryptionPolicyError> {
+        Ok(Self {
+            kind: EncryptionAttestationKind::Managed(ManagedEncryptionIdentity::parse(
+                provider,
+                algorithm,
+                key_identity_fingerprint,
+            )?),
+        })
+    }
+
+    /// Records the deliberate absence of encryption in a development/test backend.
+    pub const fn plaintext_for_development_or_test() -> Self {
+        Self {
+            kind: EncryptionAttestationKind::DevelopmentOrTestPlaintext,
+        }
+    }
+
+    pub const fn is_managed(&self) -> bool {
+        matches!(self.kind, EncryptionAttestationKind::Managed(_))
+    }
+
+    /// Returns the validated semantic provider identity for durable attestation
+    /// storage. This value is never a provider locator or credential.
+    pub fn provider_identity(&self) -> Option<&str> {
+        self.managed_identity()
+            .map(|identity| identity.provider.as_str())
+    }
+
+    /// Returns the validated semantic algorithm identity for durable attestation
+    /// storage.
+    pub fn algorithm_identity(&self) -> Option<&str> {
+        self.managed_identity()
+            .map(|identity| identity.algorithm.as_str())
+    }
+
+    /// Returns the optional non-secret SHA-256 key identity fingerprint.
+    pub fn key_identity_fingerprint(&self) -> Option<&str> {
+        self.managed_identity()
+            .and_then(|identity| identity.key_identity_fingerprint.as_deref())
+    }
+
+    fn managed_identity(&self) -> Option<&ManagedEncryptionIdentity> {
+        match &self.kind {
+            EncryptionAttestationKind::Managed(identity) => Some(identity),
+            EncryptionAttestationKind::DevelopmentOrTestPlaintext => None,
+        }
+    }
+}
+
+impl fmt::Debug for EncryptionAttestation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptionAttestation")
+            .field("mode", &encryption_mode_name(self.is_managed()))
+            .field("identity", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Display for EncryptionAttestation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(encryption_mode_name(self.is_managed()))
+    }
+}
+
+/// A write receipt paired with encryption evidence accepted by an
+/// [`ArtifactEncryptionPolicy`].
+#[derive(Clone, Eq, PartialEq)]
+pub struct EncryptionVerifiedObjectWriteReceipt {
+    receipt: ObjectWriteReceipt,
+    attestation: EncryptionAttestation,
+}
+
+impl EncryptionVerifiedObjectWriteReceipt {
+    pub const fn receipt(&self) -> &ObjectWriteReceipt {
+        &self.receipt
+    }
+
+    pub const fn attestation(&self) -> &EncryptionAttestation {
+        &self.attestation
+    }
+
+    pub fn into_parts(self) -> (ObjectWriteReceipt, EncryptionAttestation) {
+        (self.receipt, self.attestation)
+    }
+}
+
+impl fmt::Debug for EncryptionVerifiedObjectWriteReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptionVerifiedObjectWriteReceipt")
+            .field("object", &"[VERIFIED]")
+            .field("size_bytes", &self.receipt.size_bytes)
+            .field("digest", &self.receipt.digest)
+            .field("idempotent_replay", &self.receipt.idempotent_replay)
+            .field("attestation", &self.attestation)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum EncryptionPolicyError {
+    #[error("encryption identity is invalid")]
+    InvalidEncryptionIdentity,
+    #[error("encryption key identity fingerprint is invalid")]
+    InvalidKeyIdentityFingerprint,
+    #[error("encryption attestation is required")]
+    MissingAttestation,
+    #[error("managed encryption is required")]
+    ManagedEncryptionRequired,
+    #[error("observed encryption provider does not satisfy policy")]
+    ProviderMismatch,
+    #[error("observed encryption algorithm does not satisfy policy")]
+    AlgorithmMismatch,
+    #[error("observed encryption key identity does not satisfy policy")]
+    KeyIdentityMismatch,
+}
+
+fn encryption_mode_name(managed: bool) -> &'static str {
+    if managed {
+        "managed"
+    } else {
+        "development-or-test-plaintext"
+    }
+}
+
+fn is_safe_encryption_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ENCRYPTION_IDENTITY_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn is_sha256_fingerprint(value: &str) -> bool {
+    value.len() == SHA256_FINGERPRINT_PREFIX.len() + SHA256_HEX_BYTES
+        && value.starts_with(SHA256_FINGERPRINT_PREFIX)
+        && value[SHA256_FINGERPRINT_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,6 +762,181 @@ mod tests {
             expected_digest: digest_bytes(body),
             content_type: "application/json".to_owned(),
         }
+    }
+
+    fn receipt(idempotent_replay: bool) -> ObjectWriteReceipt {
+        ObjectWriteReceipt {
+            key: ObjectKey::parse("objects/encrypted.json").expect("key"),
+            size_bytes: 9,
+            digest: digest_bytes(b"encrypted"),
+            e_tag: Some("opaque-etag".to_owned()),
+            version: Some("opaque-version".to_owned()),
+            idempotent_replay,
+        }
+    }
+
+    fn key_identity_fingerprint() -> &'static str {
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+
+    fn managed_policy() -> ArtifactEncryptionPolicy {
+        ArtifactEncryptionPolicy::new(
+            EncryptionRequirement::managed(
+                "portable-managed-key",
+                "aes-256-gcm",
+                Some(key_identity_fingerprint()),
+            )
+            .expect("managed requirement"),
+        )
+    }
+
+    fn managed_attestation() -> EncryptionAttestation {
+        EncryptionAttestation::managed(
+            "portable-managed-key",
+            "aes-256-gcm",
+            Some(key_identity_fingerprint()),
+        )
+        .expect("managed attestation")
+    }
+
+    #[test]
+    fn encryption_policy_rejects_absent_or_plaintext_attestation_when_managed_is_required() {
+        let policy = managed_policy();
+        assert_eq!(
+            policy.verify_receipt(receipt(false), None),
+            Err(EncryptionPolicyError::MissingAttestation)
+        );
+        assert_eq!(
+            policy.verify_receipt(
+                receipt(false),
+                Some(EncryptionAttestation::plaintext_for_development_or_test()),
+            ),
+            Err(EncryptionPolicyError::ManagedEncryptionRequired)
+        );
+    }
+
+    #[test]
+    fn encryption_policy_compares_managed_provider_algorithm_and_optional_key_identity() {
+        let verified = managed_policy()
+            .verify_receipt(receipt(false), Some(managed_attestation()))
+            .expect("matching managed attestation");
+        assert!(!verified.receipt().idempotent_replay);
+        assert!(verified.attestation().is_managed());
+
+        for (attestation, expected) in [
+            (
+                EncryptionAttestation::managed(
+                    "different-provider",
+                    "aes-256-gcm",
+                    Some(key_identity_fingerprint()),
+                )
+                .expect("attestation"),
+                EncryptionPolicyError::ProviderMismatch,
+            ),
+            (
+                EncryptionAttestation::managed(
+                    "portable-managed-key",
+                    "different-algorithm",
+                    Some(key_identity_fingerprint()),
+                )
+                .expect("attestation"),
+                EncryptionPolicyError::AlgorithmMismatch,
+            ),
+            (
+                EncryptionAttestation::managed(
+                    "portable-managed-key",
+                    "aes-256-gcm",
+                    Some("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                )
+                .expect("attestation"),
+                EncryptionPolicyError::KeyIdentityMismatch,
+            ),
+        ] {
+            assert_eq!(
+                managed_policy().verify_receipt(receipt(false), Some(attestation)),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_attestation_debug_and_display_never_disclose_identity_values() {
+        let provider = "sentinel-provider-secret";
+        let algorithm = "sentinel-algorithm-secret";
+        let fingerprint = key_identity_fingerprint();
+        let attestation = EncryptionAttestation::managed(provider, algorithm, Some(fingerprint))
+            .expect("managed attestation");
+
+        for rendered in [format!("{attestation:?}"), format!("{attestation}")] {
+            assert!(!rendered.contains(provider));
+            assert!(!rendered.contains(algorithm));
+            assert!(!rendered.contains(fingerprint));
+            assert!(!rendered.contains("arn:"));
+            assert!(!rendered.contains("https://"));
+            assert!(!rendered.to_ascii_lowercase().contains("credential"));
+            assert!(!rendered.to_ascii_lowercase().contains("token"));
+        }
+    }
+
+    #[test]
+    fn encryption_attestation_exposes_only_validated_semantic_identity_for_persistence() {
+        let attestation = managed_attestation();
+        assert_eq!(
+            attestation.provider_identity(),
+            Some("portable-managed-key")
+        );
+        assert_eq!(attestation.algorithm_identity(), Some("aes-256-gcm"));
+        assert_eq!(
+            attestation.key_identity_fingerprint(),
+            Some(key_identity_fingerprint())
+        );
+
+        let plaintext = EncryptionAttestation::plaintext_for_development_or_test();
+        assert_eq!(plaintext.provider_identity(), None);
+        assert_eq!(plaintext.algorithm_identity(), None);
+        assert_eq!(plaintext.key_identity_fingerprint(), None);
+    }
+
+    #[test]
+    fn encryption_identity_inputs_reject_provider_locator_shapes() {
+        for unsafe_identity in [
+            "arn:provider:kms:region:account:key/value",
+            "https://kms.example/key",
+            "provider/key",
+            "provider?credential=value",
+            "provider token",
+        ] {
+            assert!(EncryptionAttestation::managed(unsafe_identity, "aes-256-gcm", None).is_err());
+            assert!(EncryptionRequirement::managed(unsafe_identity, "aes-256-gcm", None).is_err());
+        }
+    }
+
+    #[test]
+    fn idempotent_write_receipt_cannot_bypass_a_weaker_observed_policy() {
+        let result = managed_policy().verify_receipt(
+            receipt(true),
+            Some(EncryptionAttestation::plaintext_for_development_or_test()),
+        );
+        assert_eq!(
+            result,
+            Err(EncryptionPolicyError::ManagedEncryptionRequired)
+        );
+    }
+
+    #[test]
+    fn plaintext_backends_require_an_explicit_development_or_test_policy() {
+        let attestation = EncryptionAttestation::plaintext_for_development_or_test();
+        assert_eq!(
+            managed_policy().verify_receipt(receipt(false), Some(attestation.clone())),
+            Err(EncryptionPolicyError::ManagedEncryptionRequired)
+        );
+
+        let policy =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::development_or_test_plaintext());
+        let verified = policy
+            .verify_receipt(receipt(false), Some(attestation))
+            .expect("explicit development/test plaintext policy");
+        assert!(!verified.attestation().is_managed());
     }
 
     #[test]
