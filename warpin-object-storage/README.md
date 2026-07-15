@@ -149,6 +149,9 @@ The ignored Rust integration test and wrapper script verify:
   containers, with complete output capture, strict single-document JSON
   validation, explicit container removal, and a cleanup ledger that atomically
   registers each validated single-line Docker name before container creation;
+- lstat-style rejection of a symlinked private work directory and every ledger
+  symlink (including dangling links), plus rejection of directories, FIFOs, and
+  other non-regular ledger objects before any ledger bytes are read;
 - a random, least-privilege processing identity (root is bootstrap-only);
 - two context-bound physical objects for one logical key;
 - SSE-KMS response identity and attestation fingerprint equality;
@@ -167,6 +170,27 @@ any individually remaining static or dynamic container, network, or temporary
 directory cannot produce the cleanup success attestation. The live gate
 additionally compares the running KES and MinIO bind-mount sets and lists their
 visible secret directories from inside each container.
+
+A ledger is either absent or a real regular file containing unique,
+newline-terminated names from the current run. Every historical record must use
+the current run prefix, a `bootstrap` or `metrics` identity, Docker's restricted
+single-line name grammar, and at most 128 bytes. Empty records, controls,
+whitespace, option-like values, wrong prefixes or identities, invalid Docker
+characters, duplicates, and a missing final newline make the whole ledger
+untrusted. Registration validates the complete old ledger, reconstructs and
+revalidates a same-directory candidate, and atomically replaces the ledger;
+failure leaves the original file or symlink target unchanged and occurs before
+`docker create`.
+
+Every one-shot container also receives one internally generated current-run
+label. Cleanup treats both the ledger and Docker label-query output as
+untrusted inputs: label results are individually validated by the same name
+contract and de-duplicated before use. A completely empty query is the normal
+"no containers" result, while an embedded empty record, malformed name, wrong
+run or identity, or duplicate result is corruption. If the ledger is damaged,
+best-effort trap cleanup can still remove a safely discovered run container,
+but verified cleanup returns failure even when fallback deletion succeeds; it
+cannot hide ledger-integrity loss behind `ephemeral_resources_cleaned=true`.
 
 A registered name whose `docker create` fails is a harmless absent cleanup
 entry. Once registration succeeds, every pre-create or post-create interruption

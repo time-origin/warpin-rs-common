@@ -23,6 +23,10 @@ readonly RUN_TOKEN="$$-$(date +%s)"
 readonly KES_NAME="warpin-kes-gate-${RUN_TOKEN}"
 readonly MINIO_NAME="warpin-minio-gate-${RUN_TOKEN}"
 readonly KES_ONE_SHOT_PREFIX="warpin-kes-one-shot-gate-${RUN_TOKEN}"
+readonly KES_ONE_SHOT_LABEL_KEY='com.warpin.live-gate.one-shot-run'
+readonly KES_ONE_SHOT_LABEL_VALUE="${RUN_TOKEN}"
+readonly KES_ONE_SHOT_LABEL="${KES_ONE_SHOT_LABEL_KEY}=${KES_ONE_SHOT_LABEL_VALUE}"
+readonly KES_ONE_SHOT_LABEL_FILTER="label=${KES_ONE_SHOT_LABEL}"
 readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
 readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
@@ -35,14 +39,12 @@ readonly KES_METRICS_DIR="${WORK_DIR}/kes/metrics"
 
 cleanup_best_effort() {
     local -a one_shot_containers=()
-    if [[ -f "${ONE_SHOT_LEDGER}" ]]; then
-        mapfile -t one_shot_containers <"${ONE_SHOT_LEDGER}"
-    fi
+    collect_validated_one_shot_cleanup_names one_shot_containers || true
     if (( ${#one_shot_containers[@]} > 0 )); then
-        docker rm -f "${one_shot_containers[@]}" >/dev/null 2>&1 || true
+        docker rm -f -- "${one_shot_containers[@]}" >/dev/null 2>&1 || true
     fi
-    docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1 || true
-    docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1 || true
+    docker rm -f -- "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1 || true
+    docker network rm -- "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1 || true
     rm -rf -- "${WORK_DIR}" || true
 }
 trap cleanup_best_effort EXIT INT TERM
@@ -50,20 +52,20 @@ trap cleanup_best_effort EXIT INT TERM
 cleanup_verified() {
     local failed=0
     local -a one_shot_containers=()
-    if [[ -f "${ONE_SHOT_LEDGER}" ]]; then
-        mapfile -t one_shot_containers <"${ONE_SHOT_LEDGER}"
+    if ! collect_validated_one_shot_cleanup_names one_shot_containers; then
+        failed=1
     fi
-    if ! docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1; then
+    if ! docker rm -f -- "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1; then
         failed=1
     fi
     local one_shot
     for one_shot in "${one_shot_containers[@]}"; do
-        if docker container inspect "${one_shot}" >/dev/null 2>&1 \
-            && ! docker rm -f "${one_shot}" >/dev/null 2>&1; then
+        if docker container inspect -- "${one_shot}" >/dev/null 2>&1 \
+            && ! docker rm -f -- "${one_shot}" >/dev/null 2>&1; then
             failed=1
         fi
     done
-    if ! docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1; then
+    if ! docker network rm -- "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1; then
         failed=1
     fi
     if ! rm -rf -- "${WORK_DIR}"; then
@@ -71,17 +73,22 @@ cleanup_verified() {
     fi
     local container
     for container in "${MINIO_NAME}" "${KES_NAME}" "${one_shot_containers[@]}"; do
-        if docker container inspect "${container}" >/dev/null 2>&1; then
+        if docker container inspect -- "${container}" >/dev/null 2>&1; then
             failed=1
         fi
     done
+    local -a labeled_residuals=()
+    if ! discover_labeled_one_shot_containers labeled_residuals \
+        || (( ${#labeled_residuals[@]} > 0 )); then
+        failed=1
+    fi
     local network
     for network in "${CLIENT_NETWORK}" "${KMS_NETWORK}"; do
-        if docker network inspect "${network}" >/dev/null 2>&1; then
+        if docker network inspect -- "${network}" >/dev/null 2>&1; then
             failed=1
         fi
     done
-    if [[ -e "${WORK_DIR}" ]]; then
+    if [[ -e "${WORK_DIR}" || -L "${WORK_DIR}" ]]; then
         failed=1
     fi
     (( failed == 0 ))
@@ -168,34 +175,179 @@ parse_kes_success_count() {
 validate_one_shot_container_name() {
     local client_name="$1"
     local identity_name="$2"
+    local LC_ALL=C
     case "${identity_name}" in
         bootstrap|metrics) ;;
         *) return 1 ;;
     esac
     local expected_prefix="${KES_ONE_SHOT_PREFIX}-${identity_name}-"
-    [[ "${client_name}" == "${expected_prefix}"* ]] \
+    [[ "${client_name}" == "${expected_prefix}"?* ]] \
         && (( ${#client_name} <= 128 )) \
         && [[ "${client_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+validate_one_shot_container_record() {
+    local client_name="$1"
+    validate_one_shot_container_name "${client_name}" bootstrap \
+        || validate_one_shot_container_name "${client_name}" metrics
+}
+
+validate_private_work_dir() {
+    [[ ! -L "${WORK_DIR}" && -d "${WORK_DIR}" ]]
+}
+
+validate_one_shot_label_contract() {
+    local LC_ALL=C
+    [[ "${KES_ONE_SHOT_LABEL_KEY}" =~ ^[a-z][a-z0-9.-]*[a-z0-9]$ ]] \
+        && [[ "${KES_ONE_SHOT_LABEL_VALUE}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+        && (( ${#KES_ONE_SHOT_LABEL_VALUE} <= 128 )) \
+        && [[ "${KES_ONE_SHOT_LABEL}" \
+            == "${KES_ONE_SHOT_LABEL_KEY}=${KES_ONE_SHOT_LABEL_VALUE}" ]] \
+        && [[ "${KES_ONE_SHOT_LABEL_FILTER}" == "label=${KES_ONE_SHOT_LABEL}" ]]
+}
+
+load_validated_one_shot_ledger() {
+    local ledger_path="$1"
+    local output_name="$2"
+    local -n output_ref="${output_name}"
+    output_ref=()
+    validate_private_work_dir || return 1
+    if [[ "${ledger_path}" != "${ONE_SHOT_LEDGER}" \
+        && "${ledger_path}" != "${WORK_DIR}/one-shot-containers.next."* ]]; then
+        return 1
+    fi
+    if [[ -L "${ledger_path}" ]]; then
+        return 1
+    fi
+    if [[ ! -e "${ledger_path}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "${ledger_path}" ]]; then
+        return 1
+    fi
+
+    local LC_ALL=C
+    local -a validated_records=()
+    local -A seen_records=()
+    local record=''
+    local expected_bytes=0
+    while IFS= read -r record; do
+        validate_one_shot_container_record "${record}" || return 1
+        if [[ -n "${seen_records[${record}]:-}" ]]; then
+            return 1
+        fi
+        seen_records["${record}"]=1
+        validated_records+=("${record}")
+        expected_bytes=$((expected_bytes + ${#record} + 1))
+    done <"${ledger_path}"
+    if [[ -n "${record}" ]]; then
+        return 1
+    fi
+    local actual_bytes
+    actual_bytes="$(wc -c <"${ledger_path}")" || return 1
+    if [[ ! "${actual_bytes}" =~ ^[0-9]+$ ]] \
+        || (( actual_bytes != expected_bytes )); then
+        return 1
+    fi
+    output_ref=("${validated_records[@]}")
+}
+
+discover_labeled_one_shot_containers() {
+    local output_name="$1"
+    local -n output_ref="${output_name}"
+    output_ref=()
+    validate_one_shot_label_contract || return 1
+    local discovery_output
+    if ! discovery_output="$(
+        docker container ls \
+            --all \
+            --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
+            --format '{{.Names}}'
+    )"; then
+        return 1
+    fi
+    if [[ -z "${discovery_output}" ]]; then
+        return 0
+    fi
+
+    local -a validated_names=()
+    local -A seen_names=()
+    local discovered_name
+    while IFS= read -r discovered_name; do
+        validate_one_shot_container_record "${discovered_name}" || return 1
+        if [[ -n "${seen_names[${discovered_name}]:-}" ]]; then
+            return 1
+        fi
+        seen_names["${discovered_name}"]=1
+        validated_names+=("${discovered_name}")
+    done <<<"${discovery_output}"
+    output_ref=("${validated_names[@]}")
+}
+
+collect_validated_one_shot_cleanup_names() {
+    local output_name="$1"
+    local -n output_ref="${output_name}"
+    output_ref=()
+    local invalid_source=0
+    local -a ledger_names=()
+    local -a labeled_names=()
+    if ! load_validated_one_shot_ledger "${ONE_SHOT_LEDGER}" ledger_names; then
+        invalid_source=1
+        ledger_names=()
+    fi
+    if ! discover_labeled_one_shot_containers labeled_names; then
+        invalid_source=1
+        labeled_names=()
+    fi
+
+    local -A seen_names=()
+    local one_shot_name
+    for one_shot_name in "${ledger_names[@]}" "${labeled_names[@]}"; do
+        validate_one_shot_container_record "${one_shot_name}" || {
+            invalid_source=1
+            continue
+        }
+        if [[ -z "${seen_names[${one_shot_name}]:-}" ]]; then
+            seen_names["${one_shot_name}"]=1
+            output_ref+=("${one_shot_name}")
+        fi
+    done
+    (( invalid_source == 0 ))
 }
 
 register_one_shot_container() {
     local client_name="$1"
     local identity_name="$2"
+    validate_private_work_dir || return 1
     validate_one_shot_container_name "${client_name}" "${identity_name}" \
         || return 1
-    if [[ -e "${ONE_SHOT_LEDGER}" && ! -f "${ONE_SHOT_LEDGER}" ]]; then
-        return 1
-    fi
+    local -a existing_records=()
+    load_validated_one_shot_ledger "${ONE_SHOT_LEDGER}" existing_records \
+        || return 1
+    local existing_record
+    for existing_record in "${existing_records[@]}"; do
+        [[ "${existing_record}" != "${client_name}" ]] || return 1
+    done
+
     local next_ledger
     next_ledger="$(mktemp "${WORK_DIR}/one-shot-containers.next.XXXXXX")" \
         || return 1
-    if [[ -f "${ONE_SHOT_LEDGER}" ]] \
-        && ! cp -- "${ONE_SHOT_LEDGER}" "${next_ledger}"; then
+    if ! {
+        for existing_record in "${existing_records[@]}"; do
+            printf '%s\n' "${existing_record}"
+        done
+        printf '%s\n' "${client_name}"
+    } >"${next_ledger}"; then
         rm -f -- "${next_ledger}"
         return 1
     fi
-    if ! printf '%s\n' "${client_name}" >>"${next_ledger}" \
-        || ! mv -f -- "${next_ledger}" "${ONE_SHOT_LEDGER}"; then
+    local -a candidate_records=()
+    if ! load_validated_one_shot_ledger "${next_ledger}" candidate_records \
+        || (( ${#candidate_records[@]} != ${#existing_records[@]} + 1 )) \
+        || [[ "${candidate_records[-1]}" != "${client_name}" ]] \
+        || [[ -L "${ONE_SHOT_LEDGER}" ]] \
+        || [[ -e "${ONE_SHOT_LEDGER}" && ! -f "${ONE_SHOT_LEDGER}" ]] \
+        || ! mv -fT -- "${next_ledger}" "${ONE_SHOT_LEDGER}"; then
         rm -f -- "${next_ledger}"
         return 1
     fi
@@ -203,9 +355,11 @@ register_one_shot_container() {
 
 self_check() {
     local fake_docker_state='absent'
-    local fake_one_shot='warpin-kes-self-check-one-shot'
+    local fake_one_shot="${KES_ONE_SHOT_PREFIX}-metrics-self-check"
     local fake_created_name=''
     local fake_container_present=0
+    local fake_forbidden_docker_argument=''
+    local fake_forbidden_docker_argument_seen=0
     local fake_create_marker="${WORK_DIR}/self-check-created-container"
     local fake_create_count_file="${WORK_DIR}/self-check-create-count"
     local policy_file="${WORK_DIR}/self-check-kes.yml"
@@ -215,6 +369,13 @@ self_check() {
     local secret_layout="${WORK_DIR}/self-check-secret-layout"
     docker() {
         local argument
+        if [[ -n "${fake_forbidden_docker_argument:-}" ]]; then
+            for argument in "$@"; do
+                if [[ "${argument}" == "${fake_forbidden_docker_argument}" ]]; then
+                    fake_forbidden_docker_argument_seen=1
+                fi
+            done
+        fi
         case "${1:-} ${2:-}" in
             create\ *)
                 local create_count=0
@@ -270,7 +431,40 @@ self_check() {
             'network rm')
                 [[ "${fake_docker_state:-absent}" != 'remove-failure' ]]
                 ;;
+            'container ls')
+                case "${fake_docker_state:-absent}" in
+                    labeled-one-shot-present)
+                        if (( ${fake_container_present:-0} == 1 )); then
+                            printf '%s\n' "${fake_created_name:-}"
+                        fi
+                        ;;
+                    labeled-one-shot-invalid)
+                        printf '%s\n' '--help'
+                        ;;
+                    labeled-one-shot-wrong-run)
+                        printf '%s\n' 'warpin-kes-one-shot-gate-wrong-run-metrics-label'
+                        ;;
+                    labeled-one-shot-wrong-identity)
+                        printf '%s\n' "${KES_ONE_SHOT_PREFIX}-runtime-label"
+                        ;;
+                    labeled-one-shot-empty-record)
+                        printf '%s\n\n%s\n' \
+                            "${fake_created_name:-}" \
+                            "${KES_ONE_SHOT_PREFIX}-bootstrap-label-second"
+                        ;;
+                    labeled-one-shot-duplicate)
+                        printf '%s\n%s\n' \
+                            "${fake_created_name:-}" \
+                            "${fake_created_name:-}"
+                        ;;
+                    *) ;;
+                esac
+                ;;
             'container inspect'|'network inspect')
+                local inspected_name=''
+                if (( $# > 0 )); then
+                    inspected_name="${!#}"
+                fi
                 if [[ "${fake_docker_state}" == 'client-nonzero' && "${1:-}" == 'container' ]]; then
                     printf '[{"Mounts":['
                     printf '{"Type":"bind","Source":"%s","Destination":"/identity","RW":false},' \
@@ -285,13 +479,21 @@ self_check() {
                         return 0
                         ;;
                     one-container-remains)
-                        [[ "${1:-}" == 'container' && $# -eq 3 && "${3:-}" == "${MINIO_NAME}" ]]
+                        [[ "${1:-}" == 'container' \
+                            && "${inspected_name}" == "${MINIO_NAME}" ]]
                         ;;
                     one-network-remains)
-                        [[ "${1:-}" == 'network' && $# -eq 3 && "${3:-}" == "${CLIENT_NETWORK}" ]]
+                        [[ "${1:-}" == 'network' \
+                            && "${inspected_name}" == "${CLIENT_NETWORK}" ]]
                         ;;
                     one-shot-remains|one-shot-remove-failure)
-                        [[ "${1:-}" == 'container' && $# -eq 3 && "${3:-}" == "${fake_one_shot}" ]]
+                        [[ "${1:-}" == 'container' \
+                            && "${inspected_name}" == "${fake_one_shot}" ]]
+                        ;;
+                    labeled-one-shot-present)
+                        [[ "${1:-}" == 'container' \
+                            && ${fake_container_present:-0} -eq 1 \
+                            && "${inspected_name}" == "${fake_created_name:-}" ]]
                         ;;
                     *)
                         return 1
@@ -337,6 +539,37 @@ self_check() {
             printf '%s\n' "$(<"${fake_create_count_file}")"
         else
             printf '%s\n' 0
+        fi
+    }
+
+    local -a ledger_attack_failures=()
+    registration_fixture_must_fail_closed() {
+        local fixture_name="$1"
+        fake_docker_state='create-failure'
+        if run_kes_client metrics metric >/dev/null 2>&1; then
+            ledger_attack_failures+=(
+                "self-check accepted ${fixture_name} during registration"
+            )
+        fi
+        if [[ "$(fake_create_count)" -ne 0 ]]; then
+            ledger_attack_failures+=(
+                "self-check called docker create for ${fixture_name}"
+            )
+        fi
+    }
+    regular_ledger_fixture_must_fail_closed() {
+        local fixture_name="$1"
+        local fixture_content="$2"
+        local original_ledger="${WORK_DIR}/self-check-original-ledger"
+        reset_one_shot_boundary_fixture
+        printf '%s' "${fixture_content}" >"${ONE_SHOT_LEDGER}"
+        cp -- "${ONE_SHOT_LEDGER}" "${original_ledger}"
+        registration_fixture_must_fail_closed "${fixture_name}"
+        if [[ ! -f "${ONE_SHOT_LEDGER}" ]] \
+            || ! cmp -s -- "${original_ledger}" "${ONE_SHOT_LEDGER}"; then
+            ledger_attack_failures+=(
+                "self-check changed ${fixture_name} after rejected registration"
+            )
         fi
     }
 
@@ -458,6 +691,220 @@ self_check() {
         echo 'self-check lost or replaced sequential cleanup-ledger names' >&2
         return 1
     fi
+
+    local real_work_dir="${WORK_DIR}.self-check-real"
+    local symlink_work_dir_target="${WORK_DIR}.self-check-target"
+    reset_one_shot_boundary_fixture
+    rm -rf -- "${real_work_dir}" "${symlink_work_dir_target}"
+    mv -- "${WORK_DIR}" "${real_work_dir}"
+    mkdir "${symlink_work_dir_target}"
+    ln -s -- "${symlink_work_dir_target}" "${WORK_DIR}"
+    registration_fixture_must_fail_closed 'a symlinked private work directory'
+    if find "${symlink_work_dir_target}" -mindepth 1 -print -quit | grep -q .; then
+        ledger_attack_failures+=(
+            'self-check wrote through a symlinked private work directory'
+        )
+    fi
+    rm -f -- "${WORK_DIR}"
+    rm -rf -- "${symlink_work_dir_target}"
+    mv -- "${real_work_dir}" "${WORK_DIR}"
+
+    local symlink_target="${WORK_DIR}/self-check-ledger-symlink-target"
+    local symlink_target_before="${WORK_DIR}/self-check-ledger-symlink-target.before"
+    reset_one_shot_boundary_fixture
+    printf '%s\n' '--help' >"${symlink_target}"
+    cp -- "${symlink_target}" "${symlink_target_before}"
+    ln -s -- "${symlink_target}" "${ONE_SHOT_LEDGER}"
+    registration_fixture_must_fail_closed 'a ledger symlink to a regular file'
+    if [[ ! -L "${ONE_SHOT_LEDGER}" ]] \
+        || [[ "$(readlink -- "${ONE_SHOT_LEDGER}")" != "${symlink_target}" ]] \
+        || ! cmp -s -- "${symlink_target_before}" "${symlink_target}"; then
+        ledger_attack_failures+=(
+            'self-check changed a ledger symlink or its external target'
+        )
+    fi
+
+    reset_one_shot_boundary_fixture
+    local dangling_target="${WORK_DIR}/self-check-missing-ledger-target"
+    rm -f -- "${dangling_target}"
+    ln -s -- "${dangling_target}" "${ONE_SHOT_LEDGER}"
+    registration_fixture_must_fail_closed 'a dangling ledger symlink'
+    if [[ ! -L "${ONE_SHOT_LEDGER}" ]] \
+        || [[ "$(readlink -- "${ONE_SHOT_LEDGER}")" != "${dangling_target}" ]]; then
+        ledger_attack_failures+=(
+            'self-check replaced a dangling ledger symlink'
+        )
+    fi
+
+    reset_one_shot_boundary_fixture
+    mkdir "${ONE_SHOT_LEDGER}"
+    registration_fixture_must_fail_closed 'a ledger directory'
+    if [[ ! -d "${ONE_SHOT_LEDGER}" || -L "${ONE_SHOT_LEDGER}" ]]; then
+        ledger_attack_failures+=('self-check changed a rejected ledger directory')
+    fi
+
+    reset_one_shot_boundary_fixture
+    mkfifo "${ONE_SHOT_LEDGER}"
+    registration_fixture_must_fail_closed 'a ledger FIFO'
+    if [[ ! -p "${ONE_SHOT_LEDGER}" || -L "${ONE_SHOT_LEDGER}" ]]; then
+        ledger_attack_failures+=('self-check changed a rejected ledger FIFO')
+    fi
+
+    local history_name="${KES_ONE_SHOT_PREFIX}-metrics-history-valid"
+    local wrong_run_name='warpin-kes-one-shot-gate-wrong-run-metrics-history'
+    local wrong_identity_name="${KES_ONE_SHOT_PREFIX}-runtime-history"
+    local overlong_history_name="${KES_ONE_SHOT_PREFIX}-metrics-${overlong_suffix}"
+    regular_ledger_fixture_must_fail_closed \
+        'an option-like historical ledger record' \
+        $'--help\n'
+    regular_ledger_fixture_must_fail_closed \
+        'a wrong-run historical ledger record' \
+        "${wrong_run_name}"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'an unsupported-identity historical ledger record' \
+        "${wrong_identity_name}"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'an empty historical ledger record' \
+        $'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'a control-character historical ledger record' \
+        "${KES_ONE_SHOT_PREFIX}-metrics-bad"$'\t'"record"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'a whitespace historical ledger record' \
+        "${KES_ONE_SHOT_PREFIX}-metrics-bad record"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'an overlong historical ledger record' \
+        "${overlong_history_name}"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'an invalid-Docker-character historical ledger record' \
+        "${KES_ONE_SHOT_PREFIX}-metrics-bad/record"$'\n'
+    regular_ledger_fixture_must_fail_closed \
+        'a non-newline-terminated historical ledger record' \
+        "${history_name}"
+    regular_ledger_fixture_must_fail_closed \
+        'duplicate historical ledger records' \
+        "${history_name}"$'\n'"${history_name}"$'\n'
+
+    reset_one_shot_boundary_fixture
+    printf '%s\n' '--help' >"${ONE_SHOT_LEDGER}"
+    fake_docker_state='absent'
+    fake_forbidden_docker_argument='--help'
+    fake_forbidden_docker_argument_seen=0
+    cleanup_best_effort
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        ledger_attack_failures+=(
+            'self-check passed an untrusted ledger record to best-effort Docker cleanup'
+        )
+    fi
+
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' '--help' >"${ONE_SHOT_LEDGER}"
+    fake_forbidden_docker_argument_seen=0
+    if cleanup_verified; then
+        ledger_attack_failures+=(
+            'self-check attested verified cleanup for a corrupt ledger'
+        )
+    fi
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        ledger_attack_failures+=(
+            'self-check passed an untrusted ledger record to verified Docker cleanup'
+        )
+    fi
+
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' '--help' >"${ONE_SHOT_LEDGER}"
+    fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+    fake_container_present=1
+    fake_docker_state='labeled-one-shot-present'
+    fake_forbidden_docker_argument_seen=0
+    cleanup_best_effort
+    if (( fake_container_present != 0 )); then
+        ledger_attack_failures+=(
+            'self-check did not use the run label to clean a corrupt-ledger container'
+        )
+    fi
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        ledger_attack_failures+=(
+            'self-check passed corrupt ledger bytes during label fallback cleanup'
+        )
+    fi
+
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' '--help' >"${ONE_SHOT_LEDGER}"
+    fake_container_present=1
+    fake_docker_state='labeled-one-shot-present'
+    fake_forbidden_docker_argument_seen=0
+    if cleanup_verified; then
+        ledger_attack_failures+=(
+            'self-check hid ledger corruption behind successful label fallback cleanup'
+        )
+    fi
+    if (( fake_container_present != 0 )); then
+        ledger_attack_failures+=(
+            'self-check verified cleanup left a run-labeled one-shot container'
+        )
+    fi
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        ledger_attack_failures+=(
+            'self-check verified fallback passed corrupt ledger bytes to Docker'
+        )
+    fi
+
+    local invalid_discovery_state
+    for invalid_discovery_state in \
+        labeled-one-shot-invalid \
+        labeled-one-shot-wrong-run \
+        labeled-one-shot-wrong-identity \
+        labeled-one-shot-empty-record \
+        labeled-one-shot-duplicate; do
+        mkdir -p "${WORK_DIR}"
+        : >"${ONE_SHOT_LEDGER}"
+        fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+        fake_container_present=0
+        fake_docker_state="${invalid_discovery_state}"
+        fake_forbidden_docker_argument_seen=0
+        if cleanup_verified; then
+            ledger_attack_failures+=(
+                "self-check accepted ${invalid_discovery_state} discovery output"
+            )
+        fi
+        if (( fake_forbidden_docker_argument_seen != 0 )); then
+            ledger_attack_failures+=(
+                "self-check passed ${invalid_discovery_state} output to Docker"
+            )
+        fi
+    done
+
+    mkdir -p "${WORK_DIR}"
+    : >"${ONE_SHOT_LEDGER}"
+    fake_docker_state='absent'
+    if ! cleanup_verified; then
+        ledger_attack_failures+=(
+            'self-check rejected a completely empty label discovery result'
+        )
+    fi
+
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' '--help' >"${ONE_SHOT_LEDGER}"
+    fake_docker_state='labeled-one-shot-invalid'
+    fake_forbidden_docker_argument_seen=0
+    if cleanup_verified; then
+        ledger_attack_failures+=(
+            'self-check accepted corrupt ledger plus malicious label discovery output'
+        )
+    fi
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        ledger_attack_failures+=(
+            'self-check passed corrupt ledger or malicious label output to Docker'
+        )
+    fi
+    fake_forbidden_docker_argument=''
+    if (( ${#ledger_attack_failures[@]} > 0 )); then
+        printf '%s\n' "${ledger_attack_failures[@]}" >&2
+        return 1
+    fi
+
+    mkdir -p "${WORK_DIR}"
     : >"${ONE_SHOT_LEDGER}"
     fake_docker_state='client-nonzero'
     local client_failure
@@ -593,7 +1040,7 @@ assert_container_bind_mounts() {
     local actual
     local expected
     actual="$(
-        docker container inspect "${container_name}" |
+        docker container inspect -- "${container_name}" |
             jq -r '.[0].Mounts[] | select(.Type == "bind") | "\(.Source)|\(.Destination)|\(.RW)"' |
             sort
     )"
@@ -649,7 +1096,7 @@ allocate_one_shot_container_name() {
 }
 
 start_one_shot_client() {
-    timeout 5 docker start --attach "$1"
+    timeout 5 docker start --attach -- "$1"
 }
 
 before_one_shot_create() {
@@ -670,6 +1117,10 @@ run_kes_client() {
             return 1
             ;;
     esac
+    if ! validate_private_work_dir || ! validate_one_shot_label_contract; then
+        echo 'invalid one-shot KES private runtime boundary' >&2
+        return 1
+    fi
     local identity_directory="${WORK_DIR}/kes/${identity_name}"
     local client_name
     client_name="$(allocate_one_shot_container_name "${identity_name}")"
@@ -684,6 +1135,7 @@ run_kes_client() {
     local container_id
     if ! container_id="$(docker create \
         --name "${client_name}" \
+        --label "${KES_ONE_SHOT_LABEL}" \
         --network "${KMS_NETWORK}" \
         --user "$(id -u):$(id -g)" \
         --cap-drop ALL \
@@ -718,7 +1170,7 @@ run_kes_client() {
         return 1
     fi
     if [[ -z "${container_id}" ]]; then
-        docker rm -f "${client_name}" >/dev/null 2>&1 || true
+        docker rm -f -- "${client_name}" >/dev/null 2>&1 || true
         echo "one-shot KES ${identity_name} create returned no container id" >&2
         return 1
     fi
@@ -730,14 +1182,14 @@ run_kes_client() {
         "${client_name}" \
         "${identity_directory}|/identity|false" \
         "${KES_SERVER_DIR}/server.crt|/trust/server.crt|false"; then
-        docker rm -f "${client_name}" >/dev/null 2>&1 || true
+        docker rm -f -- "${client_name}" >/dev/null 2>&1 || true
         return 1
     fi
     local client_output
     local start_status=0
     client_output="$(start_one_shot_client "${client_name}" 2>&1)" || start_status=$?
     local remove_status=0
-    if ! docker rm -f "${client_name}" >/dev/null 2>&1; then
+    if ! docker rm -f -- "${client_name}" >/dev/null 2>&1; then
         remove_status=1
     fi
     if (( start_status != 0 )); then
@@ -1084,7 +1536,7 @@ readonly VERSION_A VERSION_B
 
 # Restart MinIO with the same immutable data and TLS/KES configuration. The
 # post-restart library read is pinned to the two exact captured versions.
-docker rm -f "${MINIO_NAME}" >/dev/null
+docker rm -f -- "${MINIO_NAME}" >/dev/null
 start_minio
 MINIO_PORT="$(docker port "${MINIO_NAME}" 9000/tcp | awk -F: 'NR == 1 { print $NF }')"
 wait_for_https \
