@@ -27,6 +27,8 @@ readonly KES_ONE_SHOT_LABEL_KEY='com.warpin.live-gate.one-shot-run'
 readonly KES_ONE_SHOT_LABEL_VALUE="${RUN_TOKEN}"
 readonly KES_ONE_SHOT_LABEL="${KES_ONE_SHOT_LABEL_KEY}=${KES_ONE_SHOT_LABEL_VALUE}"
 readonly KES_ONE_SHOT_LABEL_FILTER="label=${KES_ONE_SHOT_LABEL}"
+readonly KES_ONE_SHOT_MAX_RECORDS=256
+readonly KES_ONE_SHOT_MAX_RECORD_FILE_BYTES=65536
 readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
 readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
@@ -65,6 +67,11 @@ cleanup_verified() {
             failed=1
         fi
     done
+    local -a labeled_residuals=()
+    if ! discover_labeled_one_shot_containers labeled_residuals \
+        || (( ${#labeled_residuals[@]} > 0 )); then
+        failed=1
+    fi
     if ! docker network rm -- "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1; then
         failed=1
     fi
@@ -77,11 +84,6 @@ cleanup_verified() {
             failed=1
         fi
     done
-    local -a labeled_residuals=()
-    if ! discover_labeled_one_shot_containers labeled_residuals \
-        || (( ${#labeled_residuals[@]} > 0 )); then
-        failed=1
-    fi
     local network
     for network in "${CLIENT_NETWORK}" "${KMS_NETWORK}"; do
         if docker network inspect -- "${network}" >/dev/null 2>&1; then
@@ -206,32 +208,50 @@ validate_one_shot_label_contract() {
         && [[ "${KES_ONE_SHOT_LABEL_FILTER}" == "label=${KES_ONE_SHOT_LABEL}" ]]
 }
 
-load_validated_one_shot_ledger() {
-    local ledger_path="$1"
-    local output_name="$2"
+load_validated_one_shot_record_file() {
+    local record_file="$1"
+    local existence_policy="$2"
+    local output_name="$3"
     local -n output_ref="${output_name}"
     output_ref=()
     validate_private_work_dir || return 1
-    if [[ "${ledger_path}" != "${ONE_SHOT_LEDGER}" \
-        && "${ledger_path}" != "${WORK_DIR}/one-shot-containers.next."* ]]; then
+    case "${record_file}" in
+        "${ONE_SHOT_LEDGER}")
+            [[ "${existence_policy}" == 'allow-absent' ]] || return 1
+            ;;
+        "${WORK_DIR}"/one-shot-containers.next.*|\
+            "${WORK_DIR}"/one-shot-discovery.*)
+            [[ "${existence_policy}" == 'require-existing' ]] || return 1
+            [[ "${record_file#"${WORK_DIR}/"}" != */* ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    if [[ -L "${record_file}" ]]; then
         return 1
     fi
-    if [[ -L "${ledger_path}" ]]; then
-        return 1
+    if [[ ! -e "${record_file}" ]]; then
+        [[ "${existence_policy}" == 'allow-absent' ]]
+        return
     fi
-    if [[ ! -e "${ledger_path}" ]]; then
-        return 0
-    fi
-    if [[ ! -f "${ledger_path}" ]]; then
+    if [[ ! -f "${record_file}" ]]; then
         return 1
     fi
 
     local LC_ALL=C
+    local actual_bytes
+    actual_bytes="$(wc -c <"${record_file}")" || return 1
+    if [[ ! "${actual_bytes}" =~ ^[0-9]+$ ]] \
+        || (( actual_bytes > KES_ONE_SHOT_MAX_RECORD_FILE_BYTES )); then
+        return 1
+    fi
     local -a validated_records=()
     local -A seen_records=()
     local record=''
     local expected_bytes=0
     while IFS= read -r record; do
+        if (( ${#validated_records[@]} >= KES_ONE_SHOT_MAX_RECORDS )); then
+            return 1
+        fi
         validate_one_shot_container_record "${record}" || return 1
         if [[ -n "${seen_records[${record}]:-}" ]]; then
             return 1
@@ -239,48 +259,59 @@ load_validated_one_shot_ledger() {
         seen_records["${record}"]=1
         validated_records+=("${record}")
         expected_bytes=$((expected_bytes + ${#record} + 1))
-    done <"${ledger_path}"
+    done <"${record_file}"
     if [[ -n "${record}" ]]; then
         return 1
     fi
-    local actual_bytes
-    actual_bytes="$(wc -c <"${ledger_path}")" || return 1
-    if [[ ! "${actual_bytes}" =~ ^[0-9]+$ ]] \
-        || (( actual_bytes != expected_bytes )); then
+    if (( actual_bytes != expected_bytes )); then
         return 1
     fi
     output_ref=("${validated_records[@]}")
+}
+
+remove_one_shot_discovery_temp() {
+    local discovery_file="$1"
+    validate_private_work_dir || return 1
+    [[ "${discovery_file}" == "${WORK_DIR}/one-shot-discovery."?* ]] \
+        || return 1
+    rm -rf -- "${discovery_file}" >/dev/null 2>&1 || return 1
+    [[ ! -e "${discovery_file}" && ! -L "${discovery_file}" ]]
 }
 
 discover_labeled_one_shot_containers() {
     local output_name="$1"
     local -n output_ref="${output_name}"
     output_ref=()
+    validate_private_work_dir || return 1
     validate_one_shot_label_contract || return 1
-    local discovery_output
-    if ! discovery_output="$(
-        docker container ls \
-            --all \
-            --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
-            --format '{{.Names}}'
-    )"; then
+    local discovery_file
+    discovery_file="$(
+        mktemp "${WORK_DIR}/one-shot-discovery.XXXXXX" 2>/dev/null
+    )" || return 1
+    local -a empty_preflight=()
+    if ! load_validated_one_shot_record_file \
+        "${discovery_file}" require-existing empty_preflight \
+        || (( ${#empty_preflight[@]} != 0 )); then
+        remove_one_shot_discovery_temp "${discovery_file}" || true
         return 1
     fi
-    if [[ -z "${discovery_output}" ]]; then
-        return 0
+    if ! docker container ls \
+        --all \
+        --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
+        --format '{{.Names}}' \
+        2>/dev/null >"${discovery_file}"; then
+        remove_one_shot_discovery_temp "${discovery_file}" || true
+        return 1
     fi
-
     local -a validated_names=()
-    local -A seen_names=()
-    local discovered_name
-    while IFS= read -r discovered_name; do
-        validate_one_shot_container_record "${discovered_name}" || return 1
-        if [[ -n "${seen_names[${discovered_name}]:-}" ]]; then
-            return 1
-        fi
-        seen_names["${discovered_name}"]=1
-        validated_names+=("${discovered_name}")
-    done <<<"${discovery_output}"
+    if ! load_validated_one_shot_record_file \
+        "${discovery_file}" require-existing validated_names; then
+        remove_one_shot_discovery_temp "${discovery_file}" || true
+        return 1
+    fi
+    if ! remove_one_shot_discovery_temp "${discovery_file}"; then
+        return 1
+    fi
     output_ref=("${validated_names[@]}")
 }
 
@@ -291,7 +322,8 @@ collect_validated_one_shot_cleanup_names() {
     local invalid_source=0
     local -a ledger_names=()
     local -a labeled_names=()
-    if ! load_validated_one_shot_ledger "${ONE_SHOT_LEDGER}" ledger_names; then
+    if ! load_validated_one_shot_record_file \
+        "${ONE_SHOT_LEDGER}" allow-absent ledger_names; then
         invalid_source=1
         ledger_names=()
     fi
@@ -322,8 +354,8 @@ register_one_shot_container() {
     validate_one_shot_container_name "${client_name}" "${identity_name}" \
         || return 1
     local -a existing_records=()
-    load_validated_one_shot_ledger "${ONE_SHOT_LEDGER}" existing_records \
-        || return 1
+    load_validated_one_shot_record_file \
+        "${ONE_SHOT_LEDGER}" allow-absent existing_records || return 1
     local existing_record
     for existing_record in "${existing_records[@]}"; do
         [[ "${existing_record}" != "${client_name}" ]] || return 1
@@ -342,7 +374,8 @@ register_one_shot_container() {
         return 1
     fi
     local -a candidate_records=()
-    if ! load_validated_one_shot_ledger "${next_ledger}" candidate_records \
+    if ! load_validated_one_shot_record_file \
+        "${next_ledger}" require-existing candidate_records \
         || (( ${#candidate_records[@]} != ${#existing_records[@]} + 1 )) \
         || [[ "${candidate_records[-1]}" != "${client_name}" ]] \
         || [[ -L "${ONE_SHOT_LEDGER}" ]] \
@@ -360,6 +393,9 @@ self_check() {
     local fake_container_present=0
     local fake_forbidden_docker_argument=''
     local fake_forbidden_docker_argument_seen=0
+    local fake_discovery_temp_mode='normal'
+    local fake_discovery_temp_path="${WORK_DIR}/one-shot-discovery.self-check"
+    local fake_discovery_symlink_target="${WORK_DIR}/self-check-discovery-target"
     local fake_create_marker="${WORK_DIR}/self-check-created-container"
     local fake_create_count_file="${WORK_DIR}/self-check-create-count"
     local policy_file="${WORK_DIR}/self-check-kes.yml"
@@ -367,6 +403,38 @@ self_check() {
     local runtime_policy
     local metrics_policy
     local secret_layout="${WORK_DIR}/self-check-secret-layout"
+    mktemp() {
+        local template="${1:-}"
+        if [[ "${template}" == "${WORK_DIR}/one-shot-discovery."* ]]; then
+            rm -rf -- "${fake_discovery_temp_path:-}"
+            case "${fake_discovery_temp_mode:-normal}" in
+                failure)
+                    return 73
+                    ;;
+                symlink)
+                    ln -s -- \
+                        "${fake_discovery_symlink_target}" \
+                        "${fake_discovery_temp_path}"
+                    printf '%s\n' "${fake_discovery_temp_path}"
+                    return 0
+                    ;;
+                directory)
+                    mkdir "${fake_discovery_temp_path}"
+                    printf '%s\n' "${fake_discovery_temp_path}"
+                    return 0
+                    ;;
+                unwritable)
+                    : >"${fake_discovery_temp_path}"
+                    chmod 400 "${fake_discovery_temp_path}"
+                    printf '%s\n' "${fake_discovery_temp_path}"
+                    return 0
+                    ;;
+                normal) ;;
+                *) return 74 ;;
+            esac
+        fi
+        command mktemp "$@"
+    }
     docker() {
         local argument
         if [[ -n "${fake_forbidden_docker_argument:-}" ]]; then
@@ -433,6 +501,43 @@ self_check() {
                 ;;
             'container ls')
                 case "${fake_docker_state:-absent}" in
+                    discovery-empty-output)
+                        :
+                        ;;
+                    discovery-empty-line)
+                        printf '\n'
+                        ;;
+                    discovery-trailing-empty)
+                        printf '%s\n\n' "${fake_created_name:-}"
+                        ;;
+                    discovery-missing-final-newline)
+                        printf '%s' "${fake_created_name:-}"
+                        ;;
+                    discovery-nul)
+                        printf '%s\0%s\n' \
+                            "${KES_ONE_SHOT_PREFIX}-metrics-label-" \
+                            'fallback'
+                        ;;
+                    discovery-control)
+                        printf '%s\t%s\n' \
+                            "${KES_ONE_SHOT_PREFIX}-metrics-label-" \
+                            'fallback'
+                        ;;
+                    discovery-valid)
+                        printf '%s\n' "${fake_created_name:-}"
+                        ;;
+                    discovery-duplicate)
+                        printf '%s\n%s\n' \
+                            "${fake_created_name:-}" \
+                            "${fake_created_name:-}"
+                        ;;
+                    discovery-invalid)
+                        printf '%s\n' '--help'
+                        ;;
+                    discovery-docker-failure)
+                        printf '%s\n' 'FORBIDDEN_DISCOVERY_SECRET_42' >&2
+                        return 42
+                        ;;
                     labeled-one-shot-present)
                         if (( ${fake_container_present:-0} == 1 )); then
                             printf '%s\n' "${fake_created_name:-}"
@@ -490,7 +595,8 @@ self_check() {
                         [[ "${1:-}" == 'container' \
                             && "${inspected_name}" == "${fake_one_shot}" ]]
                         ;;
-                    labeled-one-shot-present)
+                    labeled-one-shot-present|discovery-trailing-empty|\
+                        discovery-missing-final-newline|discovery-nul)
                         [[ "${1:-}" == 'container' \
                             && ${fake_container_present:-0} -eq 1 \
                             && "${inspected_name}" == "${fake_created_name:-}" ]]
@@ -540,6 +646,73 @@ self_check() {
         else
             printf '%s\n' 0
         fi
+    }
+
+    local -a discovery_byte_failures=()
+    assert_no_discovery_temp_remains() {
+        local fixture_name="$1"
+        local leftover_path
+        while IFS= read -r leftover_path; do
+            discovery_byte_failures+=(
+                "self-check left a discovery temp after ${fixture_name}"
+            )
+            rm -rf -- "${leftover_path}"
+        done < <(
+            find "${WORK_DIR}" -maxdepth 1 \
+                -name 'one-shot-discovery.*' -print 2>/dev/null
+        )
+    }
+    discovery_bytes_must_match() {
+        local fixture_name="$1"
+        local docker_state="$2"
+        local expected_status="$3"
+        local expected_count="$4"
+        mkdir -p "${WORK_DIR}"
+        fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+        fake_docker_state="${docker_state}"
+        fake_discovery_temp_mode='normal'
+        local -a discovered_names=()
+        local actual_status='failure'
+        if discover_labeled_one_shot_containers discovered_names; then
+            actual_status='success'
+        fi
+        if [[ "${actual_status}" != "${expected_status}" ]]; then
+            discovery_byte_failures+=(
+                "self-check gave ${fixture_name} discovery status ${actual_status}"
+            )
+        fi
+        if (( ${#discovered_names[@]} != expected_count )); then
+            discovery_byte_failures+=(
+                "self-check published names for ${fixture_name} discovery bytes"
+            )
+        fi
+        if [[ "${expected_status}" == 'success' && expected_count -eq 1 ]] \
+            && [[ "${discovered_names[0]:-}" != "${fake_created_name}" ]]; then
+            discovery_byte_failures+=(
+                "self-check changed the canonical valid discovery name"
+            )
+        fi
+        assert_no_discovery_temp_remains "${fixture_name}"
+    }
+    discovery_temp_mode_must_fail() {
+        local temp_mode="$1"
+        mkdir -p "${WORK_DIR}"
+        fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+        fake_docker_state='discovery-valid'
+        fake_discovery_temp_mode="${temp_mode}"
+        local -a discovered_names=()
+        if discover_labeled_one_shot_containers discovered_names; then
+            discovery_byte_failures+=(
+                "self-check accepted ${temp_mode} discovery temp"
+            )
+        fi
+        if (( ${#discovered_names[@]} != 0 )); then
+            discovery_byte_failures+=(
+                "self-check published names after ${temp_mode} discovery temp"
+            )
+        fi
+        assert_no_discovery_temp_remains "${temp_mode} temp"
+        fake_discovery_temp_mode='normal'
     }
 
     local -a ledger_attack_failures=()
@@ -897,6 +1070,124 @@ self_check() {
         ledger_attack_failures+=(
             'self-check passed corrupt ledger or malicious label output to Docker'
         )
+    fi
+
+    discovery_bytes_must_match \
+        'zero-byte' discovery-empty-output success 0
+    discovery_bytes_must_match \
+        'single-newline' discovery-empty-line failure 0
+    discovery_bytes_must_match \
+        'trailing-empty-record' discovery-trailing-empty failure 0
+    discovery_bytes_must_match \
+        'missing-final-newline' discovery-missing-final-newline failure 0
+    discovery_bytes_must_match \
+        'embedded-NUL' discovery-nul failure 0
+    discovery_bytes_must_match \
+        'embedded-control' discovery-control failure 0
+    discovery_bytes_must_match \
+        'duplicate-record' discovery-duplicate failure 0
+    discovery_bytes_must_match \
+        'invalid-record' discovery-invalid failure 0
+    discovery_bytes_must_match \
+        'canonical-valid-record' discovery-valid success 1
+
+    printf '%s\n' 'UNCHANGED_DISCOVERY_TARGET' \
+        >"${fake_discovery_symlink_target}"
+    local discovery_target_before
+    discovery_target_before="$(sha256sum "${fake_discovery_symlink_target}")"
+    discovery_temp_mode_must_fail failure
+    discovery_temp_mode_must_fail symlink
+    if [[ "$(sha256sum "${fake_discovery_symlink_target}")" \
+        != "${discovery_target_before}" ]]; then
+        discovery_byte_failures+=(
+            'self-check changed an external discovery-temp symlink target'
+        )
+    fi
+    discovery_temp_mode_must_fail directory
+    discovery_temp_mode_must_fail unwritable
+
+    mkdir -p "${WORK_DIR}"
+    fake_docker_state='discovery-docker-failure'
+    fake_discovery_temp_mode='normal'
+    local discovery_error_file="${WORK_DIR}/self-check-discovery-error"
+    local -a failed_discovery_names=()
+    if discover_labeled_one_shot_containers failed_discovery_names \
+        2>"${discovery_error_file}"; then
+        discovery_byte_failures+=(
+            'self-check accepted a nonzero Docker discovery command'
+        )
+    fi
+    if (( ${#failed_discovery_names[@]} != 0 )); then
+        discovery_byte_failures+=(
+            'self-check published names after Docker discovery failure'
+        )
+    fi
+    if grep -Fq 'FORBIDDEN_DISCOVERY_SECRET_42' "${discovery_error_file}"; then
+        discovery_byte_failures+=(
+            'self-check leaked Docker discovery stderr'
+        )
+    fi
+    rm -f -- "${discovery_error_file}"
+    assert_no_discovery_temp_remains 'Docker command failure'
+
+    mkdir -p "${WORK_DIR}"
+    : >"${ONE_SHOT_LEDGER}"
+    fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+    fake_container_present=1
+    fake_docker_state='discovery-empty-line'
+    fake_forbidden_docker_argument="${fake_created_name}"
+    fake_forbidden_docker_argument_seen=0
+    if cleanup_verified; then
+        discovery_byte_failures+=(
+            'self-check hid a residual behind newline-only discovery bytes'
+        )
+    fi
+    if (( fake_container_present != 1 )); then
+        discovery_byte_failures+=(
+            'self-check consumed newline-only discovery as a container operand'
+        )
+    fi
+    if (( fake_forbidden_docker_argument_seen != 0 )); then
+        discovery_byte_failures+=(
+            'self-check passed newline-only discovery to Docker'
+        )
+    fi
+    fake_container_present=0
+
+    local normalized_discovery_state
+    for normalized_discovery_state in \
+        discovery-trailing-empty \
+        discovery-missing-final-newline \
+        discovery-nul; do
+        mkdir -p "${WORK_DIR}"
+        : >"${ONE_SHOT_LEDGER}"
+        fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+        fake_container_present=1
+        fake_docker_state="${normalized_discovery_state}"
+        fake_forbidden_docker_argument="${fake_created_name}"
+        fake_forbidden_docker_argument_seen=0
+        if cleanup_verified; then
+            discovery_byte_failures+=(
+                "self-check accepted ${normalized_discovery_state} cleanup bytes"
+            )
+        fi
+        if (( fake_forbidden_docker_argument_seen != 0 )); then
+            discovery_byte_failures+=(
+                "self-check passed ${normalized_discovery_state} bytes to Docker"
+            )
+        fi
+        if (( fake_container_present != 1 )); then
+            discovery_byte_failures+=(
+                "self-check removed a container from ${normalized_discovery_state} bytes"
+            )
+        fi
+        fake_container_present=0
+    done
+    fake_forbidden_docker_argument=''
+
+    if (( ${#discovery_byte_failures[@]} > 0 )); then
+        printf '%s\n' "${discovery_byte_failures[@]}" >&2
+        return 1
     fi
     fake_forbidden_docker_argument=''
     if (( ${#ledger_attack_failures[@]} > 0 )); then
