@@ -1,9 +1,26 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
+#[cfg(feature = "aws")]
+use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{
-    Attribute, AttributeValue, Attributes, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    path::Path,
+    Attribute, AttributeValue, Attributes, Extensions, GetOptions, ObjectStore, PutMode,
+    PutOptions, path::Path,
+};
+#[cfg(feature = "aws")]
+use object_store::{
+    aws::{AmazonS3Builder, AmazonS3ConfigKey},
+    client::{
+        HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
+        ReqwestConnector,
+    },
 };
 use thiserror::Error;
 use url::Url;
@@ -15,9 +32,17 @@ const MAX_KEY_BYTES: usize = 1_024;
 const MAX_URL_BYTES: usize = 2_048;
 const MAX_OPTION_KEY_BYTES: usize = 128;
 const MAX_OPTION_VALUE_BYTES: usize = 4_096;
-const MAX_ENCRYPTION_IDENTITY_BYTES: usize = 64;
-const SHA256_FINGERPRINT_PREFIX: &str = "sha256:";
-const SHA256_HEX_BYTES: usize = 64;
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+const S3_SSE_HEADER: &str = "x-amz-server-side-encryption";
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+const S3_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+const S3_VERSION_HEADER: &str = "x-amz-version-id";
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+const S3_SSE_KMS_VALUE: &str = "aws:kms";
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+const MAX_OBSERVED_KEY_ID_BYTES: usize = 2_048;
+static NEXT_WRITE_BINDING: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct ObjectStoreSettings {
@@ -169,35 +194,45 @@ pub struct ObjectWriteReceipt {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-struct ManagedEncryptionIdentity {
-    provider: String,
-    algorithm: String,
-    key_identity_fingerprint: Option<String>,
+enum EncryptionRequirementKind {
+    S3CompatibleSseKms {
+        key_identity_fingerprint: Option<Sha256Digest>,
+    },
+    DevelopmentOrTestPlaintext,
 }
 
-impl ManagedEncryptionIdentity {
-    fn parse(
-        provider: &str,
-        algorithm: &str,
-        key_identity_fingerprint: Option<&str>,
-    ) -> Result<Self, EncryptionPolicyError> {
-        if !is_safe_encryption_identity(provider) || !is_safe_encryption_identity(algorithm) {
-            return Err(EncryptionPolicyError::InvalidEncryptionIdentity);
-        }
-        if key_identity_fingerprint.is_some_and(|value| !is_sha256_fingerprint(value)) {
-            return Err(EncryptionPolicyError::InvalidKeyIdentityFingerprint);
-        }
-        Ok(Self {
-            provider: provider.to_owned(),
-            algorithm: algorithm.to_owned(),
-            key_identity_fingerprint: key_identity_fingerprint.map(str::to_owned),
-        })
+/// Closed storage-provider identity understood by the encryption contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncryptionProvider {
+    S3Compatible,
+}
+
+impl fmt::Display for EncryptionProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("s3-compatible")
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-enum EncryptionRequirementKind {
-    Managed(ManagedEncryptionIdentity),
+/// Closed managed-encryption algorithm identity understood by the contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ManagedEncryptionAlgorithm {
+    SseKms,
+}
+
+impl fmt::Display for ManagedEncryptionAlgorithm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("sse-kms")
+    }
+}
+
+/// Read-only typed projection used by provider adapters to translate a policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionRequirementView<'a> {
+    Managed {
+        provider: EncryptionProvider,
+        algorithm: ManagedEncryptionAlgorithm,
+        key_identity_fingerprint: Option<&'a Sha256Digest>,
+    },
     DevelopmentOrTestPlaintext,
 }
 
@@ -211,23 +246,15 @@ pub struct EncryptionRequirement {
 }
 
 impl EncryptionRequirement {
-    /// Requires managed encryption with an exact provider and algorithm identity.
-    ///
-    /// `key_identity_fingerprint`, when present, is a non-secret SHA-256 fingerprint
-    /// of the expected key identity. Raw key identifiers, ARNs, URLs, and credentials
-    /// are intentionally rejected.
-    pub fn managed(
-        provider: &str,
-        algorithm: &str,
-        key_identity_fingerprint: Option<&str>,
-    ) -> Result<Self, EncryptionPolicyError> {
-        Ok(Self {
-            kind: EncryptionRequirementKind::Managed(ManagedEncryptionIdentity::parse(
-                provider,
-                algorithm,
+    /// Requires S3-compatible SSE-KMS. The optional key identity is already a
+    /// non-secret SHA-256 fingerprint; raw provider key identifiers are not part
+    /// of this public contract.
+    pub fn s3_compatible_sse_kms(key_identity_fingerprint: Option<Sha256Digest>) -> Self {
+        Self {
+            kind: EncryptionRequirementKind::S3CompatibleSseKms {
                 key_identity_fingerprint,
-            )?),
-        })
+            },
+        }
     }
 
     /// Explicitly permits plaintext only for a development or test deployment.
@@ -238,7 +265,25 @@ impl EncryptionRequirement {
     }
 
     pub const fn is_managed(&self) -> bool {
-        matches!(self.kind, EncryptionRequirementKind::Managed(_))
+        matches!(
+            self.kind,
+            EncryptionRequirementKind::S3CompatibleSseKms { .. }
+        )
+    }
+
+    pub const fn view(&self) -> EncryptionRequirementView<'_> {
+        match &self.kind {
+            EncryptionRequirementKind::S3CompatibleSseKms {
+                key_identity_fingerprint,
+            } => EncryptionRequirementView::Managed {
+                provider: EncryptionProvider::S3Compatible,
+                algorithm: ManagedEncryptionAlgorithm::SseKms,
+                key_identity_fingerprint: key_identity_fingerprint.as_ref(),
+            },
+            EncryptionRequirementKind::DevelopmentOrTestPlaintext => {
+                EncryptionRequirementView::DevelopmentOrTestPlaintext
+            }
+        }
     }
 }
 
@@ -273,44 +318,76 @@ impl ArtifactEncryptionPolicy {
         &self.requirement
     }
 
-    /// Verifies encryption evidence and returns a wrapper that records that the
-    /// receipt passed this policy. Idempotent replays follow the same checks as new
-    /// writes and therefore cannot bypass a stronger requirement.
-    pub fn verify_receipt(
+    fn verify_s3_configuration(
         &self,
-        receipt: ObjectWriteReceipt,
-        attestation: Option<EncryptionAttestation>,
-    ) -> Result<EncryptionVerifiedObjectWriteReceipt, EncryptionPolicyError> {
-        let attestation = attestation.ok_or(EncryptionPolicyError::MissingAttestation)?;
-        self.verify_attestation(&attestation)?;
-        Ok(EncryptionVerifiedObjectWriteReceipt {
-            receipt,
-            attestation,
-        })
-    }
-
-    fn verify_attestation(
-        &self,
-        attestation: &EncryptionAttestation,
+        configured: &ConfiguredS3Encryption,
     ) -> Result<(), EncryptionPolicyError> {
-        let EncryptionRequirementKind::Managed(required) = &self.requirement.kind else {
-            return Ok(());
+        let EncryptionRequirementKind::S3CompatibleSseKms {
+            key_identity_fingerprint,
+        } = &self.requirement.kind
+        else {
+            return Err(EncryptionPolicyError::PolicyBackendMismatch);
         };
-        let EncryptionAttestationKind::Managed(observed) = &attestation.kind else {
-            return Err(EncryptionPolicyError::ManagedEncryptionRequired);
-        };
-        if observed.provider != required.provider {
-            return Err(EncryptionPolicyError::ProviderMismatch);
+        match configured.algorithm {
+            ObservedManagedAlgorithm::Missing => {
+                return Err(EncryptionPolicyError::ManagedEncryptionRequired);
+            }
+            ObservedManagedAlgorithm::Other => {
+                return Err(EncryptionPolicyError::AlgorithmMismatch);
+            }
+            ObservedManagedAlgorithm::SseKms => {}
         }
-        if observed.algorithm != required.algorithm {
-            return Err(EncryptionPolicyError::AlgorithmMismatch);
-        }
-        if required.key_identity_fingerprint.is_some()
-            && observed.key_identity_fingerprint != required.key_identity_fingerprint
+        if key_identity_fingerprint.is_some()
+            && configured.key_identity_fingerprint.as_ref() != key_identity_fingerprint.as_ref()
         {
             return Err(EncryptionPolicyError::KeyIdentityMismatch);
         }
         Ok(())
+    }
+
+    fn verify_managed_evidence(
+        &self,
+        receipt: &ObjectWriteReceipt,
+        binding: &WriteBinding,
+        evidence: &ObservedEncryptionEvidence,
+    ) -> Result<EncryptionAttestation, EncryptionPolicyError> {
+        let EncryptionRequirementKind::S3CompatibleSseKms {
+            key_identity_fingerprint,
+        } = &self.requirement.kind
+        else {
+            return Err(EncryptionPolicyError::PolicyBackendMismatch);
+        };
+        if !binding.matches_receipt(receipt)
+            || evidence.binding != *binding
+            || evidence.operation
+                != if receipt.idempotent_replay {
+                    ObservedOperation::Readback
+                } else {
+                    ObservedOperation::Put
+                }
+            || evidence.response_e_tag.as_ref() != receipt.e_tag.as_ref()
+            || evidence.response_version.as_ref() != receipt.version.as_ref()
+            || receipt.e_tag.is_none()
+        {
+            return Err(EncryptionPolicyError::EvidenceBindingMismatch);
+        }
+        match evidence.algorithm {
+            ObservedManagedAlgorithm::Missing => {
+                return Err(EncryptionPolicyError::ManagedEncryptionRequired);
+            }
+            ObservedManagedAlgorithm::Other => {
+                return Err(EncryptionPolicyError::AlgorithmMismatch);
+            }
+            ObservedManagedAlgorithm::SseKms => {}
+        }
+        if key_identity_fingerprint.is_some()
+            && evidence.key_identity_fingerprint.as_ref() != key_identity_fingerprint.as_ref()
+        {
+            return Err(EncryptionPolicyError::KeyIdentityMismatch);
+        }
+        Ok(EncryptionAttestation::managed_from_observer(
+            binding, receipt, evidence,
+        ))
     }
 }
 
@@ -333,9 +410,22 @@ impl fmt::Display for ArtifactEncryptionPolicy {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 enum EncryptionAttestationKind {
-    Managed(ManagedEncryptionIdentity),
+    S3CompatibleSseKms {
+        key_identity_fingerprint: Option<Sha256Digest>,
+    },
+    DevelopmentOrTestPlaintext,
+}
+
+/// Read-only typed projection of sanitized observed encryption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncryptionAttestationView<'a> {
+    Managed {
+        provider: EncryptionProvider,
+        algorithm: ManagedEncryptionAlgorithm,
+        key_identity_fingerprint: Option<&'a Sha256Digest>,
+    },
     DevelopmentOrTestPlaintext,
 }
 
@@ -343,62 +433,84 @@ enum EncryptionAttestationKind {
 ///
 /// The type intentionally cannot contain provider response bodies or raw key
 /// locators, and its formatting implementations never expose identity values.
-#[derive(Clone, Eq, PartialEq)]
+/// Managed evidence is created only by [`VerifiedObjectStorage`] after a real
+/// observed storage response and cannot be constructed or cloned downstream:
+///
+/// ```compile_fail
+/// use warpin_object_storage::EncryptionAttestation;
+///
+/// let _ = EncryptionAttestation::managed("s3", "kms", None).unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use warpin_object_storage::EncryptionRequirement;
+///
+/// let _ = EncryptionRequirement::managed(
+///     "credential-token-shaped-provider",
+///     "https://provider.example/algorithm",
+///     None,
+/// );
+/// ```
+///
+/// ```compile_fail
+/// use warpin_object_storage::EncryptionAttestation;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<EncryptionAttestation>();
+/// ```
+#[derive(Eq, PartialEq)]
 pub struct EncryptionAttestation {
     kind: EncryptionAttestationKind,
+    receipt_binding: Sha256Digest,
 }
 
 impl EncryptionAttestation {
-    pub fn managed(
-        provider: &str,
-        algorithm: &str,
-        key_identity_fingerprint: Option<&str>,
-    ) -> Result<Self, EncryptionPolicyError> {
-        Ok(Self {
-            kind: EncryptionAttestationKind::Managed(ManagedEncryptionIdentity::parse(
-                provider,
-                algorithm,
-                key_identity_fingerprint,
-            )?),
-        })
+    fn managed_from_observer(
+        binding: &WriteBinding,
+        receipt: &ObjectWriteReceipt,
+        evidence: &ObservedEncryptionEvidence,
+    ) -> Self {
+        Self {
+            kind: EncryptionAttestationKind::S3CompatibleSseKms {
+                key_identity_fingerprint: evidence.key_identity_fingerprint.clone(),
+            },
+            receipt_binding: binding.receipt_binding(receipt, &evidence.request_path_fingerprint),
+        }
     }
 
-    /// Records the deliberate absence of encryption in a development/test backend.
-    pub const fn plaintext_for_development_or_test() -> Self {
+    fn development_or_test_plaintext(binding: &WriteBinding, receipt: &ObjectWriteReceipt) -> Self {
         Self {
             kind: EncryptionAttestationKind::DevelopmentOrTestPlaintext,
+            receipt_binding: binding.receipt_binding(receipt, &digest_bytes(b"local-backend")),
+        }
+    }
+
+    pub const fn view(&self) -> EncryptionAttestationView<'_> {
+        match &self.kind {
+            EncryptionAttestationKind::S3CompatibleSseKms {
+                key_identity_fingerprint,
+            } => EncryptionAttestationView::Managed {
+                provider: EncryptionProvider::S3Compatible,
+                algorithm: ManagedEncryptionAlgorithm::SseKms,
+                key_identity_fingerprint: key_identity_fingerprint.as_ref(),
+            },
+            EncryptionAttestationKind::DevelopmentOrTestPlaintext => {
+                EncryptionAttestationView::DevelopmentOrTestPlaintext
+            }
         }
     }
 
     pub const fn is_managed(&self) -> bool {
-        matches!(self.kind, EncryptionAttestationKind::Managed(_))
+        matches!(
+            self.kind,
+            EncryptionAttestationKind::S3CompatibleSseKms { .. }
+        )
     }
 
-    /// Returns the validated semantic provider identity for durable attestation
-    /// storage. This value is never a provider locator or credential.
-    pub fn provider_identity(&self) -> Option<&str> {
-        self.managed_identity()
-            .map(|identity| identity.provider.as_str())
-    }
-
-    /// Returns the validated semantic algorithm identity for durable attestation
-    /// storage.
-    pub fn algorithm_identity(&self) -> Option<&str> {
-        self.managed_identity()
-            .map(|identity| identity.algorithm.as_str())
-    }
-
-    /// Returns the optional non-secret SHA-256 key identity fingerprint.
-    pub fn key_identity_fingerprint(&self) -> Option<&str> {
-        self.managed_identity()
-            .and_then(|identity| identity.key_identity_fingerprint.as_deref())
-    }
-
-    fn managed_identity(&self) -> Option<&ManagedEncryptionIdentity> {
-        match &self.kind {
-            EncryptionAttestationKind::Managed(identity) => Some(identity),
-            EncryptionAttestationKind::DevelopmentOrTestPlaintext => None,
-        }
+    /// Returns a non-secret digest binding this attestation to the observed
+    /// request path and immutable write receipt.
+    pub const fn receipt_binding_fingerprint(&self) -> &Sha256Digest {
+        &self.receipt_binding
     }
 }
 
@@ -420,7 +532,7 @@ impl fmt::Display for EncryptionAttestation {
 
 /// A write receipt paired with encryption evidence accepted by an
 /// [`ArtifactEncryptionPolicy`].
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct EncryptionVerifiedObjectWriteReceipt {
     receipt: ObjectWriteReceipt,
     attestation: EncryptionAttestation,
@@ -433,10 +545,6 @@ impl EncryptionVerifiedObjectWriteReceipt {
 
     pub const fn attestation(&self) -> &EncryptionAttestation {
         &self.attestation
-    }
-
-    pub fn into_parts(self) -> (ObjectWriteReceipt, EncryptionAttestation) {
-        (self.receipt, self.attestation)
     }
 }
 
@@ -455,20 +563,16 @@ impl fmt::Debug for EncryptionVerifiedObjectWriteReceipt {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum EncryptionPolicyError {
-    #[error("encryption identity is invalid")]
-    InvalidEncryptionIdentity,
-    #[error("encryption key identity fingerprint is invalid")]
-    InvalidKeyIdentityFingerprint,
-    #[error("encryption attestation is required")]
-    MissingAttestation,
     #[error("managed encryption is required")]
     ManagedEncryptionRequired,
-    #[error("observed encryption provider does not satisfy policy")]
-    ProviderMismatch,
     #[error("observed encryption algorithm does not satisfy policy")]
     AlgorithmMismatch,
     #[error("observed encryption key identity does not satisfy policy")]
     KeyIdentityMismatch,
+    #[error("observed encryption evidence is not bound to this write receipt")]
+    EvidenceBindingMismatch,
+    #[error("encryption policy is not valid for this storage backend")]
+    PolicyBackendMismatch,
 }
 
 fn encryption_mode_name(managed: bool) -> &'static str {
@@ -479,20 +583,300 @@ fn encryption_mode_name(managed: bool) -> &'static str {
     }
 }
 
-fn is_safe_encryption_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_ENCRYPTION_IDENTITY_BYTES
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
-        })
+#[derive(Clone, Eq, PartialEq)]
+struct WriteBinding {
+    nonce: u64,
+    key: ObjectKey,
+    size_bytes: u64,
+    digest: Sha256Digest,
 }
 
-fn is_sha256_fingerprint(value: &str) -> bool {
-    value.len() == SHA256_FINGERPRINT_PREFIX.len() + SHA256_HEX_BYTES
-        && value.starts_with(SHA256_FINGERPRINT_PREFIX)
-        && value[SHA256_FINGERPRINT_PREFIX.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+impl WriteBinding {
+    fn for_write(key: &ObjectKey, size_bytes: u64, digest: &Sha256Digest) -> Self {
+        Self {
+            nonce: NEXT_WRITE_BINDING.fetch_add(1, Ordering::Relaxed),
+            key: key.clone(),
+            size_bytes,
+            digest: digest.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(receipt: &ObjectWriteReceipt) -> Self {
+        Self::for_write(&receipt.key, receipt.size_bytes, &receipt.digest)
+    }
+
+    fn matches_receipt(&self, receipt: &ObjectWriteReceipt) -> bool {
+        self.key == receipt.key
+            && self.size_bytes == receipt.size_bytes
+            && self.digest == receipt.digest
+    }
+
+    fn receipt_binding(
+        &self,
+        receipt: &ObjectWriteReceipt,
+        request_path_fingerprint: &Sha256Digest,
+    ) -> Sha256Digest {
+        let value = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.nonce,
+            self.key.as_str(),
+            self.size_bytes,
+            self.digest,
+            receipt.e_tag.as_deref().unwrap_or_default(),
+            receipt.version.as_deref().unwrap_or_default(),
+            request_path_fingerprint,
+        );
+        digest_bytes(value.as_bytes())
+    }
+}
+
+impl fmt::Debug for WriteBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteBinding")
+            .field("object", &"[BOUND]")
+            .field("size_bytes", &self.size_bytes)
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedOperation {
+    Put,
+    Readback,
+}
+
+impl ObservedOperation {
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
+    fn matches_method(self, method: &str) -> bool {
+        matches!((self, method), (Self::Put, "PUT") | (Self::Readback, "GET"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObserverRequestBinding {
+    binding: WriteBinding,
+    operation: ObservedOperation,
+}
+
+impl ObserverRequestBinding {
+    fn put(binding: WriteBinding) -> Self {
+        Self {
+            binding,
+            operation: ObservedOperation::Put,
+        }
+    }
+
+    fn readback(binding: WriteBinding) -> Self {
+        Self {
+            binding,
+            operation: ObservedOperation::Readback,
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedManagedAlgorithm {
+    Missing,
+    SseKms,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfiguredS3Encryption {
+    algorithm: ObservedManagedAlgorithm,
+    key_identity_fingerprint: Option<Sha256Digest>,
+}
+
+#[cfg(feature = "aws")]
+impl ConfiguredS3Encryption {
+    fn from_options(options: &BTreeMap<String, String>) -> Result<Self, ObjectStorageError> {
+        let mut algorithm = None;
+        let mut key_identity_fingerprint = None;
+        let mut key_identity_configured = false;
+        for (key, value) in options {
+            let parsed = key
+                .parse::<AmazonS3ConfigKey>()
+                .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+            match parsed.as_ref() {
+                "aws_server_side_encryption" => {
+                    if algorithm.is_some() {
+                        return Err(ObjectStorageError::InvalidConfiguration);
+                    }
+                    algorithm = Some(if value == S3_SSE_KMS_VALUE {
+                        ObservedManagedAlgorithm::SseKms
+                    } else {
+                        ObservedManagedAlgorithm::Other
+                    });
+                }
+                "aws_sse_kms_key_id" => {
+                    if key_identity_configured
+                        || value.is_empty()
+                        || value.len() > MAX_OBSERVED_KEY_ID_BYTES
+                    {
+                        return Err(ObjectStorageError::InvalidConfiguration);
+                    }
+                    key_identity_configured = true;
+                    key_identity_fingerprint = Some(digest_bytes(value.as_bytes()));
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            algorithm: algorithm.unwrap_or(ObservedManagedAlgorithm::Missing),
+            key_identity_fingerprint,
+        })
+    }
+}
+
+impl ConfiguredS3Encryption {
+    fn verify_observed(
+        &self,
+        evidence: &ObservedEncryptionEvidence,
+    ) -> Result<(), EncryptionPolicyError> {
+        match (self.algorithm, evidence.algorithm) {
+            (ObservedManagedAlgorithm::SseKms, ObservedManagedAlgorithm::SseKms) => {}
+            (_, ObservedManagedAlgorithm::Missing) => {
+                return Err(EncryptionPolicyError::ManagedEncryptionRequired);
+            }
+            _ => return Err(EncryptionPolicyError::AlgorithmMismatch),
+        }
+        if self.key_identity_fingerprint.is_some()
+            && self.key_identity_fingerprint.as_ref() != evidence.key_identity_fingerprint.as_ref()
+        {
+            return Err(EncryptionPolicyError::KeyIdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ObservedEncryptionEvidence {
+    binding: WriteBinding,
+    operation: ObservedOperation,
+    request_path_fingerprint: Sha256Digest,
+    response_e_tag: Option<String>,
+    response_version: Option<String>,
+    algorithm: ObservedManagedAlgorithm,
+    key_identity_fingerprint: Option<Sha256Digest>,
+}
+
+impl fmt::Debug for ObservedEncryptionEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObservedEncryptionEvidence")
+            .field("binding", &self.binding)
+            .field("operation", &self.operation)
+            .field("request_path", &"[FINGERPRINTED]")
+            .field("response_identity", &"[REDACTED]")
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+fn observed_s3_response(
+    request: &ObserverRequestBinding,
+    method: &str,
+    request_path: &str,
+    headers: &object_store::HeaderMap,
+) -> Option<ObservedEncryptionEvidence> {
+    if request_path.is_empty() {
+        return None;
+    }
+    observed_s3_response_with_path_fingerprint(
+        request,
+        method,
+        digest_bytes(request_path.as_bytes()),
+        headers,
+    )
+}
+
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+fn observed_s3_response_with_path_fingerprint(
+    request: &ObserverRequestBinding,
+    method: &str,
+    request_path_fingerprint: Sha256Digest,
+    headers: &object_store::HeaderMap,
+) -> Option<ObservedEncryptionEvidence> {
+    if !request.operation.matches_method(method) {
+        return None;
+    }
+    let algorithm = match header_value(headers, S3_SSE_HEADER) {
+        None => ObservedManagedAlgorithm::Missing,
+        Some(S3_SSE_KMS_VALUE) => ObservedManagedAlgorithm::SseKms,
+        Some(_) => ObservedManagedAlgorithm::Other,
+    };
+    let key_identity_fingerprint = header_value(headers, S3_KMS_KEY_ID_HEADER)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_OBSERVED_KEY_ID_BYTES)
+        .map(|value| digest_bytes(value.as_bytes()));
+    Some(ObservedEncryptionEvidence {
+        binding: request.binding.clone(),
+        operation: request.operation,
+        request_path_fingerprint,
+        response_e_tag: header_value(headers, "etag").map(str::to_owned),
+        response_version: header_value(headers, S3_VERSION_HEADER).map(str::to_owned),
+        algorithm,
+        key_identity_fingerprint,
+    })
+}
+
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+fn header_value<'a>(headers: &'a object_store::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+#[cfg(feature = "aws")]
+#[derive(Debug, Default)]
+struct S3EncryptionObserverConnector {
+    inner: ReqwestConnector,
+}
+
+#[cfg(feature = "aws")]
+impl HttpConnector for S3EncryptionObserverConnector {
+    fn connect(&self, options: &object_store::ClientOptions) -> object_store::Result<HttpClient> {
+        let client = self.inner.connect(options)?;
+        Ok(HttpClient::new(S3EncryptionObserverService {
+            inner: client,
+        }))
+    }
+}
+
+#[cfg(feature = "aws")]
+#[derive(Debug)]
+struct S3EncryptionObserverService {
+    inner: HttpClient,
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl HttpService for S3EncryptionObserverService {
+    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let binding = request
+            .extensions()
+            .get::<ObserverRequestBinding>()
+            .cloned();
+        let method = request.method().as_str().to_owned();
+        let path_fingerprint = (!request.uri().path().is_empty())
+            .then(|| digest_bytes(request.uri().path().as_bytes()));
+        let mut response = self.inner.execute(request).await?;
+        if response.status().is_success()
+            && let Some(binding) = binding
+            && let Some(path_fingerprint) = path_fingerprint
+            && let Some(evidence) = observed_s3_response_with_path_fingerprint(
+                &binding,
+                &method,
+                path_fingerprint,
+                response.headers(),
+            )
+        {
+            response.extensions_mut().insert(evidence);
+        }
+        Ok(response)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,6 +909,15 @@ pub enum ObjectStorageError {
     NotFound,
     #[error("object storage backend operation failed")]
     Backend,
+    #[error(transparent)]
+    EncryptionPolicy(#[from] EncryptionPolicyError),
+}
+
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackendSecurityMode {
+    DevelopmentOrTestPlaintext,
+    S3Observed { configured: ConfiguredS3Encryption },
 }
 
 #[derive(Clone)]
@@ -533,6 +926,7 @@ pub struct VerifiedObjectStorage {
     prefix: Path,
     max_object_bytes: u64,
     supports_attributes: bool,
+    backend_security: BackendSecurityMode,
 }
 
 impl fmt::Debug for VerifiedObjectStorage {
@@ -549,50 +943,149 @@ impl fmt::Debug for VerifiedObjectStorage {
 impl VerifiedObjectStorage {
     pub fn from_settings(settings: ObjectStoreSettings) -> Result<Self, ObjectStorageError> {
         let url = settings.validate()?;
-        let (store, prefix, supports_attributes): (Box<dyn ObjectStore>, Path, bool) =
-            match url.scheme() {
-                "file" => {
-                    #[cfg(not(feature = "fs"))]
-                    return Err(ObjectStorageError::UnsupportedBackend);
-                    #[cfg(feature = "fs")]
-                    {
-                        let filesystem_path = url
-                            .to_file_path()
+        let (store, prefix, supports_attributes, backend_security): (
+            Box<dyn ObjectStore>,
+            Path,
+            bool,
+            BackendSecurityMode,
+        ) = match url.scheme() {
+            "file" => {
+                #[cfg(not(feature = "fs"))]
+                return Err(ObjectStorageError::UnsupportedBackend);
+                #[cfg(feature = "fs")]
+                {
+                    let filesystem_path = url
+                        .to_file_path()
+                        .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+                    let store =
+                        object_store::local::LocalFileSystem::new_with_prefix(filesystem_path)
+                            .map_err(map_backend_configuration_error)?
+                            .with_fsync(true);
+                    (
+                        Box::new(store),
+                        Path::ROOT,
+                        false,
+                        BackendSecurityMode::DevelopmentOrTestPlaintext,
+                    )
+                }
+            }
+            "memory" => {
+                let (store, prefix) = object_store::parse_url_opts(&url, settings.options)
+                    .map_err(map_backend_configuration_error)?;
+                (
+                    store,
+                    prefix,
+                    true,
+                    BackendSecurityMode::DevelopmentOrTestPlaintext,
+                )
+            }
+            "s3" | "s3a" => {
+                #[cfg(not(feature = "aws"))]
+                return Err(ObjectStorageError::UnsupportedBackend);
+                #[cfg(feature = "aws")]
+                {
+                    let configured = ConfiguredS3Encryption::from_options(&settings.options)?;
+                    let mut builder = AmazonS3Builder::new()
+                        .with_url(url.as_str())
+                        .with_http_connector(S3EncryptionObserverConnector::default());
+                    for (key, value) in settings.options {
+                        let key = key
+                            .parse::<AmazonS3ConfigKey>()
                             .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
-                        let store =
-                            object_store::local::LocalFileSystem::new_with_prefix(filesystem_path)
-                                .map_err(map_backend_configuration_error)?
-                                .with_fsync(true);
-                        (Box::new(store), Path::ROOT, false)
+                        builder = builder.with_config(key, value);
                     }
+                    let store = builder.build().map_err(map_backend_configuration_error)?;
+                    let prefix = Path::from_url_path(url.path())
+                        .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+                    (
+                        Box::new(store),
+                        prefix,
+                        true,
+                        BackendSecurityMode::S3Observed { configured },
+                    )
                 }
-                _ => {
-                    let (store, prefix) = object_store::parse_url_opts(&url, settings.options)
-                        .map_err(map_backend_configuration_error)?;
-                    (store, prefix, true)
-                }
-            };
+            }
+            _ => return Err(ObjectStorageError::UnsupportedBackend),
+        };
         Ok(Self {
             store: Arc::from(store),
             prefix,
             max_object_bytes: settings.max_object_bytes,
             supports_attributes,
+            backend_security,
         })
     }
 
+    /// Performs an immutable write and returns a policy-verified opaque receipt.
+    ///
+    /// Managed evidence is derived only from a real S3-compatible HTTP response
+    /// observed by this crate's connector and is bound to the request method,
+    /// object, write nonce, digest, size, ETag, and version. This trust boundary
+    /// proves traversal through the installed observer; it does not defend against
+    /// a process-internal attacker replacing the entire configured HTTP transport.
     pub async fn put_immutable(
         &self,
         write: ImmutableObjectWrite,
-    ) -> Result<ObjectWriteReceipt, ObjectStorageError> {
+        policy: &ArtifactEncryptionPolicy,
+    ) -> Result<EncryptionVerifiedObjectWriteReceipt, ObjectStorageError> {
+        match (&self.backend_security, policy.requirement().view()) {
+            (
+                BackendSecurityMode::DevelopmentOrTestPlaintext,
+                EncryptionRequirementView::DevelopmentOrTestPlaintext,
+            )
+            | (BackendSecurityMode::S3Observed { .. }, EncryptionRequirementView::Managed { .. }) =>
+                {}
+            (
+                BackendSecurityMode::DevelopmentOrTestPlaintext,
+                EncryptionRequirementView::Managed { .. },
+            ) => {
+                return Err(EncryptionPolicyError::ManagedEncryptionRequired.into());
+            }
+            (
+                BackendSecurityMode::S3Observed { .. },
+                EncryptionRequirementView::DevelopmentOrTestPlaintext,
+            ) => return Err(EncryptionPolicyError::PolicyBackendMismatch.into()),
+        }
+        if let BackendSecurityMode::S3Observed { configured } = &self.backend_security {
+            policy.verify_s3_configuration(configured)?;
+        }
+
         validate_content_type(&write.content_type)?;
         let size_bytes = u64::try_from(write.content.len())
             .map_err(|_| ObjectStorageError::SizeLimitExceeded)?;
-        if size_bytes > self.max_object_bytes {
-            return Err(ObjectStorageError::SizeLimitExceeded);
-        }
-        if digest_bytes(&write.content) != write.expected_digest {
-            return Err(ObjectStorageError::DigestMismatch);
-        }
+        validate_write(&write, size_bytes, self.max_object_bytes)?;
+        let binding = WriteBinding::for_write(&write.key, size_bytes, &write.expected_digest);
+        let outcome = self
+            .put_immutable_internal(write, Some(binding.clone()))
+            .await?;
+        let attestation = match &self.backend_security {
+            BackendSecurityMode::DevelopmentOrTestPlaintext => {
+                EncryptionAttestation::development_or_test_plaintext(&binding, &outcome.receipt)
+            }
+            BackendSecurityMode::S3Observed { configured } => {
+                let evidence = outcome
+                    .evidence
+                    .as_ref()
+                    .ok_or(EncryptionPolicyError::EvidenceBindingMismatch)?;
+                configured.verify_observed(evidence)?;
+                policy.verify_managed_evidence(&outcome.receipt, &binding, evidence)?
+            }
+        };
+        Ok(EncryptionVerifiedObjectWriteReceipt {
+            receipt: outcome.receipt,
+            attestation,
+        })
+    }
+
+    async fn put_immutable_internal(
+        &self,
+        write: ImmutableObjectWrite,
+        binding: Option<WriteBinding>,
+    ) -> Result<ImmutableWriteOutcome, ObjectStorageError> {
+        validate_content_type(&write.content_type)?;
+        let size_bytes = u64::try_from(write.content.len())
+            .map_err(|_| ObjectStorageError::SizeLimitExceeded)?;
+        validate_write(&write, size_bytes, self.max_object_bytes)?;
         let location = self.location(&write.key)?;
         let attributes = if self.supports_attributes {
             let mut attributes = Attributes::new();
@@ -608,6 +1101,10 @@ impl VerifiedObjectStorage {
         } else {
             Attributes::new()
         };
+        let mut extensions = Extensions::new();
+        if let Some(binding) = binding.as_ref() {
+            extensions.insert(ObserverRequestBinding::put(binding.clone()));
+        }
         let put_result = self
             .store
             .put_opts(
@@ -616,17 +1113,32 @@ impl VerifiedObjectStorage {
                 PutOptions {
                     mode: PutMode::Create,
                     attributes,
+                    extensions,
                     ..PutOptions::default()
                 },
             )
             .await;
-        let (e_tag, version, idempotent_replay) = match put_result {
-            Ok(result) => (result.e_tag, result.version, false),
-            Err(object_store::Error::AlreadyExists { .. }) => (None, None, true),
+        let (e_tag, version, idempotent_replay, put_evidence) = match put_result {
+            Ok(result) => {
+                let evidence = result
+                    .extensions
+                    .get::<ObservedEncryptionEvidence>()
+                    .cloned();
+                (result.e_tag, result.version, false, evidence)
+            }
+            Err(object_store::Error::AlreadyExists { .. }) => (None, None, true, None),
             Err(_) => return Err(ObjectStorageError::Backend),
         };
         let readback = self
-            .read_verified(&write.key, &write.expected_digest)
+            .read_verified_internal(
+                &write.key,
+                &write.expected_digest,
+                if idempotent_replay {
+                    binding.as_ref()
+                } else {
+                    None
+                },
+            )
             .await
             .map_err(|error| {
                 if idempotent_replay && error == ObjectStorageError::DigestMismatch {
@@ -636,17 +1148,25 @@ impl VerifiedObjectStorage {
                 }
             })?;
         if self.supports_attributes
-            && readback.content_type.as_deref() != Some(write.content_type.as_str())
+            && readback.object.content_type.as_deref() != Some(write.content_type.as_str())
         {
             return Err(ObjectStorageError::ImmutableConflict);
         }
-        Ok(ObjectWriteReceipt {
+        let receipt = ObjectWriteReceipt {
             key: write.key,
             size_bytes,
             digest: write.expected_digest,
-            e_tag: e_tag.or(readback.e_tag),
-            version: version.or(readback.version),
+            e_tag: e_tag.or(readback.object.e_tag),
+            version: version.or(readback.object.version),
             idempotent_replay,
+        };
+        Ok(ImmutableWriteOutcome {
+            receipt,
+            evidence: if idempotent_replay {
+                readback.evidence
+            } else {
+                put_evidence
+            },
         })
     }
 
@@ -655,10 +1175,25 @@ impl VerifiedObjectStorage {
         key: &ObjectKey,
         expected_digest: &Sha256Digest,
     ) -> Result<VerifiedObject, ObjectStorageError> {
+        self.read_verified_internal(key, expected_digest, None)
+            .await
+            .map(|readback| readback.object)
+    }
+
+    async fn read_verified_internal(
+        &self,
+        key: &ObjectKey,
+        expected_digest: &Sha256Digest,
+        binding: Option<&WriteBinding>,
+    ) -> Result<VerifiedReadback, ObjectStorageError> {
         let location = self.location(key)?;
+        let mut extensions = Extensions::new();
+        if let Some(binding) = binding {
+            extensions.insert(ObserverRequestBinding::readback(binding.clone()));
+        }
         let result = self
             .store
-            .get(&location)
+            .get_opts(&location, GetOptions::default().with_extensions(extensions))
             .await
             .map_err(map_backend_read_error)?;
         if result.meta.size > self.max_object_bytes {
@@ -684,6 +1219,10 @@ impl VerifiedObjectStorage {
         let expected_size = result.meta.size;
         let e_tag = result.meta.e_tag.clone();
         let version = result.meta.version.clone();
+        let evidence = result
+            .extensions
+            .get::<ObservedEncryptionEvidence>()
+            .cloned();
         let content = result
             .bytes()
             .await
@@ -693,13 +1232,16 @@ impl VerifiedObjectStorage {
         if actual_size != expected_size || digest_bytes(&content) != *expected_digest {
             return Err(ObjectStorageError::DigestMismatch);
         }
-        Ok(VerifiedObject {
-            key: key.clone(),
-            content,
-            digest: expected_digest.clone(),
-            content_type,
-            e_tag,
-            version,
+        Ok(VerifiedReadback {
+            object: VerifiedObject {
+                key: key.clone(),
+                content,
+                digest: expected_digest.clone(),
+                content_type,
+                e_tag,
+                version,
+            },
+            evidence,
         })
     }
 
@@ -711,6 +1253,30 @@ impl VerifiedObjectStorage {
         };
         Path::parse(value).map_err(|_| ObjectStorageError::InvalidKey)
     }
+}
+
+struct ImmutableWriteOutcome {
+    receipt: ObjectWriteReceipt,
+    evidence: Option<ObservedEncryptionEvidence>,
+}
+
+struct VerifiedReadback {
+    object: VerifiedObject,
+    evidence: Option<ObservedEncryptionEvidence>,
+}
+
+fn validate_write(
+    write: &ImmutableObjectWrite,
+    size_bytes: u64,
+    max_object_bytes: u64,
+) -> Result<(), ObjectStorageError> {
+    if size_bytes > max_object_bytes {
+        return Err(ObjectStorageError::SizeLimitExceeded);
+    }
+    if digest_bytes(&write.content) != write.expected_digest {
+        return Err(ObjectStorageError::DigestMismatch);
+    }
+    Ok(())
 }
 
 fn validate_content_type(content_type: &str) -> Result<(), ObjectStorageError> {
@@ -746,6 +1312,8 @@ fn map_backend_read_error(error: object_store::Error) -> ObjectStorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "aws")]
+    use object_store::client::{HttpRequestBody, HttpResponseBody};
 
     fn storage(max_object_bytes: u64) -> VerifiedObjectStorage {
         VerifiedObjectStorage::from_settings(
@@ -779,164 +1347,393 @@ mod tests {
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
 
-    fn managed_policy() -> ArtifactEncryptionPolicy {
-        ArtifactEncryptionPolicy::new(
-            EncryptionRequirement::managed(
-                "portable-managed-key",
-                "aes-256-gcm",
-                Some(key_identity_fingerprint()),
-            )
-            .expect("managed requirement"),
-        )
-    }
-
-    fn managed_attestation() -> EncryptionAttestation {
-        EncryptionAttestation::managed(
-            "portable-managed-key",
-            "aes-256-gcm",
-            Some(key_identity_fingerprint()),
-        )
-        .expect("managed attestation")
+    fn typed_key_identity_fingerprint() -> Sha256Digest {
+        key_identity_fingerprint()
+            .parse()
+            .expect("typed fingerprint")
     }
 
     #[test]
-    fn encryption_policy_rejects_absent_or_plaintext_attestation_when_managed_is_required() {
-        let policy = managed_policy();
+    fn encryption_requirement_has_a_closed_typed_projection() {
+        let requirement =
+            EncryptionRequirement::s3_compatible_sse_kms(Some(typed_key_identity_fingerprint()));
         assert_eq!(
-            policy.verify_receipt(receipt(false), None),
-            Err(EncryptionPolicyError::MissingAttestation)
+            requirement.view(),
+            EncryptionRequirementView::Managed {
+                provider: EncryptionProvider::S3Compatible,
+                algorithm: ManagedEncryptionAlgorithm::SseKms,
+                key_identity_fingerprint: Some(&typed_key_identity_fingerprint()),
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn memory_backend_cannot_satisfy_a_managed_encryption_policy() {
+        let policy =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::s3_compatible_sse_kms(None));
         assert_eq!(
-            policy.verify_receipt(
-                receipt(false),
-                Some(EncryptionAttestation::plaintext_for_development_or_test()),
+            storage(1_024)
+                .put_immutable(write("objects/managed.json", b"managed"), &policy)
+                .await,
+            Err(ObjectStorageError::EncryptionPolicy(
+                EncryptionPolicyError::ManagedEncryptionRequired,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_backend_requires_explicit_development_policy_for_verified_receipts() {
+        let policy =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::development_or_test_plaintext());
+        let verified = storage(1_024)
+            .put_immutable(write("objects/dev.json", b"dev"), &policy)
+            .await
+            .expect("explicit development policy");
+        assert_eq!(
+            verified.attestation().view(),
+            EncryptionAttestationView::DevelopmentOrTestPlaintext
+        );
+    }
+
+    #[test]
+    fn managed_evidence_is_bound_to_method_object_and_receipt() {
+        let first_receipt = receipt(false);
+        let first_binding = WriteBinding::new(&first_receipt);
+        let evidence = observed_s3_response(
+            &ObserverRequestBinding::put(first_binding.clone()),
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                first_receipt.e_tag.as_deref(),
+                first_receipt.version.as_deref(),
+                "kms-key-one",
             ),
+        )
+        .expect("observed evidence");
+        let attestation = managed_policy()
+            .verify_managed_evidence(&first_receipt, &first_binding, &evidence)
+            .expect("exact evidence binding");
+        assert!(
+            attestation
+                .receipt_binding_fingerprint()
+                .as_str()
+                .starts_with("sha256:")
+        );
+
+        let mut other_receipt = receipt(false);
+        other_receipt.key = ObjectKey::parse("objects/other.json").expect("other key");
+        let other_binding = WriteBinding::new(&other_receipt);
+        assert_eq!(
+            managed_policy().verify_managed_evidence(&other_receipt, &other_binding, &evidence,),
+            Err(EncryptionPolicyError::EvidenceBindingMismatch)
+        );
+
+        let wrong_method = observed_s3_response(
+            &ObserverRequestBinding::put(first_binding.clone()),
+            "GET",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                first_receipt.e_tag.as_deref(),
+                first_receipt.version.as_deref(),
+                "kms-key-one",
+            ),
+        );
+        assert!(wrong_method.is_none());
+    }
+
+    #[test]
+    fn missing_or_mismatched_s3_encryption_headers_fail_closed() {
+        let receipt = receipt(false);
+        let binding = WriteBinding::new(&receipt);
+        let request = ObserverRequestBinding::put(binding.clone());
+
+        let missing = observed_s3_response(
+            &request,
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &receipt_headers(receipt.e_tag.as_deref(), receipt.version.as_deref()),
+        )
+        .expect("bound missing observation");
+        assert_eq!(
+            managed_policy().verify_managed_evidence(&receipt, &binding, &missing),
             Err(EncryptionPolicyError::ManagedEncryptionRequired)
         );
+
+        let mismatched = observed_s3_response(
+            &request,
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &sse_headers(
+                "AES256",
+                receipt.e_tag.as_deref(),
+                receipt.version.as_deref(),
+                None,
+            ),
+        )
+        .expect("bound mismatched observation");
+        assert_eq!(
+            managed_policy().verify_managed_evidence(&receipt, &binding, &mismatched),
+            Err(EncryptionPolicyError::AlgorithmMismatch)
+        );
     }
 
-    #[test]
-    fn encryption_policy_compares_managed_provider_algorithm_and_optional_key_identity() {
-        let verified = managed_policy()
-            .verify_receipt(receipt(false), Some(managed_attestation()))
-            .expect("matching managed attestation");
-        assert!(!verified.receipt().idempotent_replay);
-        assert!(verified.attestation().is_managed());
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn observer_http_service_carries_private_response_evidence_to_the_caller() {
+        #[derive(Debug)]
+        struct SseKmsResponseService {
+            headers: object_store::HeaderMap,
+        }
 
-        for (attestation, expected) in [
+        #[async_trait]
+        impl HttpService for SseKmsResponseService {
+            async fn call(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+                let mut response =
+                    HttpResponse::new(HttpResponseBody::new(HttpRequestBody::empty()));
+                *response.headers_mut() = self.headers.clone();
+                Ok(response)
+            }
+        }
+
+        let receipt = receipt(false);
+        let binding = WriteBinding::new(&receipt);
+        let request_binding = ObserverRequestBinding::put(binding.clone());
+        let service = S3EncryptionObserverService {
+            inner: HttpClient::new(SseKmsResponseService {
+                headers: sse_kms_headers(
+                    receipt.e_tag.as_deref(),
+                    receipt.version.as_deref(),
+                    "kms-key-one",
+                ),
+            }),
+        };
+        let mut request = HttpRequest::new(HttpRequestBody::empty());
+        *request.method_mut() = "PUT".parse().expect("PUT method");
+        *request.uri_mut() = "https://store.example/bucket/objects/encrypted.json"
+            .parse()
+            .expect("request URI");
+        request.extensions_mut().insert(request_binding);
+
+        let response = service.call(request).await.expect("observed response");
+        let evidence = response
+            .extensions()
+            .get::<ObservedEncryptionEvidence>()
+            .expect("private evidence extension");
+        managed_policy()
+            .verify_managed_evidence(&receipt, &binding, evidence)
+            .expect("evidence propagated from the real response");
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path() {
+        let missing = ConfiguredS3Encryption::from_options(&BTreeMap::new())
+            .expect("missing encryption is a valid observed configuration state");
+        assert_eq!(
+            managed_policy().verify_s3_configuration(&missing),
+            Err(EncryptionPolicyError::ManagedEncryptionRequired)
+        );
+
+        let wrong_algorithm = ConfiguredS3Encryption::from_options(&BTreeMap::from([(
+            "aws_server_side_encryption".to_owned(),
+            "AES256".to_owned(),
+        )]))
+        .expect("supported storage option shape");
+        assert_eq!(
+            managed_policy().verify_s3_configuration(&wrong_algorithm),
+            Err(EncryptionPolicyError::AlgorithmMismatch)
+        );
+
+        let wrong_key = ConfiguredS3Encryption::from_options(&BTreeMap::from([
             (
-                EncryptionAttestation::managed(
-                    "different-provider",
-                    "aes-256-gcm",
-                    Some(key_identity_fingerprint()),
-                )
-                .expect("attestation"),
-                EncryptionPolicyError::ProviderMismatch,
+                "aws_server_side_encryption".to_owned(),
+                "aws:kms".to_owned(),
             ),
+            ("aws_sse_kms_key_id".to_owned(), "different-key".to_owned()),
+        ]))
+        .expect("supported storage option shape");
+        assert_eq!(
+            managed_policy().verify_s3_configuration(&wrong_key),
+            Err(EncryptionPolicyError::KeyIdentityMismatch)
+        );
+
+        let exact = ConfiguredS3Encryption::from_options(&BTreeMap::from([
             (
-                EncryptionAttestation::managed(
-                    "portable-managed-key",
-                    "different-algorithm",
-                    Some(key_identity_fingerprint()),
-                )
-                .expect("attestation"),
-                EncryptionPolicyError::AlgorithmMismatch,
+                "aws_server_side_encryption".to_owned(),
+                "aws:kms".to_owned(),
             ),
-            (
-                EncryptionAttestation::managed(
-                    "portable-managed-key",
-                    "aes-256-gcm",
-                    Some("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
-                )
-                .expect("attestation"),
-                EncryptionPolicyError::KeyIdentityMismatch,
+            ("aws_sse_kms_key_id".to_owned(), "kms-key-one".to_owned()),
+        ]))
+        .expect("supported storage option shape");
+        managed_policy()
+            .verify_s3_configuration(&exact)
+            .expect("exact configured capability");
+
+        let receipt = receipt(false);
+        let binding = WriteBinding::new(&receipt);
+        let wrong_observed_key = observed_s3_response(
+            &ObserverRequestBinding::put(binding),
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                receipt.e_tag.as_deref(),
+                receipt.version.as_deref(),
+                "different-key",
             ),
-        ] {
-            assert_eq!(
-                managed_policy().verify_receipt(receipt(false), Some(attestation)),
-                Err(expected)
+        )
+        .expect("observed response");
+        assert_eq!(
+            exact.verify_observed(&wrong_observed_key),
+            Err(EncryptionPolicyError::KeyIdentityMismatch)
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn public_s3_write_rejects_missing_managed_configuration_without_network_io() {
+        let storage = VerifiedObjectStorage::from_settings(ObjectStoreSettings::new(
+            "s3://preflight-only-bucket/private-prefix",
+        ))
+        .expect("S3 configuration builds without performing I/O");
+        let policy =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::s3_compatible_sse_kms(None));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            storage.put_immutable(write("objects/no-plaintext.json", b"private"), &policy),
+        )
+        .await
+        .expect("policy preflight completes without network I/O");
+        assert_eq!(
+            result,
+            Err(ObjectStorageError::EncryptionPolicy(
+                EncryptionPolicyError::ManagedEncryptionRequired,
+            ))
+        );
+    }
+
+    fn sse_kms_headers(
+        e_tag: Option<&str>,
+        version: Option<&str>,
+        key_identity: &str,
+    ) -> object_store::HeaderMap {
+        sse_headers("aws:kms", e_tag, version, Some(key_identity))
+    }
+
+    fn sse_headers(
+        algorithm: &'static str,
+        e_tag: Option<&str>,
+        version: Option<&str>,
+        key_identity: Option<&str>,
+    ) -> object_store::HeaderMap {
+        let mut headers = receipt_headers(e_tag, version);
+        headers.insert(
+            "x-amz-server-side-encryption",
+            object_store::HeaderValue::from_static(algorithm),
+        );
+        if let Some(key_identity) = key_identity {
+            headers.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                key_identity.parse().expect("key identity header"),
             );
         }
+        headers
+    }
+
+    fn receipt_headers(e_tag: Option<&str>, version: Option<&str>) -> object_store::HeaderMap {
+        let mut headers = object_store::HeaderMap::new();
+        if let Some(e_tag) = e_tag {
+            headers.insert("etag", e_tag.parse().expect("etag header"));
+        }
+        if let Some(version) = version {
+            headers.insert("x-amz-version-id", version.parse().expect("version header"));
+        }
+        headers
+    }
+
+    fn managed_policy() -> ArtifactEncryptionPolicy {
+        ArtifactEncryptionPolicy::new(EncryptionRequirement::s3_compatible_sse_kms(Some(
+            digest_bytes(b"kms-key-one"),
+        )))
+    }
+
+    fn development_policy() -> ArtifactEncryptionPolicy {
+        ArtifactEncryptionPolicy::new(EncryptionRequirement::development_or_test_plaintext())
     }
 
     #[test]
-    fn encryption_attestation_debug_and_display_never_disclose_identity_values() {
-        let provider = "sentinel-provider-secret";
-        let algorithm = "sentinel-algorithm-secret";
-        let fingerprint = key_identity_fingerprint();
-        let attestation = EncryptionAttestation::managed(provider, algorithm, Some(fingerprint))
-            .expect("managed attestation");
+    fn observed_key_identity_is_fingerprinted_and_formatting_is_redacted() {
+        let raw_key_identity = "arn:provider:kms:region:account:key/credential-token-sentinel";
+        let receipt = receipt(false);
+        let binding = WriteBinding::new(&receipt);
+        let evidence = observed_s3_response(
+            &ObserverRequestBinding::put(binding.clone()),
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                receipt.e_tag.as_deref(),
+                receipt.version.as_deref(),
+                raw_key_identity,
+            ),
+        )
+        .expect("observed evidence");
+        let attestation =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::s3_compatible_sse_kms(Some(
+                digest_bytes(raw_key_identity.as_bytes()),
+            )))
+            .verify_managed_evidence(&receipt, &binding, &evidence)
+            .expect("matching evidence");
 
+        assert_eq!(
+            attestation.view(),
+            EncryptionAttestationView::Managed {
+                provider: EncryptionProvider::S3Compatible,
+                algorithm: ManagedEncryptionAlgorithm::SseKms,
+                key_identity_fingerprint: Some(&digest_bytes(raw_key_identity.as_bytes())),
+            }
+        );
         for rendered in [format!("{attestation:?}"), format!("{attestation}")] {
-            assert!(!rendered.contains(provider));
-            assert!(!rendered.contains(algorithm));
-            assert!(!rendered.contains(fingerprint));
+            assert!(!rendered.contains(raw_key_identity));
             assert!(!rendered.contains("arn:"));
-            assert!(!rendered.contains("https://"));
             assert!(!rendered.to_ascii_lowercase().contains("credential"));
             assert!(!rendered.to_ascii_lowercase().contains("token"));
         }
     }
 
     #[test]
-    fn encryption_attestation_exposes_only_validated_semantic_identity_for_persistence() {
-        let attestation = managed_attestation();
+    fn expected_key_fingerprint_and_idempotent_operation_are_enforced() {
+        let replay = receipt(true);
+        let binding = WriteBinding::new(&replay);
+        let evidence = observed_s3_response(
+            &ObserverRequestBinding::readback(binding.clone()),
+            "GET",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                replay.e_tag.as_deref(),
+                replay.version.as_deref(),
+                "different-key",
+            ),
+        )
+        .expect("readback evidence");
         assert_eq!(
-            attestation.provider_identity(),
-            Some("portable-managed-key")
+            managed_policy().verify_managed_evidence(&replay, &binding, &evidence),
+            Err(EncryptionPolicyError::KeyIdentityMismatch)
         );
-        assert_eq!(attestation.algorithm_identity(), Some("aes-256-gcm"));
+
+        let put_evidence = observed_s3_response(
+            &ObserverRequestBinding::put(binding.clone()),
+            "PUT",
+            "/bucket/objects/encrypted.json",
+            &sse_kms_headers(
+                replay.e_tag.as_deref(),
+                replay.version.as_deref(),
+                "kms-key-one",
+            ),
+        )
+        .expect("put evidence");
         assert_eq!(
-            attestation.key_identity_fingerprint(),
-            Some(key_identity_fingerprint())
+            managed_policy().verify_managed_evidence(&replay, &binding, &put_evidence),
+            Err(EncryptionPolicyError::EvidenceBindingMismatch)
         );
-
-        let plaintext = EncryptionAttestation::plaintext_for_development_or_test();
-        assert_eq!(plaintext.provider_identity(), None);
-        assert_eq!(plaintext.algorithm_identity(), None);
-        assert_eq!(plaintext.key_identity_fingerprint(), None);
-    }
-
-    #[test]
-    fn encryption_identity_inputs_reject_provider_locator_shapes() {
-        for unsafe_identity in [
-            "arn:provider:kms:region:account:key/value",
-            "https://kms.example/key",
-            "provider/key",
-            "provider?credential=value",
-            "provider token",
-        ] {
-            assert!(EncryptionAttestation::managed(unsafe_identity, "aes-256-gcm", None).is_err());
-            assert!(EncryptionRequirement::managed(unsafe_identity, "aes-256-gcm", None).is_err());
-        }
-    }
-
-    #[test]
-    fn idempotent_write_receipt_cannot_bypass_a_weaker_observed_policy() {
-        let result = managed_policy().verify_receipt(
-            receipt(true),
-            Some(EncryptionAttestation::plaintext_for_development_or_test()),
-        );
-        assert_eq!(
-            result,
-            Err(EncryptionPolicyError::ManagedEncryptionRequired)
-        );
-    }
-
-    #[test]
-    fn plaintext_backends_require_an_explicit_development_or_test_policy() {
-        let attestation = EncryptionAttestation::plaintext_for_development_or_test();
-        assert_eq!(
-            managed_policy().verify_receipt(receipt(false), Some(attestation.clone())),
-            Err(EncryptionPolicyError::ManagedEncryptionRequired)
-        );
-
-        let policy =
-            ArtifactEncryptionPolicy::new(EncryptionRequirement::development_or_test_plaintext());
-        let verified = policy
-            .verify_receipt(receipt(false), Some(attestation))
-            .expect("explicit development/test plaintext policy");
-        assert!(!verified.attestation().is_managed());
     }
 
     #[test]
@@ -1000,18 +1797,19 @@ mod tests {
     #[tokio::test]
     async fn immutable_put_read_and_exact_replay_are_digest_verified() {
         let storage = storage(1_024);
+        let policy = development_policy();
         let first = storage
-            .put_immutable(write("objects/a.json", br#"{"ok":true}"#))
+            .put_immutable(write("objects/a.json", br#"{"ok":true}"#), &policy)
             .await
             .expect("first write");
-        assert!(!first.idempotent_replay);
+        assert!(!first.receipt().idempotent_replay);
         let replay = storage
-            .put_immutable(write("objects/a.json", br#"{"ok":true}"#))
+            .put_immutable(write("objects/a.json", br#"{"ok":true}"#), &policy)
             .await
             .expect("exact replay");
-        assert!(replay.idempotent_replay);
+        assert!(replay.receipt().idempotent_replay);
         let read = storage
-            .read_verified(&first.key, &first.digest)
+            .read_verified(&first.receipt().key, &first.receipt().digest)
             .await
             .expect("verified read");
         assert_eq!(read.content, Bytes::from_static(br#"{"ok":true}"#));
@@ -1021,13 +1819,14 @@ mod tests {
     #[tokio::test]
     async fn same_key_changed_content_is_an_immutable_conflict() {
         let storage = storage(1_024);
+        let policy = development_policy();
         storage
-            .put_immutable(write("objects/a.json", b"first"))
+            .put_immutable(write("objects/a.json", b"first"), &policy)
             .await
             .expect("first write");
         assert_eq!(
             storage
-                .put_immutable(write("objects/a.json", b"second"))
+                .put_immutable(write("objects/a.json", b"second"), &policy)
                 .await,
             Err(ObjectStorageError::ImmutableConflict)
         );
@@ -1036,15 +1835,16 @@ mod tests {
     #[tokio::test]
     async fn forged_digest_and_oversized_content_fail_before_storage() {
         let storage = storage(4);
+        let policy = development_policy();
         let mut forged = write("objects/forged.json", b"four");
         forged.expected_digest = digest_bytes(b"other");
         assert_eq!(
-            storage.put_immutable(forged).await,
+            storage.put_immutable(forged, &policy).await,
             Err(ObjectStorageError::DigestMismatch)
         );
         assert_eq!(
             storage
-                .put_immutable(write("objects/large.json", b"12345"))
+                .put_immutable(write("objects/large.json", b"12345"), &policy)
                 .await,
             Err(ObjectStorageError::SizeLimitExceeded)
         );
@@ -1053,17 +1853,18 @@ mod tests {
     #[tokio::test]
     async fn concurrent_exact_creates_converge_to_one_object() {
         let storage = storage(1_024);
+        let policy = development_policy();
         let left = storage.clone();
         let right = storage.clone();
         let (left, right) = tokio::join!(
-            left.put_immutable(write("objects/race.json", b"stable")),
-            right.put_immutable(write("objects/race.json", b"stable")),
+            left.put_immutable(write("objects/race.json", b"stable"), &policy),
+            right.put_immutable(write("objects/race.json", b"stable"), &policy),
         );
         let receipts = [left.expect("left"), right.expect("right")];
         assert_eq!(
             receipts
                 .iter()
-                .filter(|receipt| receipt.idempotent_replay)
+                .filter(|receipt| receipt.receipt().idempotent_replay)
                 .count(),
             1
         );
@@ -1088,12 +1889,13 @@ mod tests {
             ObjectStoreSettings::new(url).with_max_object_bytes(1_024),
         )
         .expect("filesystem storage");
+        let policy = development_policy();
         let receipt = storage
-            .put_immutable(write("objects/local.json", b"durable"))
+            .put_immutable(write("objects/local.json", b"durable"), &policy)
             .await
             .expect("filesystem immutable write");
         let read = storage
-            .read_verified(&receipt.key, &receipt.digest)
+            .read_verified(&receipt.receipt().key, &receipt.receipt().digest)
             .await
             .expect("filesystem verified read");
         assert_eq!(read.content, Bytes::from_static(b"durable"));
