@@ -6,19 +6,30 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Immutable, digest-verified object storage boundary for the Warpin framework"
+readme = "README.md"
 keywords = ["object-storage", "s3", "integrity", "immutable"]
 categories = ["filesystem", "web-programming"]
-include = ["src/**", "Cargo.toml", "LICENSE"]
+include = [
+    "src/**",
+    "tests/**",
+    "scripts/**",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "MIGRATION.md",
+]
 
 [features]
 default = ["fs"]
 fs = ["object_store/fs"]
-aws = ["object_store/aws", "dep:async-trait"]
+aws = ["object_store/aws", "dep:async-trait", "dep:humantime", "dep:reqwest"]
 
 [dependencies]
 async-trait = { workspace = true, optional = true }
 bytes.workspace = true
+humantime = { workspace = true, optional = true }
 object_store.workspace = true
+reqwest = { workspace = true, optional = true }
 thiserror.workspace = true
 url.workspace = true
 warpin-integrity.workspace = true

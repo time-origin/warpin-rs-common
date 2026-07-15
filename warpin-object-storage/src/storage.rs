@@ -7,6 +7,8 @@ use object_store::{
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
 
+#[cfg(feature = "aws")]
+use crate::s3_adapter::map_managed_request_error;
 use crate::s3_adapter::{ConfiguredS3Encryption, ObservedEncryptionEvidence};
 use crate::{
     ArtifactEncryptionContextId, ArtifactEncryptionPolicy, EncryptionAttestation,
@@ -20,6 +22,9 @@ const DEFAULT_MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_URL_BYTES: usize = 2_048;
 const MAX_OPTION_KEY_BYTES: usize = 128;
 const MAX_OPTION_VALUE_BYTES: usize = 4_096;
+const MAX_TRUSTED_ROOT_CERTIFICATES: usize = 8;
+const MAX_TRUSTED_ROOT_CERTIFICATE_BYTES: usize = 64 * 1024;
+const MAX_TRUSTED_ROOT_CERTIFICATES_TOTAL_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct ObjectStoreSettings {
@@ -28,6 +33,7 @@ pub struct ObjectStoreSettings {
     pub max_object_bytes: u64,
     expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
     managed_encryption_profile_id: Option<ManagedEncryptionProfileId>,
+    trusted_root_certificate_pems: Vec<Vec<u8>>,
 }
 
 impl ObjectStoreSettings {
@@ -38,6 +44,7 @@ impl ObjectStoreSettings {
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
             expected_observed_key_identity_fingerprint: None,
             managed_encryption_profile_id: None,
+            trusted_root_certificate_pems: Vec::new(),
         }
     }
 
@@ -73,6 +80,16 @@ impl ObjectStoreSettings {
         self
     }
 
+    /// Adds a PEM-encoded root certificate trusted by the S3 TLS transport.
+    ///
+    /// The certificate remains private to the storage adapter and is parsed
+    /// before backend I/O. This does not disable platform certificate
+    /// validation and does not expose a provider-specific TLS type.
+    pub fn with_trusted_root_certificate_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.trusted_root_certificate_pems.push(pem.into());
+        self
+    }
+
     #[cfg(all(test, feature = "aws"))]
     pub(crate) const fn managed_encryption_profile_id(
         &self,
@@ -85,6 +102,20 @@ impl ObjectStoreSettings {
             return Err(ObjectStorageError::InvalidConfiguration);
         }
         let url = Url::parse(&self.url).map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+        let trusted_root_total_bytes = self
+            .trusted_root_certificate_pems
+            .iter()
+            .try_fold(0_usize, |total, pem| total.checked_add(pem.len()))
+            .ok_or(ObjectStorageError::InvalidConfiguration)?;
+        if self.trusted_root_certificate_pems.len() > MAX_TRUSTED_ROOT_CERTIFICATES
+            || self
+                .trusted_root_certificate_pems
+                .iter()
+                .any(|pem| pem.is_empty() || pem.len() > MAX_TRUSTED_ROOT_CERTIFICATE_BYTES)
+            || trusted_root_total_bytes > MAX_TRUSTED_ROOT_CERTIFICATES_TOTAL_BYTES
+        {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
         if !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -100,7 +131,8 @@ impl ObjectStoreSettings {
                 if url.host_str().is_some()
                     || !self.options.is_empty()
                     || self.expected_observed_key_identity_fingerprint.is_some()
-                    || self.managed_encryption_profile_id.is_some() =>
+                    || self.managed_encryption_profile_id.is_some()
+                    || !self.trusted_root_certificate_pems.is_empty() =>
             {
                 return Err(ObjectStorageError::InvalidConfiguration);
             }
@@ -152,6 +184,10 @@ impl fmt::Debug for ObjectStoreSettings {
                 "managed_encryption_profile",
                 &self.managed_encryption_profile_id.is_some(),
             )
+            .field(
+                "trusted_root_certificate_count",
+                &self.trusted_root_certificate_pems.len(),
+            )
             .field("max_object_bytes", &self.max_object_bytes)
             .finish()
     }
@@ -177,8 +213,16 @@ impl fmt::Debug for VerifiedObjectStorage {
         formatter
             .debug_struct("VerifiedObjectStorage")
             .field("backend", &"[CONFIGURED]")
-            .field("prefix", &self.prefix.as_ref())
+            .field(
+                "prefix_fingerprint",
+                &digest_bytes(self.prefix.as_ref().as_bytes()),
+            )
+            .field(
+                "managed_encryption_profile",
+                &self.managed_encryption_profile_id(),
+            )
             .field("max_object_bytes", &self.max_object_bytes)
+            .field("supports_attributes", &self.supports_attributes)
             .finish()
     }
 }
@@ -232,6 +276,7 @@ impl VerifiedObjectStorage {
                         settings.options,
                         settings.managed_encryption_profile_id,
                         settings.expected_observed_key_identity_fingerprint,
+                        settings.trusted_root_certificate_pems,
                     )?;
                     (
                         store,
@@ -381,7 +426,13 @@ impl VerifiedObjectStorage {
         let (put_e_tag, put_version, idempotent_replay) = match put_result {
             Ok(result) => (result.e_tag, result.version, false),
             Err(object_store::Error::AlreadyExists { .. }) => (None, None, true),
-            Err(_) => return Err(ObjectStorageError::Backend),
+            Err(_error) => {
+                #[cfg(feature = "aws")]
+                if let Some(error) = map_managed_request_error(&_error) {
+                    return Err(error);
+                }
+                return Err(ObjectStorageError::Backend);
+            }
         };
         let readback = self
             .read_verified_internal(
@@ -453,6 +504,7 @@ impl VerifiedObjectStorage {
             extensions.insert(ObserverRequestBinding::readback(
                 binding.clone(),
                 location.clone(),
+                expected_version.map(str::to_owned),
             ));
         }
         let options = read_options(expected_version, extensions);
@@ -588,6 +640,10 @@ pub(crate) fn map_backend_configuration_error(error: object_store::Error) -> Obj
 }
 
 fn map_backend_read_error(error: object_store::Error) -> ObjectStorageError {
+    #[cfg(feature = "aws")]
+    if let Some(error) = map_managed_request_error(&error) {
+        return error;
+    }
     match error {
         object_store::Error::NotFound { .. } => ObjectStorageError::NotFound,
         _ => ObjectStorageError::Backend,

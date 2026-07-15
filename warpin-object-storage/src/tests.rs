@@ -1,5 +1,13 @@
 #[cfg(feature = "aws")]
 use std::collections::BTreeMap;
+#[cfg(feature = "aws")]
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use object_store::{Extensions, path::Path};
@@ -12,19 +20,25 @@ use super::*;
 use async_trait::async_trait;
 #[cfg(feature = "aws")]
 use object_store::client::{
-    HttpClient, HttpError, HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody,
-    HttpService,
+    HttpClient, HttpConnector, HttpError, HttpRequest, HttpRequestBody, HttpResponse,
+    HttpResponseBody, HttpService,
 };
 #[cfg(feature = "aws")]
 use s3_adapter::{
-    ConfiguredS3Encryption, ObservedEncryptionEvidence, S3EncryptionObserverService,
-    minio_kes_object_context_profile_id,
+    ConfiguredS3Encryption, NoRedirectReqwestConnector, ObservedEncryptionEvidence,
+    map_managed_request_error, minio_kes_object_context_profile_id,
 };
 use s3_adapter::{
     ObservedBucketKeyState, S3_BUCKET_KEY_ENABLED_HEADER, actual_path_matches_expected,
     aws_s3_object_context_profile_id, observed_bucket_key_state, observed_s3_response,
 };
 use storage::read_options;
+#[cfg(feature = "aws")]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
 
 fn storage(max_object_bytes: u64) -> VerifiedObjectStorage {
     VerifiedObjectStorage::from_settings(
@@ -77,7 +91,62 @@ fn put_request(binding: WriteBinding) -> ObserverRequestBinding {
 
 fn readback_request(binding: WriteBinding) -> ObserverRequestBinding {
     let expected_location = Path::parse(binding.key().as_str()).expect("expected location");
-    ObserverRequestBinding::readback(binding, expected_location)
+    ObserverRequestBinding::readback(
+        binding,
+        expected_location,
+        Some("opaque-version".to_owned()),
+    )
+}
+
+#[cfg(feature = "aws")]
+fn signed_artifact_request(
+    binding: ObserverRequestBinding,
+    uri: &str,
+    region: &str,
+) -> HttpRequest {
+    let mut request = HttpRequest::new(HttpRequestBody::empty());
+    *request.method_mut() = match binding.operation {
+        ObservedOperation::Put => "PUT",
+        ObservedOperation::Readback => "GET",
+    }
+    .parse()
+    .expect("artifact method");
+    *request.uri_mut() = uri.parse().expect("artifact URI");
+    request.headers_mut().insert(
+        "x-amz-date",
+        "20260715T000000Z".parse().expect("date header"),
+    );
+    request.headers_mut().insert(
+        "authorization",
+        format!(
+            "AWS4-HMAC-SHA256 Credential=TESTACCESS/20260715/{region}/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature={}",
+            "a".repeat(64)
+        )
+        .parse()
+        .expect("authorization header"),
+    );
+    request.extensions_mut().insert(binding);
+    request
+}
+
+#[cfg(feature = "aws")]
+#[derive(Debug)]
+struct CountingHttpResponseService {
+    calls: Arc<AtomicUsize>,
+    status: u16,
+    headers: object_store::HeaderMap,
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl HttpService for CountingHttpResponseService {
+    async fn call(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut response = HttpResponse::new(HttpResponseBody::new(HttpRequestBody::empty()));
+        *response.status_mut() = self.status.try_into().expect("response status");
+        *response.headers_mut() = self.headers.clone();
+        Ok(response)
+    }
 }
 
 #[test]
@@ -125,7 +194,7 @@ fn observed_paths_match_only_complete_expected_segments() {
         "/prefix/contexts/sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/a%20b.json",
         &expected,
     ));
-    assert!(actual_path_matches_expected(
+    assert!(!actual_path_matches_expected(
         "/bucket/prefix/contexts/sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/a%20b.json",
         &expected,
     ));
@@ -147,7 +216,7 @@ fn observer_emits_no_evidence_for_a_different_context_path() {
             "contexts/sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted.json",
         )
         .expect("expected context path");
-    let request = ObserverRequestBinding::readback(binding, expected);
+    let request = ObserverRequestBinding::readback(binding, expected, receipt.version.clone());
     let headers = sse_kms_headers(
         receipt.e_tag.as_deref(),
         receipt.version.as_deref(),
@@ -163,6 +232,452 @@ fn observer_emits_no_evidence_for_a_different_context_path() {
             )
             .is_none()
         );
+}
+
+#[cfg(feature = "aws")]
+fn exact_target_options(region: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("aws_region".to_owned(), region.to_owned()),
+        (
+            "aws_server_side_encryption".to_owned(),
+            "aws:kms".to_owned(),
+        ),
+        ("aws_sse_bucket_key_enabled".to_owned(), "false".to_owned()),
+    ])
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn native_aws_path_style_target_is_exact_and_percent_canonical() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("native AWS configuration");
+    let binding = WriteBinding::new(&receipt(false));
+    let expected_location = Path::parse(
+        "private-prefix/contexts/sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted@v1.json",
+    )
+    .expect("expected location");
+    let request = ObserverRequestBinding::put(binding, expected_location);
+    let exact = "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json";
+
+    assert!(
+        configured
+            .verify_request_target(&request, "PUT", exact)
+            .is_ok()
+    );
+    for wrong in [
+        "http://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://evil.example/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://s3.eu-west-1.amazonaws.com/extra/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://s3.eu-west-1.amazonaws.com/other-bucket/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256%3daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted%40v1.json",
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/encrypted@v1.json",
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/contexts/sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/objects/%65ncrypted%40v1.json",
+    ] {
+        assert!(
+            configured
+                .verify_request_target(&request, "PUT", wrong)
+                .is_err(),
+            "non-exact target must fail"
+        );
+    }
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn native_aws_virtual_hosted_target_is_exact() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let mut options = exact_target_options("ap-southeast-2");
+    options.insert(
+        "aws_virtual_hosted_style_request".to_owned(),
+        "true".to_owned(),
+    );
+    let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
+        .expect("native AWS virtual-hosted configuration");
+    let expected_location = Path::parse("private-prefix/objects/encrypted.json").expect("path");
+    let request =
+        ObserverRequestBinding::put(WriteBinding::new(&receipt(false)), expected_location);
+
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "PUT",
+                "https://tenant-artifacts.s3.ap-southeast-2.amazonaws.com/private-prefix/objects/encrypted.json",
+            )
+            .is_ok()
+    );
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "PUT",
+                "https://s3.ap-southeast-2.amazonaws.com/tenant-artifacts/private-prefix/objects/encrypted.json",
+            )
+            .is_err()
+    );
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn minio_target_requires_exact_https_path_style_endpoint() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let mut options = exact_target_options("us-east-1");
+    options.insert(
+        "aws_endpoint".to_owned(),
+        "https://minio.internal.example:9443/api".to_owned(),
+    );
+    let configured = ConfiguredS3Encryption::from_options(
+        &url,
+        &options,
+        Some(minio_kes_object_context_profile_id()),
+        None,
+    )
+    .expect("MinIO path-style configuration");
+    let expected_location = Path::parse("private-prefix/objects/encrypted.json").expect("path");
+    let request =
+        ObserverRequestBinding::put(WriteBinding::new(&receipt(false)), expected_location);
+
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "PUT",
+                "https://minio.internal.example:9443/api/tenant-artifacts/private-prefix/objects/encrypted.json",
+            )
+            .is_ok()
+    );
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "PUT",
+                "https://tenant-artifacts.minio.internal.example:9443/api/private-prefix/objects/encrypted.json",
+            )
+            .is_err()
+    );
+
+    options.insert(
+        "aws_virtual_hosted_style_request".to_owned(),
+        "true".to_owned(),
+    );
+    assert_eq!(
+        ConfiguredS3Encryption::from_options(
+            &url,
+            &options,
+            Some(minio_kes_object_context_profile_id()),
+            None,
+        ),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn readback_target_allows_one_canonical_exact_version_query() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("native AWS configuration");
+    let mut receipt = receipt(false);
+    receipt.version = Some("opaque version+/=".to_owned());
+    let location = Path::parse("private-prefix/objects/encrypted.json").expect("path");
+    let request = ObserverRequestBinding::readback(
+        WriteBinding::new(&receipt),
+        location,
+        receipt.version.clone(),
+    );
+    let base =
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/objects/encrypted.json";
+
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "GET",
+                &format!("{base}?versionId=opaque+version%2B%2F%3D"),
+            )
+            .is_ok()
+    );
+    for wrong in [
+        base.to_owned(),
+        format!("{base}?versionId=wrong"),
+        format!("{base}?versionId=opaque+version%2B%2F%3D&versionId=second"),
+        format!("{base}?versionId=%6Fpaque+version%2B%2F%3D"),
+        format!("{base}?unexpected=value"),
+    ] {
+        assert!(
+            configured
+                .verify_request_target(&request, "GET", &wrong)
+                .is_err(),
+            "non-canonical or non-unique version query must fail"
+        );
+    }
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn normalized_s3_configuration_aliases_cannot_override_each_other() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let duplicate_cases = [
+        ("aws_region", "region", "us-east-1", "eu-west-1"),
+        (
+            "aws_virtual_hosted_style_request",
+            "virtual_hosted_style_request",
+            "false",
+            "true",
+        ),
+        ("allow_http", "aws_allow_http", "false", "true"),
+        (
+            "allow_invalid_certificates",
+            "aws_allow_invalid_certificates",
+            "false",
+            "true",
+        ),
+        ("aws_skip_signature", "skip_signature", "false", "true"),
+        (
+            "aws_server_side_encryption",
+            "server_side_encryption",
+            "aws:kms",
+            "AES256",
+        ),
+    ];
+    for (first_key, second_key, first_value, second_value) in duplicate_cases {
+        let mut options = exact_target_options("us-east-1");
+        options.remove("aws_region");
+        options.remove("aws_server_side_encryption");
+        options.insert(first_key.to_owned(), first_value.to_owned());
+        options.insert(second_key.to_owned(), second_value.to_owned());
+        if first_key != "aws_server_side_encryption" {
+            options.insert(
+                "aws_server_side_encryption".to_owned(),
+                "aws:kms".to_owned(),
+            );
+        }
+        if first_key != "aws_region" {
+            options.insert("aws_region".to_owned(), "us-east-1".to_owned());
+        }
+        assert_eq!(
+            ConfiguredS3Encryption::from_options(&url, &options, None, None),
+            Err(ObjectStorageError::InvalidConfiguration),
+            "normalized duplicate aliases must fail"
+        );
+    }
+
+    let mut endpoint_aliases = exact_target_options("us-east-1");
+    endpoint_aliases.insert(
+        "aws_endpoint".to_owned(),
+        "https://minio-one.example".to_owned(),
+    );
+    endpoint_aliases.insert(
+        "aws_endpoint_url_s3".to_owned(),
+        "https://minio-two.example".to_owned(),
+    );
+    assert_eq!(
+        ConfiguredS3Encryption::from_options(
+            &url,
+            &endpoint_aliases,
+            Some(minio_kes_object_context_profile_id()),
+            None,
+        ),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn managed_s3_transport_rejects_insecure_or_ambiguous_configuration_before_io() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    for (key, value) in [
+        ("allow_http", "true"),
+        ("aws_allow_http", "true"),
+        ("allow_invalid_certificates", "true"),
+        ("aws_allow_invalid_certificates", "true"),
+        ("aws_skip_signature", "true"),
+        ("skip_signature", "true"),
+        ("aws_bucket", "other-bucket"),
+        ("bucket", "other-bucket"),
+    ] {
+        let mut options = exact_target_options("us-east-1");
+        options.insert(key.to_owned(), value.to_owned());
+        assert_eq!(
+            ConfiguredS3Encryption::from_options(&url, &options, None, None),
+            Err(ObjectStorageError::InvalidConfiguration),
+            "insecure or ambiguous managed configuration must fail"
+        );
+    }
+
+    let mut http_endpoint = exact_target_options("us-east-1");
+    http_endpoint.insert(
+        "aws_endpoint".to_owned(),
+        "http://minio.internal.example:9000".to_owned(),
+    );
+    assert_eq!(
+        ConfiguredS3Encryption::from_options(
+            &url,
+            &http_endpoint,
+            Some(minio_kes_object_context_profile_id()),
+            None,
+        ),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+
+    let missing_region = BTreeMap::from([
+        (
+            "aws_server_side_encryption".to_owned(),
+            "aws:kms".to_owned(),
+        ),
+        ("aws_sse_bucket_key_enabled".to_owned(), "false".to_owned()),
+    ]);
+    assert_eq!(
+        ConfiguredS3Encryption::from_options(&url, &missing_region, None, None),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn managed_http_connector_never_follows_redirects() {
+    for (status, reason) in [
+        (301, "Moved Permanently"),
+        (302, "Found"),
+        (307, "Temporary Redirect"),
+        (308, "Permanent Redirect"),
+    ] {
+        for cross_authority in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect test server");
+            let address = listener.local_addr().expect("server address");
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let server_count = Arc::clone(&request_count);
+            let location = if cross_authority {
+                "http://127.0.0.1:9/final".to_owned()
+            } else {
+                "/final".to_owned()
+            };
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.expect("first request");
+                let mut request = [0_u8; 2048];
+                let _ = first.read(&mut request).await.expect("read first request");
+                server_count.fetch_add(1, Ordering::SeqCst);
+                first
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("write redirect");
+                if let Ok(Ok((mut second, _))) =
+                    timeout(Duration::from_millis(250), listener.accept()).await
+                {
+                    let _ = second
+                        .read(&mut request)
+                        .await
+                        .expect("read second request");
+                    server_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            let client = NoRedirectReqwestConnector::default()
+                .connect(
+                    &object_store::ClientOptions::new()
+                        .with_allow_http(true)
+                        .with_config(
+                            object_store::client::ClientConfigKey::RandomizeAddresses,
+                            "false",
+                        ),
+                )
+                .expect("test HTTP client");
+            let mut request = HttpRequest::new(HttpRequestBody::empty());
+            *request.method_mut() = "GET".parse().expect("GET method");
+            *request.uri_mut() = format!("http://{address}/start")
+                .parse()
+                .expect("request URI");
+            let response = client.execute(request).await.expect("redirect response");
+            server.await.expect("server task");
+
+            assert_eq!(response.status(), status);
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn managed_http_connector_preserves_default_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind header test server");
+    let address = listener.local_addr().expect("server address");
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.expect("request");
+        let mut request = [0_u8; 4096];
+        let bytes = connection.read(&mut request).await.expect("read request");
+        let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write response");
+        request
+    });
+    let mut headers = object_store::HeaderMap::new();
+    headers.insert(
+        "x-managed-default",
+        "present".parse().expect("header value"),
+    );
+    let options = object_store::ClientOptions::new()
+        .with_allow_http(true)
+        .with_default_headers(headers)
+        .with_config(
+            object_store::client::ClientConfigKey::RandomizeAddresses,
+            "false",
+        );
+    let client = NoRedirectReqwestConnector::default()
+        .connect(&options)
+        .expect("test HTTP client");
+    let mut request = HttpRequest::new(HttpRequestBody::empty());
+    *request.method_mut() = "GET".parse().expect("GET method");
+    *request.uri_mut() = format!("http://{address}/headers")
+        .parse()
+        .expect("request URI");
+    client.execute(request).await.expect("header response");
+    let received = server.await.expect("server task");
+
+    assert!(
+        received
+            .to_ascii_lowercase()
+            .contains("x-managed-default: present")
+    );
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn managed_s3_configuration_rejects_unreviewed_security_options() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    for (key, value) in [
+        ("aws_unsigned_payload", "true"),
+        ("aws_checksum_algorithm", "sha256"),
+        ("aws_sse_customer_key_base64", "opaque-secret"),
+        ("aws_disable_tagging", "true"),
+        ("aws_request_payer", "true"),
+        ("disable_system_certificates", "true"),
+        ("proxy_url", "https://proxy.internal.example"),
+        ("proxy_ca_certificate", "opaque-certificate"),
+        ("proxy_excludes", "storage.internal.example"),
+    ] {
+        let mut options = exact_target_options("us-east-1");
+        options.insert(key.to_owned(), value.to_owned());
+        assert_eq!(
+            ConfiguredS3Encryption::from_options(&url, &options, None, None),
+            Err(ObjectStorageError::InvalidConfiguration),
+            "unreviewed managed option must fail closed: {key}"
+        );
+    }
 }
 
 #[test]
@@ -204,7 +719,7 @@ fn final_get_with_enabled_or_invalid_bucket_key_cannot_sign_attestation() {
         let evidence = observed_s3_response(
             &readback_request(binding.clone()),
             "GET",
-            "/bucket/objects/encrypted.json",
+            "/objects/encrypted.json",
             &sse_headers_with_bucket_key(
                 "aws:kms",
                 receipt.e_tag.as_deref(),
@@ -301,7 +816,7 @@ fn managed_evidence_is_bound_to_method_object_and_receipt() {
     let evidence = observed_s3_response(
         &readback_request(first_binding.clone()),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             first_receipt.e_tag.as_deref(),
             first_receipt.version.as_deref(),
@@ -322,7 +837,7 @@ fn managed_evidence_is_bound_to_method_object_and_receipt() {
     let put_only_evidence = observed_s3_response(
         &put_request(first_binding.clone()),
         "PUT",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             first_receipt.e_tag.as_deref(),
             first_receipt.version.as_deref(),
@@ -367,7 +882,7 @@ fn managed_evidence_is_bound_to_method_object_and_receipt() {
     let wrong_method = observed_s3_response(
         &put_request(first_binding.clone()),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             first_receipt.e_tag.as_deref(),
             first_receipt.version.as_deref(),
@@ -385,7 +900,7 @@ fn initial_and_idempotent_receipts_both_require_final_get_evidence() {
         let final_get = observed_s3_response(
             &readback_request(binding.clone()),
             "GET",
-            "/bucket/objects/encrypted.json",
+            "/objects/encrypted.json",
             &sse_kms_headers(
                 receipt.e_tag.as_deref(),
                 receipt.version.as_deref(),
@@ -400,7 +915,7 @@ fn initial_and_idempotent_receipts_both_require_final_get_evidence() {
         let put_only = observed_s3_response(
             &put_request(binding.clone()),
             "PUT",
-            "/bucket/objects/encrypted.json",
+            "/objects/encrypted.json",
             &sse_kms_headers(
                 receipt.e_tag.as_deref(),
                 receipt.version.as_deref(),
@@ -416,7 +931,7 @@ fn initial_and_idempotent_receipts_both_require_final_get_evidence() {
         let weak_final_get = observed_s3_response(
             &readback_request(binding.clone()),
             "GET",
-            "/bucket/objects/encrypted.json",
+            "/objects/encrypted.json",
             &receipt_headers(receipt.e_tag.as_deref(), receipt.version.as_deref()),
         )
         .expect("weak final GET evidence");
@@ -428,7 +943,7 @@ fn initial_and_idempotent_receipts_both_require_final_get_evidence() {
         let mismatched_final_get = observed_s3_response(
             &readback_request(binding.clone()),
             "GET",
-            "/bucket/objects/encrypted.json",
+            "/objects/encrypted.json",
             &sse_kms_headers(
                 Some("different-etag"),
                 Some("different-version"),
@@ -467,7 +982,7 @@ fn missing_or_mismatched_s3_encryption_headers_fail_closed() {
     let missing = observed_s3_response(
         &request,
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &receipt_headers(receipt.e_tag.as_deref(), receipt.version.as_deref()),
     )
     .expect("bound missing observation");
@@ -479,7 +994,7 @@ fn missing_or_mismatched_s3_encryption_headers_fail_closed() {
     let mismatched = observed_s3_response(
         &request,
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_headers(
             "AES256",
             receipt.e_tag.as_deref(),
@@ -514,21 +1029,22 @@ async fn observer_http_service_carries_private_response_evidence_to_the_caller()
     let receipt = receipt(false);
     let binding = WriteBinding::new(&receipt);
     let request_binding = readback_request(binding.clone());
-    let service = S3EncryptionObserverService {
-        inner: HttpClient::new(SseKmsResponseService {
-            headers: sse_kms_headers(
-                receipt.e_tag.as_deref(),
-                receipt.version.as_deref(),
-                "kms-key-one",
-            ),
-        }),
-    };
-    let mut request = HttpRequest::new(HttpRequestBody::empty());
-    *request.method_mut() = "GET".parse().expect("GET method");
-    *request.uri_mut() = "https://store.example/bucket/objects/encrypted.json"
-        .parse()
-        .expect("request URI");
-    request.extensions_mut().insert(request_binding);
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("managed S3 configuration");
+    let service = configured.observer_service(HttpClient::new(SseKmsResponseService {
+        headers: sse_kms_headers(
+            receipt.e_tag.as_deref(),
+            receipt.version.as_deref(),
+            "kms-key-one",
+        ),
+    }));
+    let request = signed_artifact_request(
+        request_binding,
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json?versionId=opaque-version",
+        "eu-west-1",
+    );
 
     let response = service.call(request).await.expect("observed response");
     let evidence = response
@@ -541,18 +1057,146 @@ async fn observer_http_service_carries_private_response_evidence_to_the_caller()
 }
 
 #[cfg(feature = "aws")]
+#[tokio::test]
+async fn observer_rejects_nonexact_or_unsigned_artifact_requests_before_io() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("managed S3 configuration");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
+        calls: Arc::clone(&calls),
+        status: 200,
+        headers: object_store::HeaderMap::new(),
+    }));
+    let receipt = receipt(false);
+
+    let binding = readback_request(WriteBinding::new(&receipt));
+    let mut unsigned = HttpRequest::new(HttpRequestBody::empty());
+    *unsigned.method_mut() = "GET".parse().expect("GET method");
+    *unsigned.uri_mut() = "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json?versionId=opaque-version"
+        .parse()
+        .expect("request URI");
+    unsigned.extensions_mut().insert(binding);
+    let unsigned_error = service.call(unsigned).await.expect_err("unsigned request");
+    assert_eq!(
+        map_managed_request_error(&unsigned_error),
+        Some(ObjectStorageError::RequestSignatureInvalid)
+    );
+
+    let wrong_target = signed_artifact_request(
+        readback_request(WriteBinding::new(&receipt)),
+        "https://evil.example/tenant-artifacts/objects/encrypted.json?versionId=opaque-version",
+        "eu-west-1",
+    );
+    let wrong_target_error = service.call(wrong_target).await.expect_err("wrong target");
+    assert_eq!(
+        map_managed_request_error(&wrong_target_error),
+        Some(ObjectStorageError::RequestTargetMismatch)
+    );
+
+    let wrong_scope = signed_artifact_request(
+        readback_request(WriteBinding::new(&receipt)),
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json?versionId=opaque-version",
+        "us-east-1",
+    );
+    let wrong_scope_error = service.call(wrong_scope).await.expect_err("wrong scope");
+    assert_eq!(
+        map_managed_request_error(&wrong_scope_error),
+        Some(ObjectStorageError::RequestSignatureInvalid)
+    );
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn observer_does_not_guard_unbound_credential_requests() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("managed S3 configuration");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
+        calls: Arc::clone(&calls),
+        status: 200,
+        headers: object_store::HeaderMap::new(),
+    }));
+    let mut request = HttpRequest::new(HttpRequestBody::empty());
+    *request.method_mut() = "GET".parse().expect("GET method");
+    *request.uri_mut() = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        .parse()
+        .expect("metadata URI");
+
+    assert_eq!(
+        service
+            .call(request)
+            .await
+            .expect("metadata response")
+            .status(),
+        200
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn observer_emits_no_evidence_for_redirect_responses() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("managed S3 configuration");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let receipt = receipt(false);
+    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
+        calls: Arc::clone(&calls),
+        status: 307,
+        headers: sse_kms_headers(
+            receipt.e_tag.as_deref(),
+            receipt.version.as_deref(),
+            "kms-key-one",
+        ),
+    }));
+    let request = signed_artifact_request(
+        readback_request(WriteBinding::new(&receipt)),
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json?versionId=opaque-version",
+        "eu-west-1",
+    );
+
+    let response = service.call(request).await.expect("redirect response");
+    assert_eq!(response.status(), 307);
+    assert!(
+        response
+            .extensions()
+            .get::<ObservedEncryptionEvidence>()
+            .is_none()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "aws")]
 #[test]
 fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
     let expected_canonical = digest_bytes(b"arn:aws:kms:my-first-key");
-    let missing = ConfiguredS3Encryption::from_options(&BTreeMap::new(), None, None)
-        .expect("missing encryption is a valid observed configuration state");
+    let missing = ConfiguredS3Encryption::from_options(
+        &url,
+        &BTreeMap::from([("aws_region".to_owned(), "us-east-1".to_owned())]),
+        None,
+        None,
+    )
+    .expect("missing encryption is a valid observed configuration state");
     assert_eq!(
         managed_policy().verify_s3_configuration(&missing),
         Err(EncryptionPolicyError::ManagedEncryptionRequired)
     );
 
     let wrong_algorithm = ConfiguredS3Encryption::from_options(
-        &BTreeMap::from([("aws_server_side_encryption".to_owned(), "AES256".to_owned())]),
+        &url,
+        &BTreeMap::from([
+            ("aws_region".to_owned(), "us-east-1".to_owned()),
+            ("aws_server_side_encryption".to_owned(), "AES256".to_owned()),
+        ]),
         None,
         None,
     )
@@ -563,7 +1207,9 @@ fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path()
     );
 
     let wrong_key = ConfiguredS3Encryption::from_options(
+        &url,
         &BTreeMap::from([
+            ("aws_region".to_owned(), "us-east-1".to_owned()),
             (
                 "aws_server_side_encryption".to_owned(),
                 "aws:kms".to_owned(),
@@ -581,7 +1227,9 @@ fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path()
     );
 
     let exact = ConfiguredS3Encryption::from_options(
+        &url,
         &BTreeMap::from([
+            ("aws_region".to_owned(), "us-east-1".to_owned()),
             (
                 "aws_server_side_encryption".to_owned(),
                 "aws:kms".to_owned(),
@@ -611,7 +1259,7 @@ fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path()
     let wrong_observed_key = observed_s3_response(
         &readback_request(binding),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             receipt.e_tag.as_deref(),
             receipt.version.as_deref(),
@@ -627,7 +1275,7 @@ fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path()
     let matching_observed_key = observed_s3_response(
         &readback_request(WriteBinding::new(&receipt)),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             receipt.e_tag.as_deref(),
             receipt.version.as_deref(),
@@ -643,15 +1291,19 @@ fn s3_configuration_preflight_rejects_plaintext_or_wrong_key_before_write_path()
 #[cfg(feature = "aws")]
 #[test]
 fn s3_configuration_requires_explicitly_disabled_bucket_keys() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
     for bucket_key_value in [None, Some("true"), Some("invalid")] {
-        let mut options = BTreeMap::from([(
-            "aws_server_side_encryption".to_owned(),
-            "aws:kms".to_owned(),
-        )]);
+        let mut options = BTreeMap::from([
+            ("aws_region".to_owned(), "us-east-1".to_owned()),
+            (
+                "aws_server_side_encryption".to_owned(),
+                "aws:kms".to_owned(),
+            ),
+        ]);
         if let Some(value) = bucket_key_value {
             options.insert("aws_sse_bucket_key_enabled".to_owned(), value.to_owned());
         }
-        let configured = ConfiguredS3Encryption::from_options(&options, None, None)
+        let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
             .expect("configuration shape");
         assert_eq!(
             managed_policy_with_expected(None).verify_s3_configuration(&configured),
@@ -660,7 +1312,9 @@ fn s3_configuration_requires_explicitly_disabled_bucket_keys() {
     }
 
     let configured = ConfiguredS3Encryption::from_options(
+        &url,
         &BTreeMap::from([
+            ("aws_region".to_owned(), "us-east-1".to_owned()),
             (
                 "aws_server_side_encryption".to_owned(),
                 "aws:kms".to_owned(),
@@ -679,14 +1333,16 @@ fn s3_configuration_requires_explicitly_disabled_bucket_keys() {
 #[cfg(feature = "aws")]
 #[test]
 fn native_aws_and_minio_context_guarantees_use_distinct_reviewed_profiles() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
     let base_options = BTreeMap::from([
+        ("aws_region".to_owned(), "us-east-1".to_owned()),
         (
             "aws_server_side_encryption".to_owned(),
             "aws:kms".to_owned(),
         ),
         ("aws_sse_bucket_key_enabled".to_owned(), "false".to_owned()),
     ]);
-    let native = ConfiguredS3Encryption::from_options(&base_options, None, None)
+    let native = ConfiguredS3Encryption::from_options(&url, &base_options, None, None)
         .expect("native AWS profile");
     assert_eq!(native.profile_id, aws_s3_object_context_profile_id());
 
@@ -696,18 +1352,23 @@ fn native_aws_and_minio_context_guarantees_use_distinct_reviewed_profiles() {
         "https://minio.internal.example".to_owned(),
     );
     assert_eq!(
-        ConfiguredS3Encryption::from_options(&custom_options, None, None),
+        ConfiguredS3Encryption::from_options(&url, &custom_options, None, None),
         Err(ObjectStorageError::InvalidConfiguration)
     );
     let minio_profile = minio_kes_object_context_profile_id();
-    let minio =
-        ConfiguredS3Encryption::from_options(&custom_options, Some(minio_profile.clone()), None)
-            .expect("explicit reviewed MinIO/KES profile");
+    let minio = ConfiguredS3Encryption::from_options(
+        &url,
+        &custom_options,
+        Some(minio_profile.clone()),
+        None,
+    )
+    .expect("explicit reviewed MinIO/KES profile");
     assert_eq!(minio.profile_id, minio_profile);
     assert_ne!(minio.profile_id, native.profile_id);
 
     assert_eq!(
         ConfiguredS3Encryption::from_options(
+            &url,
             &base_options,
             Some(minio_kes_object_context_profile_id()),
             None,
@@ -716,6 +1377,7 @@ fn native_aws_and_minio_context_guarantees_use_distinct_reviewed_profiles() {
     );
     assert_eq!(
         ConfiguredS3Encryption::from_options(
+            &url,
             &custom_options,
             Some(aws_s3_object_context_profile_id()),
             None,
@@ -780,9 +1442,10 @@ fn native_aws_adapter_factory_installs_object_context_safety_configuration() {
 #[cfg(feature = "aws")]
 #[tokio::test]
 async fn public_s3_write_rejects_missing_managed_configuration_without_network_io() {
-    let storage = VerifiedObjectStorage::from_settings(ObjectStoreSettings::new(
-        "s3://preflight-only-bucket/private-prefix",
-    ))
+    let storage = VerifiedObjectStorage::from_settings(
+        ObjectStoreSettings::new("s3://preflight-only-bucket/private-prefix")
+            .with_option("aws_region", "us-east-1"),
+    )
     .expect("S3 configuration builds without performing I/O");
     let policy = ArtifactEncryptionPolicy::new(EncryptionRequirement::managed(
         storage
@@ -811,6 +1474,7 @@ async fn public_s3_write_rejects_missing_managed_configuration_without_network_i
 async fn public_s3_write_rejects_wrong_managed_algorithm_without_network_io() {
     let storage = VerifiedObjectStorage::from_settings(
         ObjectStoreSettings::new("s3://preflight-only-bucket/private-prefix")
+            .with_option("aws_region", "us-east-1")
             .with_option("aws_server_side_encryption", "AES256"),
     )
     .expect("S3 configuration builds without performing I/O");
@@ -920,7 +1584,7 @@ fn observed_key_identity_is_fingerprinted_and_formatting_is_redacted() {
     let evidence = observed_s3_response(
         &readback_request(binding.clone()),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             receipt.e_tag.as_deref(),
             receipt.version.as_deref(),
@@ -942,7 +1606,7 @@ fn observed_key_identity_is_fingerprinted_and_formatting_is_redacted() {
         EncryptionAttestationView::Managed {
             profile_id: &profile_id,
             context_id: &receipt.context_id,
-            object_path_binding_fingerprint: &digest_bytes(b"objects/encrypted.json"),
+            object_path_binding_fingerprint: &digest_bytes(b"/objects/encrypted.json"),
             observed_key_identity_fingerprint: Some(&digest_bytes(raw_key_identity.as_bytes(),)),
         }
     );
@@ -961,7 +1625,7 @@ fn expected_key_fingerprint_and_idempotent_operation_are_enforced() {
     let evidence = observed_s3_response(
         &readback_request(binding.clone()),
         "GET",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             replay.e_tag.as_deref(),
             replay.version.as_deref(),
@@ -977,7 +1641,7 @@ fn expected_key_fingerprint_and_idempotent_operation_are_enforced() {
     let put_evidence = observed_s3_response(
         &put_request(binding.clone()),
         "PUT",
-        "/bucket/objects/encrypted.json",
+        "/objects/encrypted.json",
         &sse_kms_headers(
             replay.e_tag.as_deref(),
             replay.version.as_deref(),
@@ -1000,6 +1664,115 @@ fn settings_debug_never_discloses_url_or_option_values() {
     assert!(!debug.contains("secret-bucket"));
     assert!(!debug.contains("SUPER-SECRET"));
     assert!(debug.contains("option_count: 2"));
+}
+
+#[test]
+fn trusted_root_pem_is_private_bounded_and_s3_scoped() {
+    let sentinel_pem =
+        b"-----BEGIN CERTIFICATE-----\nSIGNED_URL_SECRET\n-----END CERTIFICATE-----\n";
+    let settings = ObjectStoreSettings::new("s3://tenant-artifacts/private-prefix")
+        .with_option("aws_region", "us-east-1")
+        .with_trusted_root_certificate_pem(sentinel_pem.to_vec());
+    let debug = format!("{settings:?}");
+    assert!(debug.contains("trusted_root_certificate_count"));
+    assert!(!debug.contains("SIGNED_URL_SECRET"));
+    #[cfg(feature = "aws")]
+    assert_eq!(
+        VerifiedObjectStorage::from_settings(settings).map(|_| ()),
+        Err(ObjectStorageError::InvalidConfiguration),
+        "invalid PEM must fail before any backend I/O"
+    );
+
+    assert_eq!(
+        VerifiedObjectStorage::from_settings(
+            ObjectStoreSettings::new("memory:///private")
+                .with_trusted_root_certificate_pem(sentinel_pem.to_vec()),
+        )
+        .map(|_| ()),
+        Err(ObjectStorageError::InvalidConfiguration),
+        "trusted roots are scoped to S3 TLS"
+    );
+
+    let mut too_many = ObjectStoreSettings::new("s3://tenant-artifacts/private-prefix")
+        .with_option("aws_region", "us-east-1");
+    for _ in 0..9 {
+        too_many = too_many.with_trusted_root_certificate_pem(sentinel_pem.to_vec());
+    }
+    assert_eq!(
+        VerifiedObjectStorage::from_settings(too_many).map(|_| ()),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+
+    let oversized = ObjectStoreSettings::new("s3://tenant-artifacts/private-prefix")
+        .with_option("aws_region", "us-east-1")
+        .with_trusted_root_certificate_pem(vec![b'A'; 64 * 1024 + 1]);
+    assert_eq!(
+        VerifiedObjectStorage::from_settings(oversized).map(|_| ()),
+        Err(ObjectStorageError::InvalidConfiguration)
+    );
+}
+
+#[test]
+fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
+    let key = ObjectKey::parse("MODEL_RESPONSE/object.json").expect("sentinel key");
+    let context_id = context_id(b"debug-sentinel-context");
+    let write = ImmutableObjectWrite {
+        key: key.clone(),
+        context_id: context_id.clone(),
+        content: Bytes::from_static(b"PRIVATE_QUERY"),
+        expected_digest: digest_bytes(b"PRIVATE_QUERY"),
+        content_type: "application/SECRET".to_owned(),
+    };
+    let receipt = ObjectWriteReceipt {
+        key: key.clone(),
+        context_id: context_id.clone(),
+        size_bytes: 11,
+        digest: digest_bytes(b"PRIVATE_QUERY"),
+        e_tag: Some("SIGNED_URL".to_owned()),
+        version: Some("PROVIDER_BODY".to_owned()),
+        idempotent_replay: true,
+    };
+    let object = VerifiedObject {
+        key: key.clone(),
+        context_id,
+        content: Bytes::from_static(b"TOOL_RESULT"),
+        digest: digest_bytes(b"TOOL_RESULT"),
+        content_type: Some("application/SECRET".to_owned()),
+        e_tag: Some("SIGNED_URL".to_owned()),
+        version: Some("PROVIDER_BODY".to_owned()),
+    };
+    let storage = VerifiedObjectStorage::from_settings(ObjectStoreSettings::new(
+        "memory:///SIGNED_URL/PROVIDER_BODY",
+    ))
+    .expect("memory storage with sentinel prefix");
+    let rendered = [
+        format!("{key:?}"),
+        format!("{write:?}"),
+        format!("{receipt:?}"),
+        format!("{object:?}"),
+        format!("{storage:?}"),
+    ];
+
+    for debug in &rendered {
+        for sentinel in [
+            "MODEL_RESPONSE",
+            "PRIVATE_QUERY",
+            "SECRET",
+            "SIGNED_URL",
+            "PROVIDER_BODY",
+            "TOOL_RESULT",
+        ] {
+            assert!(
+                !debug.contains(sentinel),
+                "Debug output leaked sentinel {sentinel}: {debug}"
+            );
+        }
+    }
+    assert!(rendered[0].contains("fingerprint"));
+    assert!(rendered[1].contains("content_len"));
+    assert!(rendered[2].contains("e_tag_present"));
+    assert!(rendered[3].contains("content_len"));
+    assert!(rendered[4].contains("prefix_fingerprint"));
 }
 
 #[test]

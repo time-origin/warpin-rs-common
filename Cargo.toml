@@ -35,6 +35,7 @@ axum = "0.8.8"
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["trace", "cors", "fs"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
+humantime = "2.4.0"
 
 # ── gRPC ──
 tonic = "0.14.5"

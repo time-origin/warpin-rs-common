@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ObjectKey(String);
 
 impl ObjectKey {
@@ -27,6 +27,16 @@ impl ObjectKey {
     }
 }
 
+impl fmt::Debug for ObjectKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectKey")
+            .field("length", &self.0.len())
+            .field("fingerprint", &digest_bytes(self.0.as_bytes()))
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct ImmutableObjectWrite {
     pub key: ObjectKey,
@@ -44,12 +54,12 @@ impl fmt::Debug for ImmutableObjectWrite {
             .field("context_id", &self.context_id)
             .field("content_len", &self.content.len())
             .field("expected_digest", &self.expected_digest)
-            .field("content_type", &self.content_type)
+            .field("content_type_present", &!self.content_type.is_empty())
             .finish()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObjectWriteReceipt {
     pub key: ObjectKey,
     pub context_id: ArtifactEncryptionContextId,
@@ -58,6 +68,21 @@ pub struct ObjectWriteReceipt {
     pub e_tag: Option<String>,
     pub version: Option<String>,
     pub idempotent_replay: bool,
+}
+
+impl fmt::Debug for ObjectWriteReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectWriteReceipt")
+            .field("key", &self.key)
+            .field("context_id", &self.context_id)
+            .field("size_bytes", &self.size_bytes)
+            .field("digest", &self.digest)
+            .field("e_tag_present", &self.e_tag.is_some())
+            .field("version_present", &self.version.is_some())
+            .field("idempotent_replay", &self.idempotent_replay)
+            .finish()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -658,6 +683,7 @@ pub(crate) struct ObserverRequestBinding {
     pub(crate) binding: WriteBinding,
     pub(crate) operation: ObservedOperation,
     pub(crate) expected_location: Path,
+    pub(crate) expected_version: Option<String>,
 }
 
 impl ObserverRequestBinding {
@@ -666,14 +692,20 @@ impl ObserverRequestBinding {
             binding,
             operation: ObservedOperation::Put,
             expected_location,
+            expected_version: None,
         }
     }
 
-    pub(crate) fn readback(binding: WriteBinding, expected_location: Path) -> Self {
+    pub(crate) fn readback(
+        binding: WriteBinding,
+        expected_location: Path,
+        expected_version: Option<String>,
+    ) -> Self {
         Self {
             binding,
             operation: ObservedOperation::Readback,
             expected_location,
+            expected_version,
         }
     }
 }
@@ -685,11 +717,12 @@ impl fmt::Debug for ObserverRequestBinding {
             .field("binding", &self.binding)
             .field("operation", &self.operation)
             .field("expected_location", &"[REDACTED]")
+            .field("expected_version_present", &self.expected_version.is_some())
             .finish()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct VerifiedObject {
     pub key: ObjectKey,
     pub context_id: ArtifactEncryptionContextId,
@@ -698,6 +731,21 @@ pub struct VerifiedObject {
     pub content_type: Option<String>,
     pub e_tag: Option<String>,
     pub version: Option<String>,
+}
+
+impl fmt::Debug for VerifiedObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedObject")
+            .field("key", &self.key)
+            .field("context_id", &self.context_id)
+            .field("content_len", &self.content.len())
+            .field("digest", &self.digest)
+            .field("content_type_present", &self.content_type.is_some())
+            .field("e_tag_present", &self.e_tag.is_some())
+            .field("version_present", &self.version.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -722,6 +770,10 @@ pub enum ObjectStorageError {
     NotFound,
     #[error("object storage backend operation failed")]
     Backend,
+    #[error("managed object request target does not match the reviewed storage target")]
+    RequestTargetMismatch,
+    #[error("managed object request does not contain the required provider signature")]
+    RequestSignatureInvalid,
     #[error(transparent)]
     EncryptionPolicy(#[from] EncryptionPolicyError),
 }
