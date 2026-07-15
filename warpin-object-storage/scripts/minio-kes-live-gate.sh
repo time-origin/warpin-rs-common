@@ -22,11 +22,11 @@ readonly WORKSPACE_DIR="$(cd -- "${CRATE_DIR}/.." && pwd)"
 readonly RUN_TOKEN="$$-$(date +%s)"
 readonly KES_NAME="warpin-kes-gate-${RUN_TOKEN}"
 readonly MINIO_NAME="warpin-minio-gate-${RUN_TOKEN}"
-readonly KES_BOOTSTRAP_CLIENT_NAME="warpin-kes-bootstrap-gate-${RUN_TOKEN}"
-readonly KES_METRICS_CLIENT_NAME="warpin-kes-metrics-gate-${RUN_TOKEN}"
+readonly KES_ONE_SHOT_PREFIX="warpin-kes-one-shot-gate-${RUN_TOKEN}"
 readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
 readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
+readonly ONE_SHOT_LEDGER="${WORK_DIR}/one-shot-containers.ledger"
 readonly KES_SERVER_DIR="${WORK_DIR}/kes/server"
 readonly KES_KEYSTORE_DIR="${WORK_DIR}/kes/keystore"
 readonly KES_BOOTSTRAP_DIR="${WORK_DIR}/kes/bootstrap"
@@ -34,11 +34,14 @@ readonly KES_RUNTIME_DIR="${WORK_DIR}/kes/runtime"
 readonly KES_METRICS_DIR="${WORK_DIR}/kes/metrics"
 
 cleanup_best_effort() {
-    docker rm -f \
-        "${MINIO_NAME}" \
-        "${KES_NAME}" \
-        "${KES_BOOTSTRAP_CLIENT_NAME}" \
-        "${KES_METRICS_CLIENT_NAME}" >/dev/null 2>&1 || true
+    local -a one_shot_containers=()
+    if [[ -f "${ONE_SHOT_LEDGER}" ]]; then
+        mapfile -t one_shot_containers <"${ONE_SHOT_LEDGER}"
+    fi
+    if (( ${#one_shot_containers[@]} > 0 )); then
+        docker rm -f "${one_shot_containers[@]}" >/dev/null 2>&1 || true
+    fi
+    docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1 || true
     docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1 || true
     rm -rf -- "${WORK_DIR}" || true
 }
@@ -46,11 +49,15 @@ trap cleanup_best_effort EXIT INT TERM
 
 cleanup_verified() {
     local failed=0
+    local -a one_shot_containers=()
+    if [[ -f "${ONE_SHOT_LEDGER}" ]]; then
+        mapfile -t one_shot_containers <"${ONE_SHOT_LEDGER}"
+    fi
     if ! docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1; then
         failed=1
     fi
     local one_shot
-    for one_shot in "${KES_BOOTSTRAP_CLIENT_NAME}" "${KES_METRICS_CLIENT_NAME}"; do
+    for one_shot in "${one_shot_containers[@]}"; do
         if docker container inspect "${one_shot}" >/dev/null 2>&1 \
             && ! docker rm -f "${one_shot}" >/dev/null 2>&1; then
             failed=1
@@ -63,11 +70,7 @@ cleanup_verified() {
         failed=1
     fi
     local container
-    for container in \
-        "${MINIO_NAME}" \
-        "${KES_NAME}" \
-        "${KES_BOOTSTRAP_CLIENT_NAME}" \
-        "${KES_METRICS_CLIENT_NAME}"; do
+    for container in "${MINIO_NAME}" "${KES_NAME}" "${one_shot_containers[@]}"; do
         if docker container inspect "${container}" >/dev/null 2>&1; then
             failed=1
         fi
@@ -137,8 +140,34 @@ assert_exact_private_key_set() {
     (( ${#keys[@]} == 1 )) && [[ "${keys[0]}" == "${expected_name}" ]]
 }
 
+parse_kes_success_count() {
+    local snapshot="$1"
+    if [[ -z "${snapshot}" ]]; then
+        echo 'KES metrics snapshot was empty' >&2
+        return 1
+    fi
+    local success_count
+    if ! success_count="$(
+        jq -esr '
+            if length == 1
+                and (.[0] | type) == "object"
+                and (.[0].kes_http_request_success | type) == "number"
+                and .[0].kes_http_request_success >= 0
+                and (.[0].kes_http_request_success | floor) == .[0].kes_http_request_success
+            then .[0].kes_http_request_success
+            else error("expected one metrics object with a non-negative integer success count")
+            end
+        ' <<<"${snapshot}"
+    )"; then
+        echo 'KES metrics snapshot was not one valid JSON document' >&2
+        return 1
+    fi
+    printf '%s\n' "${success_count}"
+}
+
 self_check() {
     local fake_docker_state='absent'
+    local fake_one_shot='warpin-kes-self-check-one-shot'
     local policy_file="${WORK_DIR}/self-check-kes.yml"
     local bootstrap_policy
     local runtime_policy
@@ -146,10 +175,40 @@ self_check() {
     local secret_layout="${WORK_DIR}/self-check-secret-layout"
     docker() {
         case "${1:-} ${2:-}" in
-            'rm -f'|'network rm')
+            create\ *)
+                if [[ "${fake_docker_state}" == 'client-nonzero' ]]; then
+                    printf '%s\n' 'fake-one-shot-container-id'
+                    return 0
+                fi
+                return 1
+                ;;
+            'rm -f')
+                if [[ "${fake_docker_state}" == 'remove-failure' ]]; then
+                    return 1
+                fi
+                if [[ "${fake_docker_state}" == 'one-shot-remove-failure' ]]; then
+                    local argument
+                    for argument in "${@:3}"; do
+                        if [[ "${argument}" == "${fake_one_shot}" ]]; then
+                            return 1
+                        fi
+                    done
+                fi
+                return 0
+                ;;
+            'network rm')
                 [[ "${fake_docker_state}" != 'remove-failure' ]]
                 ;;
             'container inspect'|'network inspect')
+                if [[ "${fake_docker_state}" == 'client-nonzero' && "${1:-}" == 'container' ]]; then
+                    printf '[{"Mounts":['
+                    printf '{"Type":"bind","Source":"%s","Destination":"/identity","RW":false},' \
+                        "${KES_METRICS_DIR}"
+                    printf '{"Type":"bind","Source":"%s","Destination":"/trust/server.crt","RW":false}' \
+                        "${KES_SERVER_DIR}/server.crt"
+                    printf ']}]\n'
+                    return 0
+                fi
                 case "${fake_docker_state}" in
                     present)
                         return 0
@@ -160,6 +219,9 @@ self_check() {
                     one-network-remains)
                         [[ "${1:-}" == 'network' && $# -eq 3 && "${3:-}" == "${CLIENT_NETWORK}" ]]
                         ;;
+                    one-shot-remains|one-shot-remove-failure)
+                        [[ "${1:-}" == 'container' && $# -eq 3 && "${3:-}" == "${fake_one_shot}" ]]
+                        ;;
                     *)
                         return 1
                         ;;
@@ -169,6 +231,13 @@ self_check() {
                 return 1
                 ;;
         esac
+    }
+    start_one_shot_client() {
+        if [[ "${fake_docker_state}" == 'client-nonzero' ]]; then
+            printf '%s\n' 'FORBIDDEN_RAW_CONTAINER_OUTPUT_42'
+            return 42
+        fi
+        return 1
     }
 
     render_kes_config "${policy_file}" bootstrap-id runtime-id metrics-id
@@ -227,6 +296,38 @@ self_check() {
         echo 'metrics KES policy contains a key operation' >&2
         return 1
     fi
+    if [[ "$(parse_kes_success_count '{"kes_http_request_success":12}')" != 12 ]]; then
+        echo 'self-check rejected one valid KES metrics document' >&2
+        return 1
+    fi
+    local invalid_metrics
+    for invalid_metrics in \
+        '' \
+        '{}' \
+        '{"kes_http_request_success":' \
+        '{"kes_http_request_success":-1}' \
+        '{"kes_http_request_success":1.5}' \
+        $'{"kes_http_request_success":1}\n{"kes_http_request_success":2}'; do
+        if parse_kes_success_count "${invalid_metrics}" >/dev/null 2>&1; then
+            echo 'self-check accepted an invalid KES metrics snapshot' >&2
+            return 1
+        fi
+    done
+    fake_docker_state='client-nonzero'
+    local client_failure
+    if client_failure="$(run_kes_client metrics metric 2>&1)"; then
+        echo 'self-check accepted a nonzero one-shot KES client' >&2
+        return 1
+    fi
+    if grep -Fq 'FORBIDDEN_RAW_CONTAINER_OUTPUT_42' <<<"${client_failure}"; then
+        echo 'self-check found one-shot container output in an error' >&2
+        return 1
+    fi
+    if ! grep -Fq 'one-shot KES metrics client failed with exit status 42' <<<"${client_failure}"; then
+        echo 'self-check found no structured nonzero one-shot error' >&2
+        return 1
+    fi
+    fake_docker_state='absent'
 
     cleanup_verified
     mkdir -p "${WORK_DIR}"
@@ -251,18 +352,22 @@ self_check() {
         echo 'self-check accepted one remaining network' >&2
         return 1
     fi
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' "${fake_one_shot}" >"${ONE_SHOT_LEDGER}"
+    fake_docker_state='one-shot-remains'
+    if cleanup_verified; then
+        echo 'self-check accepted one remaining dynamic one-shot container' >&2
+        return 1
+    fi
+    mkdir -p "${WORK_DIR}"
+    printf '%s\n' "${fake_one_shot}" >"${ONE_SHOT_LEDGER}"
+    fake_docker_state='one-shot-remove-failure'
+    if cleanup_verified; then
+        echo 'self-check accepted a dynamic one-shot deletion failure' >&2
+        return 1
+    fi
     printf '%s\n' 'minio_kes_live_gate_self_check=true'
 }
-
-if [[ "${1:-}" == '--self-check' ]]; then
-    self_check
-    trap - EXIT INT TERM
-    exit 0
-fi
-if (( $# != 0 )); then
-    echo 'usage: minio-kes-live-gate.sh [--self-check]' >&2
-    exit 2
-fi
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -322,24 +427,35 @@ wait_for_https() {
     return 1
 }
 
+allocate_one_shot_container_name() {
+    local identity_name="$1"
+    local reservation
+    reservation="$(mktemp -d "${WORK_DIR}/one-shot-${identity_name}.XXXXXX")"
+    printf '%s-%s-%s\n' \
+        "${KES_ONE_SHOT_PREFIX}" \
+        "${identity_name}" \
+        "${reservation##*.}"
+}
+
+start_one_shot_client() {
+    timeout 5 docker start --attach "$1"
+}
+
 run_kes_client() {
     local identity_name="$1"
     shift
-    local identity_directory="${WORK_DIR}/kes/${identity_name}"
-    local client_name
     case "${identity_name}" in
-        bootstrap)
-            client_name="${KES_BOOTSTRAP_CLIENT_NAME}"
-            ;;
-        metrics)
-            client_name="${KES_METRICS_CLIENT_NAME}"
-            ;;
+        bootstrap|metrics) ;;
         *)
             echo 'unsupported one-shot KES client identity' >&2
             return 1
             ;;
     esac
-    docker create --rm \
+    local identity_directory="${WORK_DIR}/kes/${identity_name}"
+    local client_name
+    client_name="$(allocate_one_shot_container_name "${identity_name}")"
+    local container_id
+    if ! container_id="$(docker create \
         --name "${client_name}" \
         --network "${KMS_NETWORK}" \
         --user "$(id -u):$(id -g)" \
@@ -357,13 +473,56 @@ run_kes_client() {
             'set -eu
              visible_keys="$(/usr/bin/ls -1 /identity/*.key)"
              [ "${visible_keys}" = "${EXPECTED_PRIVATE_KEY}" ]
+             if [ "${1:-}" = metric ]; then
+                 shift
+                 metric_status=0
+                 # The CLI is a monitor. A long rate plus an internal timeout
+                 # emits one complete document and closes the container before
+                 # the host captures its full attach stream.
+                 /usr/bin/timeout 1 /kes metric --rate 1h "$@" >/tmp/kes-metric.json || metric_status=$?
+                 [ "${metric_status}" -eq 124 ]
+                 [ -s /tmp/kes-metric.json ]
+                 /bin/cat /tmp/kes-metric.json
+                 exit 0
+             fi
              exec /kes "$@"' \
-            client-entrypoint "$@" >/dev/null
-    assert_container_bind_mounts \
+            client-entrypoint "$@")"; then
+        echo "failed to create one-shot KES ${identity_name} client" >&2
+        return 1
+    fi
+    if [[ -z "${container_id}" ]]; then
+        docker rm -f "${client_name}" >/dev/null 2>&1 || true
+        echo "one-shot KES ${identity_name} create returned no container id" >&2
+        return 1
+    fi
+    if ! printf '%s\n' "${client_name}" >>"${ONE_SHOT_LEDGER}"; then
+        docker rm -f "${client_name}" >/dev/null 2>&1 || true
+        echo 'failed to register one-shot KES client for cleanup' >&2
+        return 1
+    fi
+    if ! assert_container_bind_mounts \
         "${client_name}" \
         "${identity_directory}|/identity|false" \
-        "${KES_SERVER_DIR}/server.crt|/trust/server.crt|false"
-    timeout 5 docker start --attach "${client_name}"
+        "${KES_SERVER_DIR}/server.crt|/trust/server.crt|false"; then
+        docker rm -f "${client_name}" >/dev/null 2>&1 || true
+        return 1
+    fi
+    local client_output
+    local start_status=0
+    client_output="$(start_one_shot_client "${client_name}" 2>&1)" || start_status=$?
+    local remove_status=0
+    if ! docker rm -f "${client_name}" >/dev/null 2>&1; then
+        remove_status=1
+    fi
+    if (( start_status != 0 )); then
+        echo "one-shot KES ${identity_name} client failed with exit status ${start_status}" >&2
+        return 1
+    fi
+    if (( remove_status != 0 )); then
+        echo "failed to remove one-shot KES ${identity_name} client" >&2
+        return 1
+    fi
+    printf '%s\n' "${client_output}"
 }
 
 kes_exec() {
@@ -384,8 +543,26 @@ wait_for_kes() {
 
 kes_success_count() {
     local snapshot
-    snapshot="$(kes_exec metric 2>/dev/null | head -n 1 || true)"
-    jq -er '.kes_http_request_success | floor' <<<"${snapshot}"
+    if ! snapshot="$(kes_exec metric)"; then
+        echo 'failed to obtain KES metrics snapshot' >&2
+        return 1
+    fi
+    parse_kes_success_count "${snapshot}"
+}
+
+assert_consecutive_metrics_snapshots() {
+    local attempt
+    local success_count
+    for attempt in {1..12}; do
+        if ! success_count="$(kes_success_count)"; then
+            echo "consecutive metrics snapshot ${attempt}/12 failed" >&2
+            return 1
+        fi
+        if [[ ! "${success_count}" =~ ^[0-9]+$ ]]; then
+            echo "consecutive metrics snapshot ${attempt}/12 was not an integer" >&2
+            return 1
+        fi
+    done
 }
 
 run_mc() {
@@ -425,6 +602,16 @@ run_live_test() {
         cargo test -p warpin-object-storage --all-features \
             --test minio_kes_live -- --ignored
 }
+
+if [[ "${1:-}" == '--self-check' ]]; then
+    self_check
+    trap - EXIT INT TERM
+    exit 0
+fi
+if (( $# != 0 )); then
+    echo 'usage: minio-kes-live-gate.sh [--self-check]' >&2
+    exit 2
+fi
 
 for command in cargo curl docker jq openssl sha256sum; do
     require_command "${command}"
@@ -540,6 +727,7 @@ assert_running_directory_files \
     /config \
     $'config.yml\nserver.crt\nserver.key'
 wait_for_kes
+assert_consecutive_metrics_snapshots
 
 run_kes_client bootstrap key create "${KMS_KEY_NAME}" >/dev/null
 
@@ -711,6 +899,7 @@ printf '%s\n' \
     "key_identity_fingerprint=sha256:${KEY_IDENTITY_FINGERPRINT}" \
     'context_bound_physical_objects=2' \
     'exact_version_post_restart_reads=2' \
+    'consecutive_metrics_snapshots=12' \
     'kes_route_labels_available=false' \
     'inferred_generate_minimum=1' \
     "kes_write_phase_success_delta=${WRITE_KES_OPERATIONS}" \

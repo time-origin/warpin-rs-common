@@ -145,6 +145,10 @@ The ignored Rust integration test and wrapper script verify:
   KES server sees only its config/certificate/key and keystore, MinIO sees only
   the runtime pair, and bootstrap/metrics run as isolated one-shot clients that
   each see only their own pair;
+- twelve consecutive metrics snapshots through uniquely named one-shot
+  containers, with complete output capture, strict single-document JSON
+  validation, explicit container removal, and a cleanup ledger for every
+  dynamically allocated client;
 - a random, least-privilege processing identity (root is bootstrap-only);
 - two context-bound physical objects for one logical key;
 - SSE-KMS response identity and attestation fingerprint equality;
@@ -156,11 +160,13 @@ The ignored Rust integration test and wrapper script verify:
 Run `./warpin-object-storage/scripts/minio-kes-live-gate.sh --self-check` for
 the non-container shell behavior gate. It verifies the least-privilege policy,
 exact private-key directory sets, removal of the legacy shared server mount,
-and the absence of metrics `docker exec`. It also proves that command failures
-or any individually remaining container, network, or temporary directory
-cannot produce the cleanup success attestation. The live gate additionally
-compares the running KES and MinIO bind-mount sets and lists their visible secret
-directories from inside each container.
+and the absence of metrics `docker exec`. It also proves that empty, malformed,
+multi-document, or non-integer metrics snapshots fail closed; nonzero one-shot
+clients do not copy raw container output into errors; and command failures or
+any individually remaining static or dynamic container, network, or temporary
+directory cannot produce the cleanup success attestation. The live gate
+additionally compares the running KES and MinIO bind-mount sets and lists their
+visible secret directories from inside each container.
 
 The pinned KES release exposes only status-labelled aggregate request metrics;
 it has no route labels and does not emit audit events for data-key generate or
