@@ -680,7 +680,7 @@ impl ObservedOperation {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ObserverRequestBinding {
-    pub(crate) binding: WriteBinding,
+    pub(crate) binding: Option<WriteBinding>,
     pub(crate) operation: ObservedOperation,
     pub(crate) expected_location: Path,
     pub(crate) expected_version: Option<String>,
@@ -689,7 +689,7 @@ pub(crate) struct ObserverRequestBinding {
 impl ObserverRequestBinding {
     pub(crate) fn put(binding: WriteBinding, expected_location: Path) -> Self {
         Self {
-            binding,
+            binding: Some(binding),
             operation: ObservedOperation::Put,
             expected_location,
             expected_version: None,
@@ -702,7 +702,16 @@ impl ObserverRequestBinding {
         expected_version: Option<String>,
     ) -> Self {
         Self {
-            binding,
+            binding: Some(binding),
+            operation: ObservedOperation::Readback,
+            expected_location,
+            expected_version,
+        }
+    }
+
+    pub(crate) fn read(expected_location: Path, expected_version: Option<String>) -> Self {
+        Self {
+            binding: None,
             operation: ObservedOperation::Readback,
             expected_location,
             expected_version,
@@ -714,7 +723,7 @@ impl fmt::Debug for ObserverRequestBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ObserverRequestBinding")
-            .field("binding", &self.binding)
+            .field("write_binding_present", &self.binding.is_some())
             .field("operation", &self.operation)
             .field("expected_location", &"[REDACTED]")
             .field("expected_version_present", &self.expected_version.is_some())

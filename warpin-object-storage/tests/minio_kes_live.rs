@@ -1,6 +1,6 @@
 #![cfg(feature = "aws")]
 
-use std::{env, fs, time::SystemTime};
+use std::{env, fs, process::Command, time::SystemTime};
 
 use bytes::Bytes;
 use warpin_integrity::digest_bytes;
@@ -13,6 +13,26 @@ use warpin_object_storage::{
 const MINIO_GATE_KEY_IDENTITY: &[u8] = b"arn:aws:kms:minio-r4-default";
 const CONTEXT_A_DOMAIN: &[u8] = b"warpin:r4:minio-kes-live-gate:context:v1";
 const CONTEXT_B_DOMAIN: &[u8] = b"warpin:r4:minio-kes-live-gate:context:v2";
+
+#[test]
+fn live_gate_shell_self_check_enforces_identity_and_cleanup_contracts() {
+    let output = Command::new("bash")
+        .arg(format!(
+            "{}/scripts/minio-kes-live-gate.sh",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg("--self-check")
+        .output()
+        .expect("execute live-gate shell self-check");
+    assert!(
+        output.status.success(),
+        "shell self-check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("minio_kes_live_gate_self_check=true"));
+    assert!(!stdout.contains("ephemeral_resources_cleaned=true"));
+}
 
 fn gate_run_id() -> String {
     let value = env::var("WARPIN_MINIO_GATE_RUN_ID").unwrap_or_else(|_| {

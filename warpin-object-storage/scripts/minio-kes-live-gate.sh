@@ -26,12 +26,182 @@ readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
 readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
 
-cleanup() {
+cleanup_best_effort() {
     docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1 || true
     docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1 || true
-    rm -rf -- "${WORK_DIR}"
+    rm -rf -- "${WORK_DIR}" || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup_best_effort EXIT INT TERM
+
+cleanup_verified() {
+    local failed=0
+    if ! docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1; then
+        failed=1
+    fi
+    if ! docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1; then
+        failed=1
+    fi
+    if ! rm -rf -- "${WORK_DIR}"; then
+        failed=1
+    fi
+    local container
+    for container in "${MINIO_NAME}" "${KES_NAME}"; do
+        if docker container inspect "${container}" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done
+    local network
+    for network in "${CLIENT_NETWORK}" "${KMS_NETWORK}"; do
+        if docker network inspect "${network}" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done
+    if [[ -e "${WORK_DIR}" ]]; then
+        failed=1
+    fi
+    (( failed == 0 ))
+}
+
+render_kes_config() {
+    local output_file="$1"
+    local bootstrap_identity="$2"
+    local runtime_identity="$3"
+    local metrics_identity="$4"
+    {
+        printf '%s\n' \
+            'address: 0.0.0.0:7373' \
+            '' \
+            'admin:' \
+            '  identity: disabled' \
+            '' \
+            'tls:' \
+            '  key: /config/server.key' \
+            '  cert: /config/server.crt' \
+            '' \
+            'policy:' \
+            '  bootstrap-live-gate:' \
+            '    allow:' \
+            "    - /v1/key/create/${KMS_KEY_NAME}" \
+            '    identities:' \
+            "    - ${bootstrap_identity}" \
+            '  runtime-live-gate:' \
+            '    allow:' \
+            "    - /v1/key/generate/${KMS_KEY_NAME}" \
+            "    - /v1/key/decrypt/${KMS_KEY_NAME}" \
+            '    identities:' \
+            "    - ${runtime_identity}" \
+            '  metrics-live-gate:' \
+            '    allow:' \
+            '    - /v1/status' \
+            '    - /v1/metrics' \
+            '    identities:' \
+            "    - ${metrics_identity}" \
+            '' \
+            'keystore:' \
+            '  fs:' \
+            '    path: /data'
+    } >"${output_file}"
+}
+
+self_check() {
+    local fake_docker_state='absent'
+    local policy_file="${WORK_DIR}/self-check-kes.yml"
+    local bootstrap_policy
+    local runtime_policy
+    local metrics_policy
+    docker() {
+        case "${1:-} ${2:-}" in
+            'rm -f'|'network rm')
+                [[ "${fake_docker_state}" != 'remove-failure' ]]
+                ;;
+            'container inspect'|'network inspect')
+                case "${fake_docker_state}" in
+                    present)
+                        return 0
+                        ;;
+                    one-container-remains)
+                        [[ "${1:-}" == 'container' && $# -eq 3 && "${3:-}" == "${MINIO_NAME}" ]]
+                        ;;
+                    one-network-remains)
+                        [[ "${1:-}" == 'network' && $# -eq 3 && "${3:-}" == "${CLIENT_NETWORK}" ]]
+                        ;;
+                    *)
+                        return 1
+                        ;;
+                esac
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    render_kes_config "${policy_file}" bootstrap-id runtime-id metrics-id
+    grep -Fxq "    - /v1/key/create/${KMS_KEY_NAME}" "${policy_file}"
+    grep -Fxq "    - /v1/key/generate/${KMS_KEY_NAME}" "${policy_file}"
+    grep -Fxq "    - /v1/key/decrypt/${KMS_KEY_NAME}" "${policy_file}"
+    grep -Fxq '    - /v1/status' "${policy_file}"
+    grep -Fxq '    - /v1/metrics' "${policy_file}"
+    if grep -Fq '*' "${policy_file}"; then
+        echo 'self-check found a wildcard KES permission' >&2
+        return 1
+    fi
+    bootstrap_policy="$(sed -n '/^  bootstrap-live-gate:/,/^  runtime-live-gate:/p' "${policy_file}")"
+    runtime_policy="$(sed -n '/^  runtime-live-gate:/,/^  metrics-live-gate:/p' "${policy_file}")"
+    metrics_policy="$(sed -n '/^  metrics-live-gate:/,/^keystore:/p' "${policy_file}")"
+    grep -Fq "/v1/key/create/${KMS_KEY_NAME}" <<<"${bootstrap_policy}"
+    if grep -Eq '/v1/key/(generate|decrypt)|/v1/(status|metrics)' <<<"${bootstrap_policy}"; then
+        echo 'bootstrap KES policy exceeds exact key creation' >&2
+        return 1
+    fi
+    grep -Fq "/v1/key/generate/${KMS_KEY_NAME}" <<<"${runtime_policy}"
+    grep -Fq "/v1/key/decrypt/${KMS_KEY_NAME}" <<<"${runtime_policy}"
+    if grep -Eq '/v1/key/create|/v1/(status|metrics)' <<<"${runtime_policy}"; then
+        echo 'runtime KES policy exceeds exact generate/decrypt operations' >&2
+        return 1
+    fi
+    grep -Fq '/v1/status' <<<"${metrics_policy}"
+    grep -Fq '/v1/metrics' <<<"${metrics_policy}"
+    if grep -Fq '/v1/key/' <<<"${metrics_policy}"; then
+        echo 'metrics KES policy contains a key operation' >&2
+        return 1
+    fi
+
+    cleanup_verified
+    mkdir -p "${WORK_DIR}"
+    fake_docker_state='remove-failure'
+    if cleanup_verified; then
+        echo 'self-check accepted a cleanup command failure' >&2
+        return 1
+    fi
+    if [[ -e "${WORK_DIR}" ]]; then
+        echo 'self-check left its temporary directory behind' >&2
+        return 1
+    fi
+    mkdir -p "${WORK_DIR}"
+    fake_docker_state='one-container-remains'
+    if cleanup_verified; then
+        echo 'self-check accepted one remaining container' >&2
+        return 1
+    fi
+    mkdir -p "${WORK_DIR}"
+    fake_docker_state='one-network-remains'
+    if cleanup_verified; then
+        echo 'self-check accepted one remaining network' >&2
+        return 1
+    fi
+    printf '%s\n' 'minio_kes_live_gate_self_check=true'
+}
+
+if [[ "${1:-}" == '--self-check' ]]; then
+    self_check
+    trap - EXIT INT TERM
+    exit 0
+fi
+if (( $# != 0 )); then
+    echo 'usage: minio-kes-live-gate.sh [--self-check]' >&2
+    exit 2
+fi
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -64,8 +234,8 @@ wait_for_https() {
 kes_exec() {
     timeout 3 docker exec \
         --env KES_SERVER=https://localhost:7373 \
-        --env KES_CLIENT_CERT=/config/client.crt \
-        --env KES_CLIENT_KEY=/config/client.key \
+        --env KES_CLIENT_CERT=/config/metrics.crt \
+        --env KES_CLIENT_KEY=/config/metrics.key \
         --env SSL_CERT_FILE=/config/server.crt \
         "${KES_NAME}" /kes "$@"
 }
@@ -156,51 +326,38 @@ docker run --rm \
         --cert /work/server.crt \
         --expiry 1h \
         kes-live-gate >/dev/null
-docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --mount "type=bind,src=${WORK_DIR}/kes,dst=/work" \
-    "${KES_IMAGE}" identity new \
-        --key /work/client.key \
-        --cert /work/client.crt \
-        --expiry 1h \
-        minio-live-gate >/dev/null
+for identity_name in bootstrap runtime metrics; do
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
+        --mount "type=bind,src=${WORK_DIR}/kes,dst=/work" \
+        "${KES_IMAGE}" identity new \
+            --key "/work/${identity_name}.key" \
+            --cert "/work/${identity_name}.crt" \
+            --expiry 1h \
+            "${identity_name}-live-gate" >/dev/null
+done
 
-KES_CLIENT_IDENTITY="$(docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --mount "type=bind,src=${WORK_DIR}/kes/client.crt,dst=/client.crt,readonly" \
-    "${KES_IMAGE}" identity of /client.crt)"
-readonly KES_CLIENT_IDENTITY
+kes_identity_of() {
+    local certificate_name="$1"
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
+        --mount "type=bind,src=${WORK_DIR}/kes/${certificate_name},dst=/client.crt,readonly" \
+        "${KES_IMAGE}" identity of /client.crt
+}
 
-{
-    printf '%s\n' \
-        'address: 0.0.0.0:7373' \
-        '' \
-        'admin:' \
-        '  identity: disabled' \
-        '' \
-        'tls:' \
-        '  key: /config/server.key' \
-        '  cert: /config/server.crt' \
-        '' \
-        'policy:' \
-        '  minio-live-gate:' \
-        '    allow:' \
-        '    - /v1/key/create/minio-*' \
-        '    - /v1/key/generate/minio-*' \
-        '    - /v1/key/decrypt/minio-*' \
-        '    - /v1/status' \
-        '    - /v1/metrics' \
-        '    identities:' \
-        "    - ${KES_CLIENT_IDENTITY}" \
-        '' \
-        'keystore:' \
-        '  fs:' \
-        '    path: /data'
-} >"${WORK_DIR}/kes/config.yml"
+KES_BOOTSTRAP_IDENTITY="$(kes_identity_of bootstrap.crt)"
+KES_RUNTIME_IDENTITY="$(kes_identity_of runtime.crt)"
+KES_METRICS_IDENTITY="$(kes_identity_of metrics.crt)"
+readonly KES_BOOTSTRAP_IDENTITY KES_RUNTIME_IDENTITY KES_METRICS_IDENTITY
+render_kes_config \
+    "${WORK_DIR}/kes/config.yml" \
+    "${KES_BOOTSTRAP_IDENTITY}" \
+    "${KES_RUNTIME_IDENTITY}" \
+    "${KES_METRICS_IDENTITY}"
 
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
     -subj '/CN=warpin-minio-live-gate-ca' \
@@ -247,11 +404,11 @@ docker run --rm \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --env "KES_SERVER=https://${KES_NAME}:7373" \
-    --env KES_CLIENT_CERT=/certs/client.crt \
-    --env KES_CLIENT_KEY=/certs/client.key \
+    --env KES_CLIENT_CERT=/certs/bootstrap.crt \
+    --env KES_CLIENT_KEY=/certs/bootstrap.key \
     --env SSL_CERT_FILE=/certs/server.crt \
-    --mount "type=bind,src=${WORK_DIR}/kes/client.crt,dst=/certs/client.crt,readonly" \
-    --mount "type=bind,src=${WORK_DIR}/kes/client.key,dst=/certs/client.key,readonly" \
+    --mount "type=bind,src=${WORK_DIR}/kes/bootstrap.crt,dst=/certs/bootstrap.crt,readonly" \
+    --mount "type=bind,src=${WORK_DIR}/kes/bootstrap.key,dst=/certs/bootstrap.key,readonly" \
     --mount "type=bind,src=${WORK_DIR}/kes/server.crt,dst=/certs/server.crt,readonly" \
     "${KES_IMAGE}" key create "${KMS_KEY_NAME}" >/dev/null
 
@@ -269,15 +426,15 @@ start_minio() {
         --env "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
         --env "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
         --env "MINIO_KMS_KES_ENDPOINT=https://${KES_NAME}:7373" \
-        --env MINIO_KMS_KES_CERT_FILE=/kes/client.crt \
-        --env MINIO_KMS_KES_KEY_FILE=/kes/client.key \
+        --env MINIO_KMS_KES_CERT_FILE=/kes/runtime.crt \
+        --env MINIO_KMS_KES_KEY_FILE=/kes/runtime.key \
         --env MINIO_KMS_KES_CAPATH=/certs/CAs/kes-server.crt \
         --env "MINIO_KMS_KES_KEY_NAME=${KMS_KEY_NAME}" \
         --tmpfs /tmp:rw,noexec,nosuid,nodev \
         --mount "type=bind,src=${WORK_DIR}/minio/data,dst=/data" \
         --mount "type=bind,src=${WORK_DIR}/minio/certs,dst=/certs,readonly" \
-        --mount "type=bind,src=${WORK_DIR}/kes/client.crt,dst=/kes/client.crt,readonly" \
-        --mount "type=bind,src=${WORK_DIR}/kes/client.key,dst=/kes/client.key,readonly" \
+        --mount "type=bind,src=${WORK_DIR}/kes/runtime.crt,dst=/kes/runtime.crt,readonly" \
+        --mount "type=bind,src=${WORK_DIR}/kes/runtime.key,dst=/kes/runtime.key,readonly" \
         "${MINIO_IMAGE}" server /data --certs-dir /certs --address :9000 >/dev/null
     docker network connect "${CLIENT_NETWORK}" "${MINIO_NAME}"
 }
@@ -402,7 +559,10 @@ fi
 
 KEY_IDENTITY_FINGERPRINT="$(printf '%s' "${KMS_KEY_IDENTITY}" | sha256sum | awk '{print $1}')"
 readonly KEY_IDENTITY_FINGERPRINT
-cleanup
+if ! cleanup_verified; then
+    echo 'ephemeral resource cleanup verification failed' >&2
+    exit 1
+fi
 trap - EXIT INT TERM
 printf '%s\n' \
     'MinIO/KES compatibility gate: PASS' \

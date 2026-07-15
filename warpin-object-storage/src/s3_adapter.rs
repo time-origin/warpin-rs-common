@@ -22,6 +22,13 @@ use reqwest::{redirect::Policy as RedirectPolicy, tls::Certificate};
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
 
+#[cfg(feature = "aws")]
+mod credential;
+#[cfg(feature = "aws")]
+use credential::CredentialMode;
+#[cfg(feature = "aws")]
+pub use credential::TrustedCredentialHttpsOrigin;
+
 use super::{
     EncryptionPolicyError, ManagedEncryptionProfileId, ObservedOperation, ObserverRequestBinding,
     WriteBinding,
@@ -34,6 +41,8 @@ pub(crate) const S3_BUCKET_KEY_ENABLED_HEADER: &str =
 const S3_SSE_HEADER: &str = "x-amz-server-side-encryption";
 const S3_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
 const S3_VERSION_HEADER: &str = "x-amz-version-id";
+#[cfg(feature = "aws")]
+const AWS_CONTENT_SHA256_HEADER: &str = "x-amz-content-sha256";
 const S3_SSE_KMS_VALUE: &str = "aws:kms";
 const AWS_S3_OBJECT_CONTEXT_PROFILE_DOMAIN: &[u8] =
     b"warpin:managed-encryption-profile:aws-s3-object-arn-sse-kms:v1";
@@ -105,6 +114,15 @@ enum ObjectContextGuarantee {
 struct ExpectedRequestTarget {
     base_url: Url,
     sigv4_region: String,
+    signed_sse_shape: ExpectedSignedSseShape,
+}
+
+#[cfg(feature = "aws")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedSignedSseShape {
+    algorithm: ObservedManagedAlgorithm,
+    bucket_key_state: ObservedBucketKeyState,
+    key_identity_fingerprint: Option<Sha256Digest>,
 }
 
 #[cfg(feature = "aws")]
@@ -116,6 +134,7 @@ impl ExpectedRequestTarget {
         custom_endpoint: Option<&str>,
         virtual_hosted: bool,
         guarantee: ObjectContextGuarantee,
+        signed_sse_shape: ExpectedSignedSseShape,
     ) -> Result<Self, ObjectStorageError> {
         let mut base_url = match guarantee {
             ObjectContextGuarantee::AwsObjectArn => {
@@ -165,6 +184,7 @@ impl ExpectedRequestTarget {
         Ok(Self {
             base_url,
             sigv4_region: region.to_owned(),
+            signed_sse_shape,
         })
     }
 
@@ -216,7 +236,11 @@ impl ExpectedRequestTarget {
         Ok(digest_bytes(actual.as_str().as_bytes()))
     }
 
-    fn verify_sigv4(&self, headers: &object_store::HeaderMap) -> Result<(), ObjectStorageError> {
+    fn verify_sigv4(
+        &self,
+        operation: ObservedOperation,
+        headers: &object_store::HeaderMap,
+    ) -> Result<(), ObjectStorageError> {
         let authorization = header_value(headers, "authorization")
             .ok_or(ObjectStorageError::InvalidConfiguration)?;
         let fields = authorization
@@ -254,6 +278,9 @@ impl ExpectedRequestTarget {
             || !signature
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || signature
+                .bytes()
+                .all(|byte| byte == signature.as_bytes()[0])
         {
             return Err(ObjectStorageError::InvalidConfiguration);
         }
@@ -280,9 +307,43 @@ impl ExpectedRequestTarget {
             })
             || names.windows(2).any(|pair| pair[0] >= pair[1])
             || !names.contains(&"host")
+            || !names.contains(&AWS_CONTENT_SHA256_HEADER)
             || !names.contains(&"x-amz-date")
         {
             return Err(ObjectStorageError::InvalidConfiguration);
+        }
+        let content_sha = header_value(headers, AWS_CONTENT_SHA256_HEADER)
+            .ok_or(ObjectStorageError::InvalidConfiguration)?;
+        if content_sha.len() != 64
+            || !content_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
+        if operation == ObservedOperation::Put {
+            if self.signed_sse_shape.algorithm != ObservedManagedAlgorithm::SseKms
+                || header_value(headers, S3_SSE_HEADER) != Some(S3_SSE_KMS_VALUE)
+                || !names.contains(&S3_SSE_HEADER)
+                || self.signed_sse_shape.bucket_key_state != ObservedBucketKeyState::Disabled
+                || header_value(headers, S3_BUCKET_KEY_ENABLED_HEADER) != Some("false")
+                || !names.contains(&S3_BUCKET_KEY_ENABLED_HEADER)
+            {
+                return Err(ObjectStorageError::InvalidConfiguration);
+            }
+            if let Some(expected) = self.signed_sse_shape.key_identity_fingerprint.as_ref() {
+                let actual = header_value(headers, S3_KMS_KEY_ID_HEADER)
+                    .filter(|value| !value.is_empty() && value.len() <= MAX_OBSERVED_KEY_ID_BYTES)
+                    .map(|value| digest_bytes(value.as_bytes()))
+                    .ok_or(ObjectStorageError::InvalidConfiguration)?;
+                if &actual != expected || !names.contains(&S3_KMS_KEY_ID_HEADER) {
+                    return Err(ObjectStorageError::InvalidConfiguration);
+                }
+            } else if headers.contains_key(S3_KMS_KEY_ID_HEADER)
+                && !names.contains(&S3_KMS_KEY_ID_HEADER)
+            {
+                return Err(ObjectStorageError::InvalidConfiguration);
+            }
         }
         Ok(())
     }
@@ -356,18 +417,37 @@ pub(crate) struct ConfiguredS3Encryption {
     pub(crate) expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
     #[cfg(feature = "aws")]
     expected_request_target: ExpectedRequestTarget,
+    #[cfg(feature = "aws")]
+    credential_mode: CredentialMode,
 }
 
 #[cfg(feature = "aws")]
 impl ConfiguredS3Encryption {
+    #[cfg(test)]
     pub(crate) fn from_options(
         storage_url: &Url,
         options: &BTreeMap<String, String>,
         selected_profile_id: Option<ManagedEncryptionProfileId>,
         expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
     ) -> Result<Self, ObjectStorageError> {
+        Self::from_options_with_trusted_credential_origins(
+            storage_url,
+            options,
+            selected_profile_id,
+            expected_observed_key_identity_fingerprint,
+            &[],
+        )
+    }
+
+    fn from_options_with_trusted_credential_origins(
+        storage_url: &Url,
+        options: &BTreeMap<String, String>,
+        selected_profile_id: Option<ManagedEncryptionProfileId>,
+        expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
+        trusted_credential_https_origins: &[TrustedCredentialHttpsOrigin],
+    ) -> Result<Self, ObjectStorageError> {
         let mut algorithm = None;
-        let mut key_identity_configured = false;
+        let mut expected_request_key_identity_fingerprint = None;
         let mut bucket_key_state = ObservedBucketKeyState::Missing;
         let mut bucket_key_configured = false;
         let mut endpoint = None;
@@ -451,13 +531,14 @@ impl ConfiguredS3Encryption {
                         });
                     }
                     "aws_sse_kms_key_id" => {
-                        if key_identity_configured
+                        if expected_request_key_identity_fingerprint.is_some()
                             || value.is_empty()
                             || value.len() > MAX_OBSERVED_KEY_ID_BYTES
                         {
                             return Err(ObjectStorageError::InvalidConfiguration);
                         }
-                        key_identity_configured = true;
+                        expected_request_key_identity_fingerprint =
+                            Some(digest_bytes(value.as_bytes()));
                     }
                     "aws_sse_bucket_key_enabled" => {
                         if bucket_key_configured {
@@ -554,7 +635,14 @@ impl ConfiguredS3Encryption {
             custom_endpoint,
             virtual_hosted,
             object_context_guarantee,
+            ExpectedSignedSseShape {
+                algorithm: algorithm.unwrap_or(ObservedManagedAlgorithm::Missing),
+                bucket_key_state,
+                key_identity_fingerprint: expected_request_key_identity_fingerprint,
+            },
         )?;
+        let credential_mode =
+            CredentialMode::from_options(options, region, trusted_credential_https_origins)?;
         Ok(Self {
             profile_id,
             object_context_guarantee,
@@ -562,6 +650,7 @@ impl ConfiguredS3Encryption {
             bucket_key_state,
             expected_observed_key_identity_fingerprint,
             expected_request_target,
+            credential_mode,
         })
     }
 
@@ -571,12 +660,14 @@ impl ConfiguredS3Encryption {
         selected_profile_id: Option<ManagedEncryptionProfileId>,
         expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
         trusted_root_certificate_pems: Vec<Vec<u8>>,
+        trusted_credential_https_origins: Vec<TrustedCredentialHttpsOrigin>,
     ) -> Result<(Box<dyn ObjectStore>, Path, Self), ObjectStorageError> {
-        let configured = Self::from_options(
+        let configured = Self::from_options_with_trusted_credential_origins(
             url,
             &options,
             selected_profile_id,
             expected_observed_key_identity_fingerprint,
+            &trusted_credential_https_origins,
         )?;
         let mut builder = AmazonS3Builder::new()
             .with_url(url.as_str())
@@ -586,8 +677,16 @@ impl ConfiguredS3Encryption {
             )
             .with_http_connector(S3EncryptionObserverConnector::new(
                 configured.expected_request_target.clone(),
+                configured.credential_mode.clone(),
                 &trusted_root_certificate_pems,
             )?);
+        if let Some(endpoint) = configured.credential_mode.official_sts_endpoint() {
+            // `object_store`'s generic default does not select every AWS
+            // partition suffix. Install the already validated official target
+            // so an omitted STS option and an explicit exact option behave the
+            // same way at the connector boundary.
+            builder = builder.with_config(AmazonS3ConfigKey::StsEndpoint, endpoint);
+        }
         for (key, value) in options {
             let key = key
                 .parse::<AmazonS3ConfigKey>()
@@ -627,6 +726,7 @@ impl ConfiguredS3Encryption {
         S3EncryptionObserverService {
             inner,
             expected_request_target: self.expected_request_target.clone(),
+            credential_mode: self.credential_mode.clone(),
         }
     }
 
@@ -737,7 +837,7 @@ fn observed_s3_response_for_verified_target(
         .filter(|value| !value.is_empty() && value.len() <= MAX_OBSERVED_KEY_ID_BYTES)
         .map(|value| digest_bytes(value.as_bytes()));
     Some(ObservedEncryptionEvidence {
-        binding: request.binding.clone(),
+        binding: request.binding.clone()?,
         operation: request.operation,
         request_path_fingerprint: request_target_fingerprint,
         response_e_tag: header_value(headers, "etag").map(str::to_owned),
@@ -959,12 +1059,14 @@ fn managed_connector_error(message: &'static str) -> object_store::Error {
 struct S3EncryptionObserverConnector {
     inner: NoRedirectReqwestConnector,
     expected_request_target: ExpectedRequestTarget,
+    credential_mode: CredentialMode,
 }
 
 #[cfg(feature = "aws")]
 impl S3EncryptionObserverConnector {
     fn new(
         expected_request_target: ExpectedRequestTarget,
+        credential_mode: CredentialMode,
         trusted_root_certificate_pems: &[Vec<u8>],
     ) -> Result<Self, ObjectStorageError> {
         Ok(Self {
@@ -972,6 +1074,7 @@ impl S3EncryptionObserverConnector {
                 trusted_root_certificate_pems,
             )?,
             expected_request_target,
+            credential_mode,
         })
     }
 }
@@ -983,6 +1086,7 @@ impl HttpConnector for S3EncryptionObserverConnector {
         Ok(HttpClient::new(S3EncryptionObserverService {
             inner: client,
             expected_request_target: self.expected_request_target.clone(),
+            credential_mode: self.credential_mode.clone(),
         }))
     }
 }
@@ -992,6 +1096,7 @@ impl HttpConnector for S3EncryptionObserverConnector {
 pub(crate) struct S3EncryptionObserverService {
     pub(crate) inner: HttpClient,
     expected_request_target: ExpectedRequestTarget,
+    credential_mode: CredentialMode,
 }
 
 #[cfg(feature = "aws")]
@@ -1011,12 +1116,15 @@ impl HttpService for S3EncryptionObserverService {
                     managed_artifact_request_error(ManagedArtifactRequestRejection::Target)
                 })?;
             self.expected_request_target
-                .verify_sigv4(request.headers())
+                .verify_sigv4(binding.operation, request.headers())
                 .map_err(|_| {
                     managed_artifact_request_error(ManagedArtifactRequestRejection::Signature)
                 })?;
             Some(fingerprint)
         } else {
+            self.credential_mode.verify_request(&request).map_err(|_| {
+                managed_artifact_request_error(ManagedArtifactRequestRejection::Credential)
+            })?;
             None
         };
         let mut response = self.inner.execute(request).await?;
@@ -1041,6 +1149,7 @@ impl HttpService for S3EncryptionObserverService {
 enum ManagedArtifactRequestRejection {
     Target,
     Signature,
+    Credential,
 }
 
 #[cfg(feature = "aws")]
@@ -1055,6 +1164,7 @@ impl fmt::Display for ManagedArtifactRequestError {
         let code = match self.rejection {
             ManagedArtifactRequestRejection::Target => "managed_request_target_mismatch",
             ManagedArtifactRequestRejection::Signature => "managed_request_signature_invalid",
+            ManagedArtifactRequestRejection::Credential => "managed_credential_request_invalid",
         };
         formatter.write_str(code)
     }
@@ -1084,6 +1194,9 @@ pub(crate) fn map_managed_request_error(
                 }
                 ManagedArtifactRequestRejection::Signature => {
                     ObjectStorageError::RequestSignatureInvalid
+                }
+                ManagedArtifactRequestRejection::Credential => {
+                    ObjectStorageError::RequestTargetMismatch
                 }
             });
         }

@@ -7,9 +7,9 @@ use object_store::{
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
 
-#[cfg(feature = "aws")]
-use crate::s3_adapter::map_managed_request_error;
 use crate::s3_adapter::{ConfiguredS3Encryption, ObservedEncryptionEvidence};
+#[cfg(feature = "aws")]
+use crate::s3_adapter::{TrustedCredentialHttpsOrigin, map_managed_request_error};
 use crate::{
     ArtifactEncryptionContextId, ArtifactEncryptionPolicy, EncryptionAttestation,
     EncryptionPolicyError, EncryptionRequirementView, EncryptionVerifiedObjectWriteReceipt,
@@ -34,6 +34,8 @@ pub struct ObjectStoreSettings {
     expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
     managed_encryption_profile_id: Option<ManagedEncryptionProfileId>,
     trusted_root_certificate_pems: Vec<Vec<u8>>,
+    #[cfg(feature = "aws")]
+    trusted_credential_https_origins: Vec<TrustedCredentialHttpsOrigin>,
 }
 
 impl ObjectStoreSettings {
@@ -45,6 +47,8 @@ impl ObjectStoreSettings {
             expected_observed_key_identity_fingerprint: None,
             managed_encryption_profile_id: None,
             trusted_root_certificate_pems: Vec::new(),
+            #[cfg(feature = "aws")]
+            trusted_credential_https_origins: Vec::new(),
         }
     }
 
@@ -90,6 +94,18 @@ impl ObjectStoreSettings {
         self
     }
 
+    /// Adds an explicitly parsed HTTPS origin that may serve EKS-compatible
+    /// container credentials. The origin alone grants no access: an exact full
+    /// credential URI and a bounded token file must also select the EKS mode.
+    #[cfg(feature = "aws")]
+    pub fn with_trusted_credential_https_origin(
+        mut self,
+        origin: TrustedCredentialHttpsOrigin,
+    ) -> Self {
+        self.trusted_credential_https_origins.push(origin);
+        self
+    }
+
     #[cfg(all(test, feature = "aws"))]
     pub(crate) const fn managed_encryption_profile_id(
         &self,
@@ -116,6 +132,18 @@ impl ObjectStoreSettings {
         {
             return Err(ObjectStorageError::InvalidConfiguration);
         }
+        #[cfg(feature = "aws")]
+        if self.trusted_credential_https_origins.len() > 8
+            || self
+                .trusted_credential_https_origins
+                .iter()
+                .enumerate()
+                .any(|(index, origin)| {
+                    self.trusted_credential_https_origins[..index].contains(origin)
+                })
+        {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
         if !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -126,13 +154,24 @@ impl ObjectStoreSettings {
         if !matches!(url.scheme(), "memory" | "file" | "s3" | "s3a") {
             return Err(ObjectStorageError::UnsupportedBackend);
         }
+        let has_trusted_credential_https_origins = {
+            #[cfg(feature = "aws")]
+            {
+                !self.trusted_credential_https_origins.is_empty()
+            }
+            #[cfg(not(feature = "aws"))]
+            {
+                false
+            }
+        };
         match url.scheme() {
             "memory" | "file"
                 if url.host_str().is_some()
                     || !self.options.is_empty()
                     || self.expected_observed_key_identity_fingerprint.is_some()
                     || self.managed_encryption_profile_id.is_some()
-                    || !self.trusted_root_certificate_pems.is_empty() =>
+                    || !self.trusted_root_certificate_pems.is_empty()
+                    || has_trusted_credential_https_origins =>
             {
                 return Err(ObjectStorageError::InvalidConfiguration);
             }
@@ -188,6 +227,16 @@ impl fmt::Debug for ObjectStoreSettings {
                 "trusted_root_certificate_count",
                 &self.trusted_root_certificate_pems.len(),
             )
+            .field("trusted_credential_https_origin_count", &{
+                #[cfg(feature = "aws")]
+                {
+                    self.trusted_credential_https_origins.len()
+                }
+                #[cfg(not(feature = "aws"))]
+                {
+                    0_usize
+                }
+            })
             .field("max_object_bytes", &self.max_object_bytes)
             .finish()
     }
@@ -196,7 +245,9 @@ impl fmt::Debug for ObjectStoreSettings {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BackendSecurityMode {
     DevelopmentOrTestPlaintext,
-    S3Observed { configured: ConfiguredS3Encryption },
+    S3Observed {
+        configured: Box<ConfiguredS3Encryption>,
+    },
 }
 
 #[derive(Clone)]
@@ -277,12 +328,15 @@ impl VerifiedObjectStorage {
                         settings.managed_encryption_profile_id,
                         settings.expected_observed_key_identity_fingerprint,
                         settings.trusted_root_certificate_pems,
+                        settings.trusted_credential_https_origins,
                     )?;
                     (
                         store,
                         prefix,
                         true,
-                        BackendSecurityMode::S3Observed { configured },
+                        BackendSecurityMode::S3Observed {
+                            configured: Box::new(configured),
+                        },
                     )
                 }
             }
@@ -500,13 +554,17 @@ impl VerifiedObjectStorage {
     ) -> Result<VerifiedReadback, ObjectStorageError> {
         let location = self.location(key, context_id)?;
         let mut extensions = Extensions::new();
-        if let Some(binding) = binding {
-            extensions.insert(ObserverRequestBinding::readback(
+        let request_binding = match binding {
+            Some(binding) => ObserverRequestBinding::readback(
                 binding.clone(),
                 location.clone(),
                 expected_version.map(str::to_owned),
-            ));
-        }
+            ),
+            None => {
+                ObserverRequestBinding::read(location.clone(), expected_version.map(str::to_owned))
+            }
+        };
+        extensions.insert(request_binding);
         let options = read_options(expected_version, extensions);
         let result = self
             .store

@@ -127,11 +127,22 @@ wrapping.
   customer-provided encryption keys, proxy options, and unknown options fail
   closed.
 - Redirects are never followed.
+- Credential modes are now typed, complete, and mutually exclusive. Static
+  credentials require both key halves; an omitted mode means strict standard
+  IMDSv2. IMDSv1 aliases, custom metadata endpoints, mixed modes, and malformed
+  ECS/EKS targets fail before network I/O.
+- ECS accepts only an absolute relative path at `169.254.170.2`. EKS requires a
+  standard loopback/link-local full URI or an explicit parsed
+  `TrustedCredentialHttpsOrigin`, plus an absolute regular token file no larger
+  than 16 KiB. Web identity uses only the official partition/region STS target.
 - A private CA is provided as PEM bytes through
   `with_trusted_root_certificate_pem`; do not use provider-specific custom-CA
   options.
 - Exact target verification uses the S3 SigV4 canonical path encoding. Do not
   pre-encode object keys or compare decoded URI aliases.
+- Every managed PUT and GET is privately classified as an artifact request.
+  SSE and content-hash headers must be signed, and ordinary/restart reads retain
+  exact target/version binding without manufacturing write-attestation evidence.
 
 ## Rollout guidance
 

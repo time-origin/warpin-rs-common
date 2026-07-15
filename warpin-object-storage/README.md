@@ -15,6 +15,10 @@ profile, context, digest, and optional key-identity fingerprints.
 - Managed S3 writes require a reviewed adapter profile, SSE-KMS, explicitly
   disabled S3 Bucket Keys, an exact HTTPS request target, and valid SigV4
   request evidence.
+- Every managed artifact PUT and GET carries a private exact-target binding.
+  PUT signatures must cover the content SHA, `aws:kms`, Bucket Keys disabled,
+  and the exact configured KMS key ID when present. GET signatures must cover
+  host, date, and content SHA; versioned reads bind the exact version query.
 - The final version-pinned GET response, not request configuration alone,
   produces the managed encryption attestation.
 - A canonical provider key identity may be required by digest. Raw key
@@ -28,6 +32,28 @@ profile, context, digest, and optional key-identity fingerprints.
   fail closed.
 - Debug and error formatting omits raw object keys, content, credentials,
   provider bodies, signed URLs, ETags, versions, and certificate contents.
+
+## Managed AWS credential boundary
+
+Credential sources are complete and mutually exclusive. A configuration must
+select exactly one of these modes, or omit credential options to use strict
+IMDSv2 at the standard `169.254.169.254` endpoint:
+
+- a complete static access-key/secret-key pair, with an optional session token;
+- an ECS relative credential path resolved only against `169.254.170.2`;
+- an EKS full URI at an AWS-standard loopback/link-local address, paired with
+  an absolute, regular, non-symlink token file of at most 16 KiB;
+- EKS-compatible HTTPS at an exact full URI whose origin was separately added
+  as a parsed `TrustedCredentialHttpsOrigin`; or
+- web identity with a partition-compatible role ARN, bounded token file, and
+  the official regional STS endpoint. Arbitrary STS endpoints are rejected.
+
+The connector validates the selected credential method, scheme, authority,
+path/query, and required headers before network I/O. IMDSv1 fallback, mixed or
+incomplete modes, URI aliases, redirects, and unclassified outbound requests
+fail closed. Token contents are retained only as private digests and are
+rechecked against the actual EKS authorization header or STS query, so a token
+file changed after preflight cannot silently alter the outbound request.
 
 ## Features
 
@@ -103,6 +129,8 @@ The ignored Rust integration test and wrapper script verify:
 
 - fixed MinIO, KES, and `mc` image RepoDigests;
 - TLS for S3, mTLS for KES, and provider-neutral private-root injection;
+- distinct KES bootstrap, runtime, and metrics identities: exact key creation,
+  exact generate/decrypt, and status/metrics respectively, with no wildcards;
 - a random, least-privilege processing identity (root is bootstrap-only);
 - two context-bound physical objects for one logical key;
 - SSE-KMS response identity and attestation fingerprint equality;
@@ -110,6 +138,11 @@ The ignored Rust integration test and wrapper script verify:
 - exact version reads before and after a MinIO restart; and
 - complete cleanup of containers, networks, credentials, and temporary
   certificates.
+
+Run `./warpin-object-storage/scripts/minio-kes-live-gate.sh --self-check` for
+the non-container shell behavior gate. It verifies the least-privilege policy
+shape and proves that command failures or any individually remaining container,
+network, or temporary directory cannot produce the cleanup success attestation.
 
 The pinned KES release exposes only status-labelled aggregate request metrics;
 it has no route labels and does not emit audit events for data-key generate or
