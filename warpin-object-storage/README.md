@@ -186,16 +186,22 @@ Every one-shot container also receives one internally generated current-run
 label. Cleanup treats both the ledger and Docker label-query output as
 untrusted inputs. Discovery stdout is redirected directly into a private,
 same-directory regular file and is never stored in a shell scalar; Docker
-stderr is discarded and cannot become a record or an emitted error. The same
-byte-aware loader used by the ledger validates the complete discovery file
-before any name is published, with limits of 65,536 bytes and 256 records. A
-zero-byte query is the normal "no containers" result. Every nonempty result
-must contain unique, current-run names with exactly one final newline per
-record; a single newline, embedded or trailing empty record, missing final
-newline, NUL/control byte, malformed name, wrong run or identity, or duplicate
-result is corruption. The discovery temporary is removed and its absence is
-verified before validated names are returned; creation, write, Docker,
-validation, and removal failures are fail-closed. If the ledger is damaged,
+stderr is discarded and cannot become a record or an emitted error. An
+internal capture boundary repeats the private-workdir, label, allowlist, and
+regular-file preflight before invoking Docker. A nonzero capture status removes
+the temporary and returns before any captured bytes are parsed, even when the
+file contains a canonical-looking name. The same byte-aware loader used by the
+ledger validates the complete successful capture before any name is published,
+with limits of 65,536 bytes and 256 records. A zero-byte query is the normal
+"no containers" result. Every nonempty result must contain unique, current-run
+names with exactly one final newline per record; a single newline, embedded or
+trailing empty record, missing final newline, NUL/control byte, malformed name,
+wrong run or identity, or duplicate result is corruption. The discovery
+temporary is removed and its absence is verified before validated names are
+returned; creation, write, Docker, validation, and removal failures are
+fail-closed. The shell self-check injects fixed nonzero capture outcomes rather
+than depending on filesystem DAC permissions, so these failure cases are
+identical for ordinary and privileged EUIDs. If the ledger is damaged,
 best-effort trap cleanup can still remove a safely discovered run container,
 but verified cleanup returns failure even when fallback deletion succeeds; it
 cannot hide ledger-integrity loss behind `ephemeral_resources_cleaned=true`.

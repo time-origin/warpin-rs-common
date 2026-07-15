@@ -278,6 +278,23 @@ remove_one_shot_discovery_temp() {
     [[ ! -e "${discovery_file}" && ! -L "${discovery_file}" ]]
 }
 
+capture_labeled_one_shot_discovery() {
+    local discovery_file="$1"
+    validate_private_work_dir || return 1
+    validate_one_shot_label_contract || return 1
+    local -a empty_preflight=()
+    if ! load_validated_one_shot_record_file \
+        "${discovery_file}" require-existing empty_preflight \
+        || (( ${#empty_preflight[@]} != 0 )); then
+        return 1
+    fi
+    docker container ls \
+        --all \
+        --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
+        --format '{{.Names}}' \
+        2>/dev/null >"${discovery_file}"
+}
+
 discover_labeled_one_shot_containers() {
     local output_name="$1"
     local -n output_ref="${output_name}"
@@ -295,11 +312,8 @@ discover_labeled_one_shot_containers() {
         remove_one_shot_discovery_temp "${discovery_file}" || true
         return 1
     fi
-    if ! docker container ls \
-        --all \
-        --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
-        --format '{{.Names}}' \
-        2>/dev/null >"${discovery_file}"; then
+    if ! capture_labeled_one_shot_discovery "${discovery_file}" \
+        2>/dev/null; then
         remove_one_shot_discovery_temp "${discovery_file}" || true
         return 1
     fi
@@ -423,9 +437,8 @@ self_check() {
                     printf '%s\n' "${fake_discovery_temp_path}"
                     return 0
                     ;;
-                unwritable)
-                    : >"${fake_discovery_temp_path}"
-                    chmod 400 "${fake_discovery_temp_path}"
+                fifo)
+                    mkfifo "${fake_discovery_temp_path}"
                     printf '%s\n' "${fake_discovery_temp_path}"
                     return 0
                     ;;
@@ -596,7 +609,9 @@ self_check() {
                             && "${inspected_name}" == "${fake_one_shot}" ]]
                         ;;
                     labeled-one-shot-present|discovery-trailing-empty|\
-                        discovery-missing-final-newline|discovery-nul)
+                        discovery-missing-final-newline|discovery-nul|\
+                        discovery-capture-write-failure|\
+                        discovery-capture-partial-failure)
                         [[ "${1:-}" == 'container' \
                             && ${fake_container_present:-0} -eq 1 \
                             && "${inspected_name}" == "${fake_created_name:-}" ]]
@@ -649,6 +664,61 @@ self_check() {
     }
 
     local -a discovery_byte_failures=()
+    production_capture_must_reject_docker_failure() {
+        mkdir -p "${WORK_DIR}"
+        local capture_file="${WORK_DIR}/one-shot-discovery.production-self-check"
+        local capture_error="${WORK_DIR}/self-check-production-capture-error"
+        : >"${capture_file}"
+        fake_docker_state='discovery-docker-failure'
+        if ! declare -F capture_labeled_one_shot_discovery >/dev/null; then
+            discovery_byte_failures+=(
+                'self-check found no production label-discovery capture seam'
+            )
+        elif capture_labeled_one_shot_discovery "${capture_file}" \
+            2>"${capture_error}"; then
+            discovery_byte_failures+=(
+                'self-check accepted a nonzero production Docker capture'
+            )
+        fi
+        if [[ -f "${capture_error}" ]] \
+            && grep -Fq 'FORBIDDEN_DISCOVERY_SECRET_42' "${capture_error}"; then
+            discovery_byte_failures+=(
+                'self-check leaked production Docker capture stderr'
+            )
+        fi
+        rm -f -- "${capture_error}"
+        remove_one_shot_discovery_temp "${capture_file}" || {
+            discovery_byte_failures+=(
+                'self-check left the production capture temp behind'
+            )
+        }
+        fake_docker_state='absent'
+    }
+    production_capture_must_reject_docker_failure
+
+    capture_labeled_one_shot_discovery() {
+        local discovery_file="$1"
+        case "${fake_docker_state:-absent}" in
+            discovery-capture-write-failure)
+                printf '%s\n' '--help' >"${discovery_file}"
+                printf '%s\n' 'FORBIDDEN_CAPTURE_SECRET_42' >&2
+                return 81
+                ;;
+            discovery-capture-partial-failure)
+                printf '%s\n' "${fake_created_name:-}" >"${discovery_file}"
+                printf '%s\n' 'FORBIDDEN_CAPTURE_SECRET_42' >&2
+                return 82
+                ;;
+            *)
+                docker container ls \
+                    --all \
+                    --filter "${KES_ONE_SHOT_LABEL_FILTER}" \
+                    --format '{{.Names}}' \
+                    2>/dev/null >"${discovery_file}"
+                ;;
+        esac
+    }
+
     assert_no_discovery_temp_remains() {
         local fixture_name="$1"
         local leftover_path
@@ -713,6 +783,62 @@ self_check() {
         fi
         assert_no_discovery_temp_remains "${temp_mode} temp"
         fake_discovery_temp_mode='normal'
+    }
+    capture_failure_must_fail_closed() {
+        local fixture_name="$1"
+        local capture_state="$2"
+        mkdir -p "${WORK_DIR}"
+        : >"${ONE_SHOT_LEDGER}"
+        fake_created_name="${KES_ONE_SHOT_PREFIX}-metrics-label-fallback"
+        fake_container_present=1
+        fake_docker_state="${capture_state}"
+        fake_discovery_temp_mode='normal'
+        fake_forbidden_docker_argument="${fake_created_name}"
+        fake_forbidden_docker_argument_seen=0
+        local capture_error="${WORK_DIR}/self-check-capture-error"
+        local -a discovered_names=()
+        if discover_labeled_one_shot_containers discovered_names \
+            2>"${capture_error}"; then
+            discovery_byte_failures+=(
+                "self-check accepted ${fixture_name} capture status"
+            )
+        fi
+        if (( ${#discovered_names[@]} != 0 )); then
+            discovery_byte_failures+=(
+                "self-check published names after ${fixture_name} capture"
+            )
+        fi
+        if grep -Fq 'FORBIDDEN_CAPTURE_SECRET_42' "${capture_error}"; then
+            discovery_byte_failures+=(
+                "self-check leaked ${fixture_name} capture stderr"
+            )
+        fi
+        rm -f -- "${capture_error}"
+        if (( fake_forbidden_docker_argument_seen != 0 )); then
+            discovery_byte_failures+=(
+                "self-check passed ${fixture_name} capture bytes to Docker"
+            )
+        fi
+        assert_no_discovery_temp_remains "${fixture_name} capture"
+        if cleanup_verified; then
+            discovery_byte_failures+=(
+                "self-check attested cleanup after ${fixture_name} capture"
+            )
+        fi
+        if (( fake_container_present != 1 )); then
+            discovery_byte_failures+=(
+                "self-check consumed ${fixture_name} capture bytes"
+            )
+        fi
+        if (( fake_forbidden_docker_argument_seen != 0 )); then
+            discovery_byte_failures+=(
+                "self-check used ${fixture_name} capture as a Docker operand"
+            )
+        fi
+        assert_no_discovery_temp_remains "${fixture_name} cleanup"
+        fake_container_present=0
+        fake_forbidden_docker_argument=''
+        fake_docker_state='absent'
     }
 
     local -a ledger_attack_failures=()
@@ -1104,7 +1230,12 @@ self_check() {
         )
     fi
     discovery_temp_mode_must_fail directory
-    discovery_temp_mode_must_fail unwritable
+    discovery_temp_mode_must_fail fifo
+
+    capture_failure_must_fail_closed \
+        'injected write failure' discovery-capture-write-failure
+    capture_failure_must_fail_closed \
+        'partial write failure' discovery-capture-partial-failure
 
     mkdir -p "${WORK_DIR}"
     fake_docker_state='discovery-docker-failure'
