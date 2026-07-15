@@ -165,39 +165,110 @@ parse_kes_success_count() {
     printf '%s\n' "${success_count}"
 }
 
+validate_one_shot_container_name() {
+    local client_name="$1"
+    local identity_name="$2"
+    case "${identity_name}" in
+        bootstrap|metrics) ;;
+        *) return 1 ;;
+    esac
+    local expected_prefix="${KES_ONE_SHOT_PREFIX}-${identity_name}-"
+    [[ "${client_name}" == "${expected_prefix}"* ]] \
+        && (( ${#client_name} <= 128 )) \
+        && [[ "${client_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+register_one_shot_container() {
+    local client_name="$1"
+    local identity_name="$2"
+    validate_one_shot_container_name "${client_name}" "${identity_name}" \
+        || return 1
+    if [[ -e "${ONE_SHOT_LEDGER}" && ! -f "${ONE_SHOT_LEDGER}" ]]; then
+        return 1
+    fi
+    local next_ledger
+    next_ledger="$(mktemp "${WORK_DIR}/one-shot-containers.next.XXXXXX")" \
+        || return 1
+    if [[ -f "${ONE_SHOT_LEDGER}" ]] \
+        && ! cp -- "${ONE_SHOT_LEDGER}" "${next_ledger}"; then
+        rm -f -- "${next_ledger}"
+        return 1
+    fi
+    if ! printf '%s\n' "${client_name}" >>"${next_ledger}" \
+        || ! mv -f -- "${next_ledger}" "${ONE_SHOT_LEDGER}"; then
+        rm -f -- "${next_ledger}"
+        return 1
+    fi
+}
+
 self_check() {
     local fake_docker_state='absent'
     local fake_one_shot='warpin-kes-self-check-one-shot'
+    local fake_created_name=''
+    local fake_container_present=0
+    local fake_create_marker="${WORK_DIR}/self-check-created-container"
+    local fake_create_count_file="${WORK_DIR}/self-check-create-count"
     local policy_file="${WORK_DIR}/self-check-kes.yml"
     local bootstrap_policy
     local runtime_policy
     local metrics_policy
     local secret_layout="${WORK_DIR}/self-check-secret-layout"
     docker() {
+        local argument
         case "${1:-} ${2:-}" in
             create\ *)
-                if [[ "${fake_docker_state}" == 'client-nonzero' ]]; then
-                    printf '%s\n' 'fake-one-shot-container-id'
+                local create_count=0
+                if [[ -f "${fake_create_count_file}" ]]; then
+                    create_count="$(<"${fake_create_count_file}")"
+                fi
+                printf '%s\n' "$((create_count + 1))" >"${fake_create_count_file}"
+                if [[ "${fake_docker_state}" == 'client-nonzero' \
+                    || "${fake_docker_state}" == 'after-create-interruption' \
+                    || "${fake_docker_state}" == 'ledger-append-failure' \
+                    || "${fake_docker_state}" == 'create-empty-id' ]]; then
+                    local previous_argument=''
+                    for argument in "${@:2}"; do
+                        if [[ "${previous_argument}" == '--name' ]]; then
+                            printf '%s\n' "${argument}" >"${fake_create_marker}"
+                            break
+                        fi
+                        previous_argument="${argument}"
+                    done
+                    if [[ "${fake_docker_state}" != 'create-empty-id' ]]; then
+                        printf '%s\n' 'fake-one-shot-container-id'
+                    fi
                     return 0
+                fi
+                if [[ "${fake_docker_state}" == 'create-failure' ]]; then
+                    return 55
                 fi
                 return 1
                 ;;
             'rm -f')
-                if [[ "${fake_docker_state}" == 'remove-failure' ]]; then
+                if [[ "${fake_docker_state:-absent}" == 'remove-failure' ]]; then
                     return 1
                 fi
-                if [[ "${fake_docker_state}" == 'one-shot-remove-failure' ]]; then
-                    local argument
+                if [[ "${fake_docker_state:-absent}" == 'one-shot-remove-failure' ]]; then
                     for argument in "${@:3}"; do
-                        if [[ "${argument}" == "${fake_one_shot}" ]]; then
+                        if [[ "${argument}" == "${fake_one_shot:-}" ]]; then
                             return 1
                         fi
                     done
                 fi
+                for argument in "${@:3}"; do
+                    if [[ -n "${fake_create_marker:-}" && -f "${fake_create_marker}" ]] \
+                        && [[ "${argument}" == "$(<"${fake_create_marker}")" ]]; then
+                        rm -f -- "${fake_create_marker}"
+                    fi
+                    if (( ${fake_container_present:-0} == 1 )) \
+                        && [[ "${argument}" == "${fake_created_name:-}" ]]; then
+                        fake_container_present=0
+                    fi
+                done
                 return 0
                 ;;
             'network rm')
-                [[ "${fake_docker_state}" != 'remove-failure' ]]
+                [[ "${fake_docker_state:-absent}" != 'remove-failure' ]]
                 ;;
             'container inspect'|'network inspect')
                 if [[ "${fake_docker_state}" == 'client-nonzero' && "${1:-}" == 'container' ]]; then
@@ -238,6 +309,35 @@ self_check() {
             return 42
         fi
         return 1
+    }
+    after_one_shot_create() {
+        if [[ "${fake_docker_state}" == 'after-create-interruption' ]]; then
+            fake_created_name="$(<"${fake_create_marker}")"
+            fake_container_present=1
+            cleanup_best_effort
+            return 130
+        fi
+        return 0
+    }
+    before_one_shot_create() {
+        if [[ "${fake_docker_state}" == 'before-create-interruption' ]]; then
+            return 130
+        fi
+        return 0
+    }
+    reset_one_shot_boundary_fixture() {
+        mkdir -p "${WORK_DIR}" "${KES_METRICS_DIR}" "${KES_SERVER_DIR}"
+        rm -rf -- "${ONE_SHOT_LEDGER}"
+        rm -f -- "${fake_create_marker}" "${fake_create_count_file}"
+        fake_created_name=''
+        fake_container_present=0
+    }
+    fake_create_count() {
+        if [[ -f "${fake_create_count_file}" ]]; then
+            printf '%s\n' "$(<"${fake_create_count_file}")"
+        else
+            printf '%s\n' 0
+        fi
     }
 
     render_kes_config "${policy_file}" bootstrap-id runtime-id metrics-id
@@ -313,6 +413,52 @@ self_check() {
             return 1
         fi
     done
+    local valid_client_name="${KES_ONE_SHOT_PREFIX}-metrics-Valid_1.2"
+    if ! register_one_shot_container "${valid_client_name}" metrics; then
+        echo 'self-check rejected a valid one-shot container name' >&2
+        return 1
+    fi
+    if [[ "$(<"${ONE_SHOT_LEDGER}")" != "${valid_client_name}" ]]; then
+        echo 'self-check did not register exactly one valid container name' >&2
+        return 1
+    fi
+    local overlong_suffix
+    printf -v overlong_suffix '%*s' 130 ''
+    overlong_suffix="${overlong_suffix// /a}"
+    local invalid_client_name
+    for invalid_client_name in \
+        "${KES_ONE_SHOT_PREFIX}-metrics-bad"$'\n''name' \
+        "${KES_ONE_SHOT_PREFIX}-metrics-bad/name" \
+        "-${KES_ONE_SHOT_PREFIX}-metrics-leading" \
+        "${KES_ONE_SHOT_PREFIX}-bootstrap-wrong-identity" \
+        "${KES_ONE_SHOT_PREFIX}-metrics-${overlong_suffix}"; do
+        if register_one_shot_container "${invalid_client_name}" metrics >/dev/null 2>&1; then
+            echo 'self-check accepted an invalid one-shot container name' >&2
+            return 1
+        fi
+    done
+    if [[ "$(wc -l <"${ONE_SHOT_LEDGER}")" -ne 1 ]]; then
+        echo 'self-check allowed an invalid name to alter the cleanup ledger' >&2
+        return 1
+    fi
+    local sequence
+    for sequence in {2..12}; do
+        if ! register_one_shot_container \
+            "${KES_ONE_SHOT_PREFIX}-metrics-history-${sequence}" \
+            metrics; then
+            echo 'self-check failed to append a sequential one-shot name' >&2
+            return 1
+        fi
+    done
+    if [[ "$(wc -l <"${ONE_SHOT_LEDGER}")" -ne 12 ]] \
+        || [[ "$(sort -u "${ONE_SHOT_LEDGER}" | wc -l)" -ne 12 ]] \
+        || [[ "$(head -n 1 "${ONE_SHOT_LEDGER}")" != "${valid_client_name}" ]] \
+        || [[ "$(tail -n 1 "${ONE_SHOT_LEDGER}")" \
+            != "${KES_ONE_SHOT_PREFIX}-metrics-history-12" ]]; then
+        echo 'self-check lost or replaced sequential cleanup-ledger names' >&2
+        return 1
+    fi
+    : >"${ONE_SHOT_LEDGER}"
     fake_docker_state='client-nonzero'
     local client_failure
     if client_failure="$(run_kes_client metrics metric 2>&1)"; then
@@ -327,6 +473,71 @@ self_check() {
         echo 'self-check found no structured nonzero one-shot error' >&2
         return 1
     fi
+    local -a boundary_failures=()
+
+    reset_one_shot_boundary_fixture
+    fake_docker_state='before-create-interruption'
+    if run_kes_client metrics metric >/dev/null 2>&1; then
+        boundary_failures+=('self-check accepted an interruption before docker create')
+    fi
+    if [[ ! -f "${ONE_SHOT_LEDGER}" ]] \
+        || [[ "$(wc -l <"${ONE_SHOT_LEDGER}")" -ne 1 ]]; then
+        boundary_failures+=('self-check did not register a name before a pre-create interruption')
+    fi
+    if [[ "$(fake_create_count)" -ne 0 || -e "${fake_create_marker}" ]]; then
+        boundary_failures+=('self-check created a container during a pre-create interruption')
+    fi
+
+    reset_one_shot_boundary_fixture
+    fake_docker_state='create-failure'
+    if run_kes_client metrics metric >/dev/null 2>&1; then
+        boundary_failures+=('self-check accepted a one-shot create failure')
+    fi
+    if [[ ! -f "${ONE_SHOT_LEDGER}" ]] \
+        || [[ "$(wc -l <"${ONE_SHOT_LEDGER}")" -ne 1 ]]; then
+        boundary_failures+=('self-check did not register a name before a create failure')
+    fi
+    cleanup_best_effort
+    if (( fake_container_present != 0 )) || [[ -e "${fake_create_marker}" ]]; then
+        boundary_failures+=('self-check could not clean a registered create failure')
+    fi
+
+    reset_one_shot_boundary_fixture
+    mkdir "${ONE_SHOT_LEDGER}"
+    fake_docker_state='ledger-append-failure'
+    if run_kes_client metrics metric >/dev/null 2>&1; then
+        boundary_failures+=('self-check accepted a cleanup-ledger append failure')
+    fi
+    if [[ "$(fake_create_count)" -ne 0 ]]; then
+        boundary_failures+=('self-check called docker create after ledger append failed')
+    fi
+
+    reset_one_shot_boundary_fixture
+    fake_docker_state='create-empty-id'
+    if run_kes_client metrics metric >/dev/null 2>&1; then
+        boundary_failures+=('self-check accepted an empty create container id')
+    fi
+    if [[ ! -f "${ONE_SHOT_LEDGER}" ]] \
+        || [[ "$(wc -l <"${ONE_SHOT_LEDGER}")" -ne 1 ]]; then
+        boundary_failures+=('self-check did not retain the registered name for an empty create id')
+    fi
+    if [[ -e "${fake_create_marker}" ]]; then
+        boundary_failures+=('self-check left the empty-id container present')
+    fi
+
+    reset_one_shot_boundary_fixture
+    fake_docker_state='after-create-interruption'
+    if run_kes_client metrics metric >/dev/null 2>&1; then
+        boundary_failures+=('self-check accepted an interrupted one-shot create')
+    fi
+    if (( fake_container_present != 0 )); then
+        boundary_failures+=('self-check left an unregistered interrupted container')
+    fi
+    if (( ${#boundary_failures[@]} > 0 )); then
+        printf '%s\n' "${boundary_failures[@]}" >&2
+        return 1
+    fi
+    mkdir -p "${WORK_DIR}"
     fake_docker_state='absent'
 
     cleanup_verified
@@ -441,6 +652,14 @@ start_one_shot_client() {
     timeout 5 docker start --attach "$1"
 }
 
+before_one_shot_create() {
+    :
+}
+
+after_one_shot_create() {
+    :
+}
+
 run_kes_client() {
     local identity_name="$1"
     shift
@@ -454,6 +673,14 @@ run_kes_client() {
     local identity_directory="${WORK_DIR}/kes/${identity_name}"
     local client_name
     client_name="$(allocate_one_shot_container_name "${identity_name}")"
+    if ! register_one_shot_container "${client_name}" "${identity_name}"; then
+        echo 'failed to register one-shot KES client for cleanup' >&2
+        return 1
+    fi
+    if ! before_one_shot_create; then
+        echo "one-shot KES ${identity_name} client interrupted before create" >&2
+        return 1
+    fi
     local container_id
     if ! container_id="$(docker create \
         --name "${client_name}" \
@@ -495,9 +722,8 @@ run_kes_client() {
         echo "one-shot KES ${identity_name} create returned no container id" >&2
         return 1
     fi
-    if ! printf '%s\n' "${client_name}" >>"${ONE_SHOT_LEDGER}"; then
-        docker rm -f "${client_name}" >/dev/null 2>&1 || true
-        echo 'failed to register one-shot KES client for cleanup' >&2
+    if ! after_one_shot_create; then
+        echo "one-shot KES ${identity_name} client interrupted after create" >&2
         return 1
     fi
     if ! assert_container_bind_mounts \

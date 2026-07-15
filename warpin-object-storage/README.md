@@ -147,8 +147,8 @@ The ignored Rust integration test and wrapper script verify:
   each see only their own pair;
 - twelve consecutive metrics snapshots through uniquely named one-shot
   containers, with complete output capture, strict single-document JSON
-  validation, explicit container removal, and a cleanup ledger for every
-  dynamically allocated client;
+  validation, explicit container removal, and a cleanup ledger that atomically
+  registers each validated single-line Docker name before container creation;
 - a random, least-privilege processing identity (root is bootstrap-only);
 - two context-bound physical objects for one logical key;
 - SSE-KMS response identity and attestation fingerprint equality;
@@ -167,6 +167,11 @@ any individually remaining static or dynamic container, network, or temporary
 directory cannot produce the cleanup success attestation. The live gate
 additionally compares the running KES and MinIO bind-mount sets and lists their
 visible secret directories from inside each container.
+
+A registered name whose `docker create` fails is a harmless absent cleanup
+entry. Once registration succeeds, every pre-create or post-create interruption
+is trap-visible; cleanup safely ignores absent names and removes any container
+that Docker created before the interruption.
 
 The pinned KES release exposes only status-labelled aggregate request metrics;
 it has no route labels and does not emit audit events for data-key generate or
