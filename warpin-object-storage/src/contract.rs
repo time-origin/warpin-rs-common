@@ -626,6 +626,11 @@ impl WriteBinding {
         &self.key
     }
 
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
+    pub(crate) const fn content_digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
     fn matches_receipt(&self, receipt: &ObjectWriteReceipt) -> bool {
         self.key == receipt.key
             && self.context_id == receipt.context_id

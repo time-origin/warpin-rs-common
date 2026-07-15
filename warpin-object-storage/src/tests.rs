@@ -5,7 +5,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,6 +13,8 @@ use std::{
 
 use bytes::Bytes;
 use object_store::{Extensions, path::Path};
+#[cfg(feature = "aws")]
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutOptions};
 #[cfg(feature = "fs")]
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
@@ -21,9 +23,11 @@ use super::*;
 #[cfg(feature = "aws")]
 use async_trait::async_trait;
 #[cfg(feature = "aws")]
+use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
+#[cfg(feature = "aws")]
 use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpRequest, HttpRequestBody, HttpResponse,
-    HttpResponseBody, HttpService,
+    ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpRequestBody,
+    HttpResponse, HttpResponseBody, HttpService,
 };
 #[cfg(feature = "aws")]
 use s3_adapter::{
@@ -101,6 +105,13 @@ fn readback_request(binding: WriteBinding) -> ObserverRequestBinding {
 }
 
 #[cfg(feature = "aws")]
+const TEST_SIGV4_SIGNATURE: &str =
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+#[cfg(feature = "aws")]
+const TEST_EMPTY_SHA256_HEX: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+#[cfg(feature = "aws")]
 fn signed_artifact_request(
     binding: ObserverRequestBinding,
     uri: &str,
@@ -114,15 +125,26 @@ fn signed_artifact_request(
     .parse()
     .expect("artifact method");
     *request.uri_mut() = uri.parse().expect("artifact URI");
+    let parsed_uri = Url::parse(uri).expect("absolute artifact URI");
+    let authority = &parsed_uri[url::Position::BeforeHost..url::Position::AfterPort];
+    request
+        .headers_mut()
+        .insert("host", authority.parse().expect("Host header"));
     request.headers_mut().insert(
         "x-amz-date",
         "20260715T000000Z".parse().expect("date header"),
     );
+    let content_sha = match binding.operation {
+        ObservedOperation::Put => binding
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.content_digest().as_str().strip_prefix("sha256:"))
+            .unwrap_or(TEST_EMPTY_SHA256_HEX),
+        ObservedOperation::Readback => TEST_EMPTY_SHA256_HEX,
+    };
     request.headers_mut().insert(
         "x-amz-content-sha256",
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .parse()
-            .expect("content SHA header"),
+        content_sha.parse().expect("content SHA header"),
     );
     let signed_headers = match binding.operation {
         ObservedOperation::Put => {
@@ -142,7 +164,7 @@ fn signed_artifact_request(
         "authorization",
         format!(
             "AWS4-HMAC-SHA256 Credential=TESTACCESS/20260715/{region}/s3/aws4_request, SignedHeaders={signed_headers}, Signature={}",
-            "0123456789abcdef".repeat(4)
+            TEST_SIGV4_SIGNATURE
         )
         .parse()
         .expect("authorization header"),
@@ -167,7 +189,7 @@ fn signed_put_request_with_kms_key(
         &mut request,
         region,
         "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id;x-amz-server-side-encryption-bucket-key-enabled",
-        &"0123456789abcdef".repeat(4),
+        TEST_SIGV4_SIGNATURE,
     );
     request
 }
@@ -207,6 +229,106 @@ impl HttpService for CountingHttpResponseService {
         *response.headers_mut() = self.headers.clone();
         Ok(response)
     }
+}
+
+#[cfg(feature = "aws")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActualRequestShape {
+    method: String,
+    uri: String,
+    headers: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "aws")]
+#[derive(Debug)]
+struct ActualCredentialShapeService {
+    requests: Arc<Mutex<Vec<ActualRequestShape>>>,
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl HttpService for ActualCredentialShapeService {
+    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let uri = request.uri().to_string();
+        let method = request.method().as_str().to_owned();
+        let headers = request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
+        self.requests
+            .lock()
+            .expect("request-shape lock")
+            .push(ActualRequestShape {
+                method: method.clone(),
+                uri: uri.clone(),
+                headers,
+            });
+
+        let body = match uri.as_str() {
+            "http://169.254.169.254/latest/api/token" => "actual-imdsv2-token".to_owned(),
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/" => {
+                "Runtime_Role+=,.@-".to_owned()
+            }
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/Runtime_Role+=,.@-"
+            | "http://169.254.170.2/v2/credentials/task-123?role=runtime%2Fworker" => {
+                r#"{"AccessKeyId":"ACTUALKEY","Code":"Success","Expiration":"2099-08-30T10:51:04Z","LastUpdated":"2026-07-16T10:21:04Z","SecretAccessKey":"ACTUALSECRET","Token":"ACTUALTOKEN","Type":"AWS-HMAC"}"#.to_owned()
+            }
+            _ => String::new(),
+        };
+        let mut response = HttpResponse::new(HttpResponseBody::new(HttpRequestBody::from(body)));
+        if uri.starts_with("https://") && method == "PUT" {
+            response
+                .headers_mut()
+                .insert("etag", "\"actual-etag\"".parse().expect("ETag response"));
+        } else if uri.starts_with("https://") && method == "GET" {
+            response
+                .headers_mut()
+                .insert("content-length", "0".parse().expect("content length"));
+        }
+        Ok(response)
+    }
+}
+
+#[cfg(feature = "aws")]
+#[derive(Clone, Debug)]
+struct ActualObjectStoreShapeConnector {
+    configured: ConfiguredS3Encryption,
+    inner: HttpClient,
+}
+
+#[cfg(feature = "aws")]
+impl HttpConnector for ActualObjectStoreShapeConnector {
+    fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
+        Ok(HttpClient::new(
+            self.configured.observer_service(self.inner.clone()),
+        ))
+    }
+}
+
+#[cfg(feature = "aws")]
+fn actual_object_store_with_observer(
+    url: &Url,
+    options: &BTreeMap<String, String>,
+    configured: ConfiguredS3Encryption,
+    inner: HttpClient,
+) -> AmazonS3 {
+    let mut builder = AmazonS3Builder::new()
+        .with_url(url.as_str())
+        .with_http_connector(ActualObjectStoreShapeConnector { configured, inner });
+    for (key, value) in options {
+        builder = builder.with_config(
+            key.parse::<AmazonS3ConfigKey>()
+                .expect("reviewed S3 configuration key"),
+            value,
+        );
+    }
+    builder.build().expect("actual object_store S3 client")
 }
 
 #[test]
@@ -381,6 +503,71 @@ fn managed_s3_credentials_require_one_complete_mutually_exclusive_mode() {
 
 #[cfg(feature = "aws")]
 #[test]
+fn managed_s3_rejects_every_removed_credential_surface_even_when_complete() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let token = credential_token_file("removed-modes", b"opaque-token");
+    let token = token.to_str().expect("UTF-8 token path");
+
+    let rejected = [
+        with_credential_options(&[
+            (
+                "aws_container_credentials_full_uri",
+                "http://169.254.170.23/v1/credentials",
+            ),
+            ("aws_container_authorization_token_file", token),
+        ]),
+        with_credential_options(&[
+            (
+                "container_credentials_full_uri",
+                "http://169.254.170.23/v1/credentials",
+            ),
+            ("container_authorization_token_file", token),
+        ]),
+        with_credential_options(&[
+            ("aws_web_identity_token_file", token),
+            ("aws_role_arn", "arn:aws:iam::123456789012:role/runtime"),
+        ]),
+        with_credential_options(&[
+            ("web_identity_token_file", token),
+            ("role_arn", "arn:aws:iam::123456789012:role/runtime"),
+        ]),
+        with_credential_options(&[
+            ("aws_web_identity_token_file", token),
+            ("aws_role_arn", "arn:aws:iam::123456789012:role/runtime"),
+            ("aws_role_session_name", "runtime-session"),
+        ]),
+        with_credential_options(&[
+            ("web_identity_token_file", token),
+            ("role_arn", "arn:aws:iam::123456789012:role/runtime"),
+            ("role_session_name", "runtime-session"),
+        ]),
+        with_credential_options(&[
+            ("aws_web_identity_token_file", token),
+            ("aws_role_arn", "arn:aws:iam::123456789012:role/runtime"),
+            (
+                "aws_endpoint_url_sts",
+                "https://sts.us-east-1.amazonaws.com",
+            ),
+        ]),
+        with_credential_options(&[
+            ("web_identity_token_file", token),
+            ("role_arn", "arn:aws:iam::123456789012:role/runtime"),
+            ("endpoint_url_sts", "https://sts.us-east-1.amazonaws.com"),
+        ]),
+    ];
+
+    for options in rejected {
+        assert_eq!(
+            ConfiguredS3Encryption::from_options(&url, &options, None, None),
+            Err(ObjectStorageError::InvalidConfiguration)
+        );
+    }
+
+    fs::remove_file(token).expect("remove removed-mode token fixture");
+}
+
+#[cfg(feature = "aws")]
+#[test]
 fn managed_s3_imds_is_exact_link_local_and_v2_only_for_every_alias() {
     let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
     for (key, value) in [
@@ -426,7 +613,6 @@ fn managed_s3_rejects_credential_target_aliases_before_store_construction() {
     for relative_uri in [
         "v2/credentials/task",
         "//@evil.example/credentials",
-        "/v2/credentials/task?token=secret",
         "/v2/credentials/task#fragment",
         "/v2/../credentials/task",
         "/v2/credentials/%2e%2e/task",
@@ -437,6 +623,17 @@ fn managed_s3_rejects_credential_target_aliases_before_store_construction() {
             ConfiguredS3Encryption::from_options(&url, &options, None, None),
             Err(ObjectStorageError::InvalidConfiguration),
             "malicious ECS relative URI must fail closed"
+        );
+    }
+    for relative_uri in [
+        "/v2/credentials/task",
+        "/v2/credentials/task?role=runtime%2Fworker",
+    ] {
+        let options =
+            with_credential_options(&[("aws_container_credentials_relative_uri", relative_uri)]);
+        assert!(
+            ConfiguredS3Encryption::from_options(&url, &options, None, None).is_ok(),
+            "AWS ECS relative URI shape must remain supported"
         );
     }
     for full_uri in [
@@ -469,169 +666,6 @@ fn managed_s3_rejects_credential_target_aliases_before_store_construction() {
     ]);
     assert_eq!(
         ConfiguredS3Encryption::from_options(&url, &custom_sts, None, None),
-        Err(ObjectStorageError::InvalidConfiguration)
-    );
-}
-
-#[cfg(feature = "aws")]
-#[test]
-fn managed_s3_eks_and_web_identity_require_bounded_regular_token_files() {
-    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
-    let valid = credential_token_file("valid", b"opaque-token");
-    let oversized = credential_token_file("oversized", &vec![b'x'; 16 * 1024 + 1]);
-    let directory = std::env::temp_dir();
-
-    let eks = with_credential_options(&[
-        (
-            "aws_container_credentials_full_uri",
-            "http://169.254.170.23/v1/credentials",
-        ),
-        (
-            "aws_container_authorization_token_file",
-            valid.to_str().expect("UTF-8 token path"),
-        ),
-    ]);
-    assert!(ConfiguredS3Encryption::from_options(&url, &eks, None, None).is_ok());
-    let loopback_eks = with_credential_options(&[
-        (
-            "aws_container_credentials_full_uri",
-            "http://127.0.0.1:8181/v1/credentials",
-        ),
-        (
-            "aws_container_authorization_token_file",
-            valid.to_str().expect("UTF-8 token path"),
-        ),
-    ]);
-    assert!(ConfiguredS3Encryption::from_options(&url, &loopback_eks, None, None).is_ok());
-
-    let web = with_credential_options(&[
-        (
-            "aws_web_identity_token_file",
-            valid.to_str().expect("UTF-8 token path"),
-        ),
-        ("aws_role_arn", "arn:aws:iam::123456789012:role/runtime"),
-        (
-            "aws_endpoint_url_sts",
-            "https://sts.us-east-1.amazonaws.com",
-        ),
-    ]);
-    assert!(ConfiguredS3Encryption::from_options(&url, &web, None, None).is_ok());
-    let empty_role_name = with_credential_options(&[
-        (
-            "aws_web_identity_token_file",
-            valid.to_str().expect("UTF-8 token path"),
-        ),
-        ("aws_role_arn", "arn:aws:iam::123456789012:role/"),
-    ]);
-    assert_eq!(
-        ConfiguredS3Encryption::from_options(&url, &empty_role_name, None, None),
-        Err(ObjectStorageError::InvalidConfiguration)
-    );
-    let mut china_partition = exact_target_options("cn-north-1");
-    china_partition.extend([
-        (
-            "aws_web_identity_token_file".to_owned(),
-            valid.to_str().expect("UTF-8 token path").to_owned(),
-        ),
-        (
-            "aws_role_arn".to_owned(),
-            "arn:aws-cn:iam::123456789012:role/runtime".to_owned(),
-        ),
-        (
-            "aws_endpoint_url_sts".to_owned(),
-            "https://sts.cn-north-1.amazonaws.com.cn".to_owned(),
-        ),
-    ]);
-    assert!(
-        ConfiguredS3Encryption::from_options(&url, &china_partition, None, None).is_ok(),
-        "official partition and regional STS endpoint"
-    );
-    china_partition.insert(
-        "aws_endpoint_url_sts".to_owned(),
-        "https://sts.cn-north-1.amazonaws.com".to_owned(),
-    );
-    assert_eq!(
-        ConfiguredS3Encryption::from_options(&url, &china_partition, None, None),
-        Err(ObjectStorageError::InvalidConfiguration)
-    );
-
-    for token_path in [
-        oversized.to_str().expect("UTF-8 token path"),
-        directory.to_str().expect("UTF-8 directory path"),
-        "relative/token",
-    ] {
-        let options = with_credential_options(&[
-            (
-                "aws_container_credentials_full_uri",
-                "http://169.254.170.23/v1/credentials",
-            ),
-            ("aws_container_authorization_token_file", token_path),
-        ]);
-        assert_eq!(
-            ConfiguredS3Encryption::from_options(&url, &options, None, None),
-            Err(ObjectStorageError::InvalidConfiguration)
-        );
-    }
-
-    fs::remove_file(valid).expect("remove valid token fixture");
-    fs::remove_file(oversized).expect("remove oversized token fixture");
-}
-
-#[cfg(feature = "aws")]
-#[test]
-fn typed_https_credential_origin_is_required_for_nonstandard_eks_targets() {
-    let token = credential_token_file("trusted-origin", b"opaque-token");
-    let origin =
-        s3_adapter::TrustedCredentialHttpsOrigin::parse("https://credentials.internal.example/")
-            .expect("typed HTTPS origin");
-    let settings = s3_adapter::with_aws_s3_object_context_profile(
-        ObjectStoreSettings::new("s3://tenant-artifacts/private-prefix")
-            .with_option("aws_region", "us-east-1")
-            .with_option("aws_server_side_encryption", "aws:kms")
-            .with_option("aws_sse_bucket_key_enabled", "false")
-            .with_option(
-                "aws_container_credentials_full_uri",
-                "https://credentials.internal.example/v1/credentials",
-            )
-            .with_option(
-                "aws_container_authorization_token_file",
-                token.to_str().expect("UTF-8 token path"),
-            )
-            .with_trusted_credential_https_origin(origin),
-    );
-
-    VerifiedObjectStorage::from_settings(settings).expect("typed trusted EKS target");
-    fs::remove_file(token).expect("remove token fixture");
-}
-
-#[cfg(feature = "aws")]
-#[test]
-fn trusted_credential_origins_are_bounded_unique_and_debug_safe() {
-    let raw_origin = "https://private-credential-host.example/";
-    let origin =
-        s3_adapter::TrustedCredentialHttpsOrigin::parse(raw_origin).expect("typed HTTPS origin");
-    let rendered = format!("{origin:?}");
-    assert!(!rendered.contains("private-credential-host"));
-
-    let duplicate = ObjectStoreSettings::new("s3://tenant-artifacts")
-        .with_trusted_credential_https_origin(origin.clone())
-        .with_trusted_credential_https_origin(origin.clone());
-    assert_eq!(
-        VerifiedObjectStorage::from_settings(duplicate).map(|_| ()),
-        Err(ObjectStorageError::InvalidConfiguration)
-    );
-
-    let mut excessive = ObjectStoreSettings::new("s3://tenant-artifacts");
-    for index in 0..9 {
-        excessive = excessive.with_trusted_credential_https_origin(
-            s3_adapter::TrustedCredentialHttpsOrigin::parse(format!(
-                "https://credentials-{index}.internal.example/"
-            ))
-            .expect("typed HTTPS origin"),
-        );
-    }
-    assert_eq!(
-        VerifiedObjectStorage::from_settings(excessive).map(|_| ()),
         Err(ObjectStorageError::InvalidConfiguration)
     );
 }
@@ -762,6 +796,50 @@ fn minio_target_requires_exact_https_path_style_endpoint() {
         ),
         Err(ObjectStorageError::InvalidConfiguration)
     );
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn minio_sigv4_host_requires_the_exact_nondefault_authority_port() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let mut options = exact_target_options("us-east-1");
+    options.insert(
+        "aws_endpoint".to_owned(),
+        "https://minio.internal.example:9443/api".to_owned(),
+    );
+    let configured = ConfiguredS3Encryption::from_options(
+        &url,
+        &options,
+        Some(minio_kes_object_context_profile_id()),
+        None,
+    )
+    .expect("MinIO path-style configuration");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
+        calls: Arc::clone(&calls),
+        status: 200,
+        headers: object_store::HeaderMap::new(),
+    }));
+    let uri = "https://minio.internal.example:9443/api/tenant-artifacts/private-prefix/objects/encrypted.json";
+    let binding = || {
+        ObserverRequestBinding::put(
+            WriteBinding::new(&receipt(false)),
+            Path::parse("private-prefix/objects/encrypted.json").expect("path"),
+        )
+    };
+
+    service
+        .call(signed_artifact_request(binding(), uri, "us-east-1"))
+        .await
+        .expect("exact nondefault Host port");
+
+    let mut missing_port = signed_artifact_request(binding(), uri, "us-east-1");
+    missing_port.headers_mut().insert(
+        "host",
+        "minio.internal.example".parse().expect("missing-port Host"),
+    );
+    assert!(service.call(missing_port).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(feature = "aws")]
@@ -1530,7 +1608,7 @@ async fn observer_rejects_artifact_signatures_that_do_not_cover_required_sse_sha
         "authorization",
         format!(
             "AWS4-HMAC-SHA256 Credential=TESTACCESS/20260715/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature={}",
-            "a".repeat(64)
+            TEST_SIGV4_SIGNATURE
         )
         .parse()
         .expect("weak authorization"),
@@ -1609,7 +1687,7 @@ async fn observer_requires_exact_signed_put_sse_and_get_content_hash() {
         &mut unsigned_key,
         "eu-west-1",
         "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled",
-        &"0123456789abcdef".repeat(4),
+        TEST_SIGV4_SIGNATURE,
     );
     invalid_puts.push(unsigned_key);
 
@@ -1619,7 +1697,7 @@ async fn observer_requires_exact_signed_put_sse_and_get_content_hash() {
         &mut unsigned_bucket_key,
         "eu-west-1",
         "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id",
-        &"0123456789abcdef".repeat(4),
+        TEST_SIGV4_SIGNATURE,
     );
     invalid_puts.push(unsigned_bucket_key);
 
@@ -1629,7 +1707,7 @@ async fn observer_requires_exact_signed_put_sse_and_get_content_hash() {
         &mut unsigned_content,
         "eu-west-1",
         "host;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id;x-amz-server-side-encryption-bucket-key-enabled",
-        &"0123456789abcdef".repeat(4),
+        TEST_SIGV4_SIGNATURE,
     );
     invalid_puts.push(unsigned_content);
 
@@ -1663,11 +1741,265 @@ async fn observer_requires_exact_signed_put_sse_and_get_content_hash() {
         &mut unsigned_get,
         "eu-west-1",
         "host;x-amz-date",
-        &"0123456789abcdef".repeat(4),
+        TEST_SIGV4_SIGNATURE,
     );
     assert!(service.call(unsigned_get).await.is_err());
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn observer_rejects_host_digest_binding_and_kms_presence_forgery_before_io() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("managed S3 configuration");
+    let receipt = receipt(false);
+    let put_uri = "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json";
+    let get_uri = "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/objects/encrypted.json?versionId=opaque-version";
+
+    let mut missing_host = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    missing_host.headers_mut().remove("host");
+
+    let mut conflicting_host = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    conflicting_host
+        .headers_mut()
+        .insert("host", "s3.evil.example".parse().expect("conflicting Host"));
+
+    let mut random_put_digest = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    random_put_digest.headers_mut().insert(
+        "x-amz-content-sha256",
+        "4e8fb7a4fca2e6eb16bca3ad2c6ec3dbf7bf86f91cc7b16e05e37977134f8491"
+            .parse()
+            .expect("random content digest"),
+    );
+
+    let mut random_get_digest = signed_artifact_request(
+        readback_request(WriteBinding::new(&receipt)),
+        get_uri,
+        "eu-west-1",
+    );
+    random_get_digest.headers_mut().insert(
+        "x-amz-content-sha256",
+        "4e8fb7a4fca2e6eb16bca3ad2c6ec3dbf7bf86f91cc7b16e05e37977134f8491"
+            .parse()
+            .expect("random content digest"),
+    );
+
+    let mut unexpected_kms_key = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    unexpected_kms_key.headers_mut().insert(
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "kms-key-one".parse().expect("unexpected KMS key"),
+    );
+    replace_test_authorization(
+        &mut unexpected_kms_key,
+        "eu-west-1",
+        "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id;x-amz-server-side-encryption-bucket-key-enabled",
+        TEST_SIGV4_SIGNATURE,
+    );
+
+    let missing_binding = ObserverRequestBinding {
+        binding: None,
+        operation: ObservedOperation::Put,
+        expected_location: Path::parse("objects/encrypted.json").expect("location"),
+        expected_version: None,
+    };
+    let missing_binding = signed_artifact_request(missing_binding, put_uri, "eu-west-1");
+
+    let mut nonexistent_signed_header = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    replace_test_authorization(
+        &mut nonexistent_signed_header,
+        "eu-west-1",
+        "host;x-amz-content-sha256;x-amz-date;x-amz-meta-forged;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled",
+        TEST_SIGV4_SIGNATURE,
+    );
+
+    let mut duplicate_authorization = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    duplicate_authorization.headers_mut().append(
+        "authorization",
+        format!(
+            "AWS4-HMAC-SHA256 Credential=TESTACCESS/20260715/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled, Signature={TEST_SIGV4_SIGNATURE}"
+        )
+        .parse()
+        .expect("duplicate authorization"),
+    );
+
+    let mut duplicate_signed_name = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    replace_test_authorization(
+        &mut duplicate_signed_name,
+        "eu-west-1",
+        "host;host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled",
+        TEST_SIGV4_SIGNATURE,
+    );
+
+    let mut noncanonical_signed_name = signed_artifact_request(
+        put_request(WriteBinding::new(&receipt)),
+        put_uri,
+        "eu-west-1",
+    );
+    replace_test_authorization(
+        &mut noncanonical_signed_name,
+        "eu-west-1",
+        "Host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled",
+        TEST_SIGV4_SIGNATURE,
+    );
+
+    for forged in [
+        missing_host,
+        conflicting_host,
+        random_put_digest,
+        random_get_digest,
+        unexpected_kms_key,
+        missing_binding,
+        nonexistent_signed_header,
+        duplicate_authorization,
+        duplicate_signed_name,
+        noncanonical_signed_name,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
+            calls: Arc::clone(&calls),
+            status: 200,
+            headers: object_store::HeaderMap::new(),
+        }));
+        assert!(service.call(forged).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn actual_object_store_artifact_requests_retain_exact_host_digest_and_kms_signature_shape() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let mut options = exact_target_options("eu-west-1");
+    options.extend([
+        ("aws_access_key_id".to_owned(), "ACTUALKEY".to_owned()),
+        (
+            "aws_secret_access_key".to_owned(),
+            "ACTUALSECRET".to_owned(),
+        ),
+        ("aws_sse_kms_key_id".to_owned(), "kms-key-one".to_owned()),
+    ]);
+    let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
+        .expect("static managed S3 configuration");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let store = actual_object_store_with_observer(
+        &url,
+        &options,
+        configured,
+        HttpClient::new(ActualCredentialShapeService {
+            requests: Arc::clone(&requests),
+        }),
+    );
+    let receipt = receipt(false);
+    let location = Path::parse("objects/encrypted.json").expect("location");
+    let mut put_extensions = Extensions::new();
+    put_extensions.insert(ObserverRequestBinding::put(
+        WriteBinding::new(&receipt),
+        location.clone(),
+    ));
+
+    store
+        .put_opts(
+            &location,
+            Bytes::from_static(b"encrypted").into(),
+            PutOptions {
+                extensions: put_extensions,
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("actual object_store signed PUT");
+
+    let mut get_extensions = Extensions::new();
+    get_extensions.insert(ObserverRequestBinding::read(location.clone(), None));
+    store
+        .get_opts(
+            &location,
+            GetOptions {
+                extensions: get_extensions,
+                ..GetOptions::default()
+            },
+        )
+        .await
+        .expect("actual object_store signed GET");
+
+    let requests = requests.lock().expect("request-shape lock").clone();
+    assert_eq!(requests.len(), 2);
+    let expected_host = "s3.eu-west-1.amazonaws.com";
+    let expected_put_sha = receipt
+        .digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("typed digest prefix");
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[0].headers.get("host").map(String::as_str),
+        Some(expected_host)
+    );
+    assert_eq!(
+        requests[1].headers.get("host").map(String::as_str),
+        Some(expected_host)
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-amz-content-sha256")
+            .map(String::as_str),
+        Some(expected_put_sha)
+    );
+    assert_eq!(
+        requests[1]
+            .headers
+            .get("x-amz-content-sha256")
+            .map(String::as_str),
+        Some(TEST_EMPTY_SHA256_HEX)
+    );
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .map(String::as_str),
+        Some("kms-key-one")
+    );
+    let put_authorization = requests[0]
+        .headers
+        .get("authorization")
+        .expect("actual PUT authorization");
+    assert!(put_authorization.contains("SignedHeaders="));
+    assert!(put_authorization.contains("host"));
+    assert!(put_authorization.contains("x-amz-content-sha256"));
+    assert!(put_authorization.contains("x-amz-server-side-encryption-aws-kms-key-id"));
 }
 
 #[cfg(feature = "aws")]
@@ -1799,6 +2131,21 @@ async fn observer_allows_only_exact_imdsv2_request_shapes() {
     );
     service.call(role).await.expect("exact role request");
 
+    let mut credentials = HttpRequest::new(HttpRequestBody::empty());
+    *credentials.method_mut() = "GET".parse().expect("GET method");
+    *credentials.uri_mut() =
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/Runtime_Role+=,.@-"
+            .parse()
+            .expect("credentials URI");
+    credentials.headers_mut().insert(
+        "x-aws-ec2-metadata-token",
+        "opaque-imdsv2-token".parse().expect("token header"),
+    );
+    service
+        .call(credentials)
+        .await
+        .expect("exact one-segment IAM role-name request");
+
     for target in [
         "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
         "http://127.0.0.1/latest/api/token",
@@ -1809,7 +2156,77 @@ async fn observer_allows_only_exact_imdsv2_request_shapes() {
         *malicious.uri_mut() = target.parse().expect("malicious URI");
         assert!(service.call(malicious).await.is_err());
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    for role_name in [
+        "role/nested",
+        "role:invalid",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let mut malicious = HttpRequest::new(HttpRequestBody::empty());
+        *malicious.method_mut() = "GET".parse().expect("GET method");
+        *malicious.uri_mut() =
+            format!("http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}")
+                .parse()
+                .expect("invalid role URI");
+        malicious.headers_mut().insert(
+            "x-aws-ec2-metadata-token",
+            "opaque-imdsv2-token".parse().expect("token header"),
+        );
+        assert!(service.call(malicious).await.is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn actual_object_store_imdsv2_provider_uses_only_the_frozen_three_request_shapes() {
+    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
+    let options = exact_target_options("us-east-1");
+    let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
+        .expect("IMDSv2 credential configuration");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let store = actual_object_store_with_observer(
+        &url,
+        &options,
+        configured,
+        HttpClient::new(ActualCredentialShapeService {
+            requests: Arc::clone(&requests),
+        }),
+    );
+
+    let _ = store
+        .get(&Path::parse("objects/probe").expect("probe path"))
+        .await;
+
+    let requests = requests.lock().expect("request-shape lock").clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[0].uri, "http://169.254.169.254/latest/api/token");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-aws-ec2-metadata-token-ttl-seconds")
+            .map(String::as_str),
+        Some("600")
+    );
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].uri,
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    );
+    assert_eq!(
+        requests[2].uri,
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/Runtime_Role+=,.@-"
+    );
+    for request in &requests[1..] {
+        assert_eq!(
+            request
+                .headers
+                .get("x-aws-ec2-metadata-token")
+                .map(String::as_str),
+            Some("actual-imdsv2-token")
+        );
+        assert!(!request.headers.contains_key("authorization"));
+    }
 }
 
 #[cfg(feature = "aws")]
@@ -1851,142 +2268,37 @@ async fn observer_binds_ecs_method_authority_and_relative_path() {
 
 #[cfg(feature = "aws")]
 #[tokio::test]
-async fn observer_binds_eks_target_and_authorization_token_separately() {
-    let token_path = credential_token_file("eks-observer", b"SECRET_TEST_TOKEN_987");
+async fn actual_object_store_ecs_provider_preserves_relative_query_at_fixed_authority() {
     let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
-    let options = with_credential_options(&[
-        (
-            "aws_container_credentials_full_uri",
-            "http://169.254.170.23/v1/credentials",
-        ),
-        (
-            "aws_container_authorization_token_file",
-            token_path.to_str().expect("UTF-8 token path"),
-        ),
-    ]);
+    let options = with_credential_options(&[(
+        "aws_container_credentials_relative_uri",
+        "/v2/credentials/task-123?role=runtime%2Fworker",
+    )]);
     let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
-        .expect("EKS credential configuration");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
-        calls: Arc::clone(&calls),
-        status: 200,
-        headers: object_store::HeaderMap::new(),
-    }));
-
-    let mut exact = HttpRequest::new(HttpRequestBody::empty());
-    *exact.method_mut() = "GET".parse().expect("GET method");
-    *exact.uri_mut() = "http://169.254.170.23/v1/credentials"
-        .parse()
-        .expect("EKS URI");
-    exact.headers_mut().insert(
-        "authorization",
-        "SECRET_TEST_TOKEN_987".parse().expect("authorization"),
+        .expect("ECS credential configuration");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let store = actual_object_store_with_observer(
+        &url,
+        &options,
+        configured,
+        HttpClient::new(ActualCredentialShapeService {
+            requests: Arc::clone(&requests),
+        }),
     );
-    service.call(exact).await.expect("exact EKS request");
 
-    for (target, token) in [
-        (
-            "http://169.254.170.23/v1/credentials",
-            "DIFFERENT_SECRET_TOKEN",
-        ),
-        (
-            "http://169.254.170.2/v1/credentials",
-            "SECRET_TEST_TOKEN_987",
-        ),
-        (
-            "http://169.254.170.23/v1/credentials?secret=true",
-            "SECRET_TEST_TOKEN_987",
-        ),
-    ] {
-        let mut malicious = HttpRequest::new(HttpRequestBody::empty());
-        *malicious.method_mut() = "GET".parse().expect("GET method");
-        *malicious.uri_mut() = target.parse().expect("malicious URI");
-        malicious
-            .headers_mut()
-            .insert("authorization", token.parse().expect("authorization"));
-        let error = service
-            .call(malicious)
-            .await
-            .expect_err("invalid EKS request");
-        let rendered = format!("{error:?} {error}");
-        assert!(!rendered.contains("SECRET_TEST_TOKEN_987"));
-        assert!(!rendered.contains("DIFFERENT_SECRET_TOKEN"));
-    }
-    fs::write(&token_path, b"ROTATED_SECRET_TOKEN").expect("rotate EKS token fixture");
-    let mut rotated = HttpRequest::new(HttpRequestBody::empty());
-    *rotated.method_mut() = "GET".parse().expect("GET method");
-    *rotated.uri_mut() = "http://169.254.170.23/v1/credentials"
-        .parse()
-        .expect("EKS URI");
-    rotated.headers_mut().insert(
-        "authorization",
-        "ROTATED_SECRET_TOKEN".parse().expect("rotated token"),
+    let _ = store
+        .get(&Path::parse("objects/probe").expect("probe path"))
+        .await;
+
+    let requests = requests.lock().expect("request-shape lock").clone();
+    assert_eq!(
+        requests,
+        [ActualRequestShape {
+            method: "GET".to_owned(),
+            uri: "http://169.254.170.2/v2/credentials/task-123?role=runtime%2Fworker".to_owned(),
+            headers: BTreeMap::new(),
+        }]
     );
-    assert!(service.call(rotated).await.is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    fs::remove_file(token_path).expect("remove EKS token fixture");
-}
-
-#[cfg(feature = "aws")]
-#[tokio::test]
-async fn observer_binds_web_identity_to_official_sts_query_shape() {
-    let token_path = credential_token_file("web-observer", b"SECRET_WEB_TOKEN_987");
-    let url = Url::parse("s3://tenant-artifacts").expect("S3 URL");
-    let role_arn = "arn:aws:iam::123456789012:role/runtime";
-    let options = with_credential_options(&[
-        (
-            "aws_web_identity_token_file",
-            token_path.to_str().expect("UTF-8 token path"),
-        ),
-        ("aws_role_arn", role_arn),
-        ("aws_role_session_name", "runtime-session"),
-    ]);
-    let configured = ConfiguredS3Encryption::from_options(&url, &options, None, None)
-        .expect("web identity credential configuration");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let service = configured.observer_service(HttpClient::new(CountingHttpResponseService {
-        calls: Arc::clone(&calls),
-        status: 200,
-        headers: object_store::HeaderMap::new(),
-    }));
-
-    let web_request = |token: &str, endpoint: &str| {
-        let mut target = Url::parse(endpoint).expect("STS endpoint");
-        target.query_pairs_mut().extend_pairs([
-            ("Action", "AssumeRoleWithWebIdentity"),
-            ("DurationSeconds", "3600"),
-            ("RoleArn", role_arn),
-            ("RoleSessionName", "runtime-session"),
-            ("Version", "2011-06-15"),
-            ("WebIdentityToken", token),
-        ]);
-        let mut request = HttpRequest::new(HttpRequestBody::empty());
-        *request.method_mut() = "POST".parse().expect("POST method");
-        *request.uri_mut() = target.as_str().parse().expect("STS URI");
-        request
-    };
-
-    service
-        .call(web_request(
-            "SECRET_WEB_TOKEN_987",
-            "https://sts.us-east-1.amazonaws.com",
-        ))
-        .await
-        .expect("exact official STS request");
-    for request in [
-        web_request("DIFFERENT_WEB_TOKEN", "https://sts.us-east-1.amazonaws.com"),
-        web_request("SECRET_WEB_TOKEN_987", "https://sts.evil.example"),
-    ] {
-        let error = service
-            .call(request)
-            .await
-            .expect_err("invalid STS request");
-        let rendered = format!("{error:?} {error}");
-        assert!(!rendered.contains("SECRET_WEB_TOKEN_987"));
-        assert!(!rendered.contains("DIFFERENT_WEB_TOKEN"));
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    fs::remove_file(token_path).expect("remove web token fixture");
 }
 
 #[cfg(feature = "aws")]

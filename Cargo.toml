@@ -68,7 +68,9 @@ uuid = { version = "1.22.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 bytes = "1"
 url = "2.5.8"
-object_store = { version = "0.14.0", default-features = false }
+# 0.14.0 retains the URI authority in the signed Host request header. The
+# managed-S3 observer verifies that exact header; 0.14.1 removes it post-sign.
+object_store = { version = "=0.14.0", default-features = false }
 
 # ── 消息队列 ──
 rdkafka = { version = "0.39.0", features = ["tokio"] }

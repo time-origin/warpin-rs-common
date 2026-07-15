@@ -130,19 +130,32 @@ wrapping.
 - Credential modes are now typed, complete, and mutually exclusive. Static
   credentials require both key halves; an omitted mode means strict standard
   IMDSv2. IMDSv1 aliases, custom metadata endpoints, mixed modes, and malformed
-  ECS/EKS targets fail before network I/O.
-- ECS accepts only an absolute relative path at `169.254.170.2`. EKS requires a
-  standard loopback/link-local full URI or an explicit parsed
-  `TrustedCredentialHttpsOrigin`, plus an absolute regular token file no larger
-  than 16 KiB. Web identity uses only the official partition/region STS target.
+  ECS targets fail before network I/O.
+- IMDSv2 is fixed to `169.254.169.254`. Its role-list path is exact and the
+  credential path accepts one IAM role-name segment of at most 64 bytes using
+  `[A-Za-z0-9_+=,.@-]`.
+- ECS accepts an absolute relative URI, including an exact query when present,
+  only at fixed authority `169.254.170.2`.
+- EKS full URI, container authorization-token files, EKS Pod Identity,
+  IRSA/web identity, role options, trusted credential origins, and custom STS
+  endpoints are unsupported in 0.2.0. Canonical and legacy spellings fail
+  before builder construction or network I/O. Future support requires a typed,
+  self-owned, pinned credential provider; AstroNexus Runtime R4 does not promise
+  EKS/IRSA support.
 - A private CA is provided as PEM bytes through
   `with_trusted_root_certificate_pem`; do not use provider-specific custom-CA
   options.
 - Exact target verification uses the S3 SigV4 canonical path encoding. Do not
   pre-encode object keys or compare decoded URI aliases.
 - Every managed PUT and GET is privately classified as an artifact request.
-  SSE and content-hash headers must be signed, and ordinary/restart reads retain
-  exact target/version binding without manufacturing write-attestation evidence.
+  Host must equal the exact URI authority, PUT content SHA must equal the private
+  write-binding digest, GET content SHA must equal the empty-content digest, and
+  the configured KMS-key header must be both present and signed or both absent.
+  Ordinary/restart reads retain exact target/version binding without
+  manufacturing write-attestation evidence.
+- The crate pins `object_store` to exactly 0.14.0 because its signed requests
+  retain the real Host header required by the observer. Upgrade only with real
+  request-shape regression evidence.
 
 ## Rollout guidance
 

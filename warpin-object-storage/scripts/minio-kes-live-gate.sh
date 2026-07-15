@@ -22,12 +22,23 @@ readonly WORKSPACE_DIR="$(cd -- "${CRATE_DIR}/.." && pwd)"
 readonly RUN_TOKEN="$$-$(date +%s)"
 readonly KES_NAME="warpin-kes-gate-${RUN_TOKEN}"
 readonly MINIO_NAME="warpin-minio-gate-${RUN_TOKEN}"
+readonly KES_BOOTSTRAP_CLIENT_NAME="warpin-kes-bootstrap-gate-${RUN_TOKEN}"
+readonly KES_METRICS_CLIENT_NAME="warpin-kes-metrics-gate-${RUN_TOKEN}"
 readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
 readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
+readonly KES_SERVER_DIR="${WORK_DIR}/kes/server"
+readonly KES_KEYSTORE_DIR="${WORK_DIR}/kes/keystore"
+readonly KES_BOOTSTRAP_DIR="${WORK_DIR}/kes/bootstrap"
+readonly KES_RUNTIME_DIR="${WORK_DIR}/kes/runtime"
+readonly KES_METRICS_DIR="${WORK_DIR}/kes/metrics"
 
 cleanup_best_effort() {
-    docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1 || true
+    docker rm -f \
+        "${MINIO_NAME}" \
+        "${KES_NAME}" \
+        "${KES_BOOTSTRAP_CLIENT_NAME}" \
+        "${KES_METRICS_CLIENT_NAME}" >/dev/null 2>&1 || true
     docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1 || true
     rm -rf -- "${WORK_DIR}" || true
 }
@@ -38,6 +49,13 @@ cleanup_verified() {
     if ! docker rm -f "${MINIO_NAME}" "${KES_NAME}" >/dev/null 2>&1; then
         failed=1
     fi
+    local one_shot
+    for one_shot in "${KES_BOOTSTRAP_CLIENT_NAME}" "${KES_METRICS_CLIENT_NAME}"; do
+        if docker container inspect "${one_shot}" >/dev/null 2>&1 \
+            && ! docker rm -f "${one_shot}" >/dev/null 2>&1; then
+            failed=1
+        fi
+    done
     if ! docker network rm "${CLIENT_NETWORK}" "${KMS_NETWORK}" >/dev/null 2>&1; then
         failed=1
     fi
@@ -45,7 +63,11 @@ cleanup_verified() {
         failed=1
     fi
     local container
-    for container in "${MINIO_NAME}" "${KES_NAME}"; do
+    for container in \
+        "${MINIO_NAME}" \
+        "${KES_NAME}" \
+        "${KES_BOOTSTRAP_CLIENT_NAME}" \
+        "${KES_METRICS_CLIENT_NAME}"; do
         if docker container inspect "${container}" >/dev/null 2>&1; then
             failed=1
         fi
@@ -103,12 +125,25 @@ render_kes_config() {
     } >"${output_file}"
 }
 
+assert_exact_private_key_set() {
+    local directory="$1"
+    local expected_name="$2"
+    local -a keys=()
+    local key
+    for key in "${directory}"/*.key; do
+        [[ -e "${key}" ]] || continue
+        keys+=("$(basename -- "${key}")")
+    done
+    (( ${#keys[@]} == 1 )) && [[ "${keys[0]}" == "${expected_name}" ]]
+}
+
 self_check() {
     local fake_docker_state='absent'
     local policy_file="${WORK_DIR}/self-check-kes.yml"
     local bootstrap_policy
     local runtime_policy
     local metrics_policy
+    local secret_layout="${WORK_DIR}/self-check-secret-layout"
     docker() {
         case "${1:-} ${2:-}" in
             'rm -f'|'network rm')
@@ -137,6 +172,32 @@ self_check() {
     }
 
     render_kes_config "${policy_file}" bootstrap-id runtime-id metrics-id
+
+    mkdir -p \
+        "${secret_layout}/server" \
+        "${secret_layout}/bootstrap" \
+        "${secret_layout}/runtime" \
+        "${secret_layout}/metrics"
+    : >"${secret_layout}/server/server.key"
+    : >"${secret_layout}/bootstrap/bootstrap.key"
+    : >"${secret_layout}/runtime/runtime.key"
+    : >"${secret_layout}/metrics/metrics.key"
+    assert_exact_private_key_set "${secret_layout}/server" server.key
+    assert_exact_private_key_set "${secret_layout}/bootstrap" bootstrap.key
+    assert_exact_private_key_set "${secret_layout}/runtime" runtime.key
+    assert_exact_private_key_set "${secret_layout}/metrics" metrics.key
+    if assert_exact_private_key_set "${secret_layout}/server" bootstrap.key; then
+        echo 'self-check accepted a cross-identity private key set' >&2
+        return 1
+    fi
+    if (( $(grep -Fc -- '--mount "type=bind,src=${WORK_DIR}/kes,dst=/config,readonly"' "${BASH_SOURCE[0]}") > 1 )); then
+        echo 'self-check found the legacy shared KES server secret mount' >&2
+        return 1
+    fi
+    if declare -f kes_exec | grep -Fq 'docker exec'; then
+        echo 'self-check found metrics credentials executed inside the KES server' >&2
+        return 1
+    fi
     grep -Fxq "    - /v1/key/create/${KMS_KEY_NAME}" "${policy_file}"
     grep -Fxq "    - /v1/key/generate/${KMS_KEY_NAME}" "${policy_file}"
     grep -Fxq "    - /v1/key/decrypt/${KMS_KEY_NAME}" "${policy_file}"
@@ -210,6 +271,36 @@ require_command() {
     }
 }
 
+assert_container_bind_mounts() {
+    local container_name="$1"
+    shift
+    local actual
+    local expected
+    actual="$(
+        docker container inspect "${container_name}" |
+            jq -r '.[0].Mounts[] | select(.Type == "bind") | "\(.Source)|\(.Destination)|\(.RW)"' |
+            sort
+    )"
+    expected="$(printf '%s\n' "$@" | sort)"
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "unexpected bind mount set for ${container_name}" >&2
+        return 1
+    fi
+}
+
+assert_running_directory_files() {
+    local container_name="$1"
+    local directory="$2"
+    local expected="$3"
+    docker exec \
+        --env "EXPECTED_VISIBLE_FILES=${expected}" \
+        "${container_name}" /bin/sh -c \
+            'set -eu
+             visible_files="$(/usr/bin/ls -1 "$1")"
+             [ "${visible_files}" = "${EXPECTED_VISIBLE_FILES}" ]' \
+            visibility-check "${directory}"
+}
+
 wait_for_https() {
     local ca_file="$1"
     local url="$2"
@@ -231,13 +322,52 @@ wait_for_https() {
     return 1
 }
 
+run_kes_client() {
+    local identity_name="$1"
+    shift
+    local identity_directory="${WORK_DIR}/kes/${identity_name}"
+    local client_name
+    case "${identity_name}" in
+        bootstrap)
+            client_name="${KES_BOOTSTRAP_CLIENT_NAME}"
+            ;;
+        metrics)
+            client_name="${KES_METRICS_CLIENT_NAME}"
+            ;;
+        *)
+            echo 'unsupported one-shot KES client identity' >&2
+            return 1
+            ;;
+    esac
+    docker create --rm \
+        --name "${client_name}" \
+        --network "${KMS_NETWORK}" \
+        --user "$(id -u):$(id -g)" \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
+        --env "EXPECTED_PRIVATE_KEY=/identity/${identity_name}.key" \
+        --env "KES_SERVER=https://${KES_NAME}:7373" \
+        --env "KES_CLIENT_CERT=/identity/${identity_name}.crt" \
+        --env "KES_CLIENT_KEY=/identity/${identity_name}.key" \
+        --env SSL_CERT_FILE=/trust/server.crt \
+        --mount "type=bind,src=${identity_directory},dst=/identity,readonly" \
+        --mount "type=bind,src=${KES_SERVER_DIR}/server.crt,dst=/trust/server.crt,readonly" \
+        --entrypoint /bin/sh \
+        "${KES_IMAGE}" -c \
+            'set -eu
+             visible_keys="$(/usr/bin/ls -1 /identity/*.key)"
+             [ "${visible_keys}" = "${EXPECTED_PRIVATE_KEY}" ]
+             exec /kes "$@"' \
+            client-entrypoint "$@" >/dev/null
+    assert_container_bind_mounts \
+        "${client_name}" \
+        "${identity_directory}|/identity|false" \
+        "${KES_SERVER_DIR}/server.crt|/trust/server.crt|false"
+    timeout 5 docker start --attach "${client_name}"
+}
+
 kes_exec() {
-    timeout 3 docker exec \
-        --env KES_SERVER=https://localhost:7373 \
-        --env KES_CLIENT_CERT=/config/metrics.crt \
-        --env KES_CLIENT_KEY=/config/metrics.key \
-        --env SSL_CERT_FILE=/config/server.crt \
-        "${KES_NAME}" /kes "$@"
+    run_kes_client metrics "$@"
 }
 
 wait_for_kes() {
@@ -307,7 +437,11 @@ for image in "${KES_IMAGE}" "${MINIO_IMAGE}" "${MC_IMAGE}"; do
 done
 
 mkdir -p \
-    "${WORK_DIR}/kes/keys" \
+    "${KES_SERVER_DIR}" \
+    "${KES_KEYSTORE_DIR}" \
+    "${KES_BOOTSTRAP_DIR}" \
+    "${KES_RUNTIME_DIR}" \
+    "${KES_METRICS_DIR}" \
     "${WORK_DIR}/mc" \
     "${WORK_DIR}/minio/certs/CAs" \
     "${WORK_DIR}/minio/data" \
@@ -317,7 +451,7 @@ docker run --rm \
     --user "$(id -u):$(id -g)" \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --mount "type=bind,src=${WORK_DIR}/kes,dst=/work" \
+    --mount "type=bind,src=${KES_SERVER_DIR},dst=/work" \
     "${KES_IMAGE}" identity new \
         --dns "${KES_NAME}" \
         --dns localhost \
@@ -327,11 +461,12 @@ docker run --rm \
         --expiry 1h \
         kes-live-gate >/dev/null
 for identity_name in bootstrap runtime metrics; do
+    identity_directory="${WORK_DIR}/kes/${identity_name}"
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         --cap-drop ALL \
         --security-opt no-new-privileges \
-        --mount "type=bind,src=${WORK_DIR}/kes,dst=/work" \
+        --mount "type=bind,src=${identity_directory},dst=/work" \
         "${KES_IMAGE}" identity new \
             --key "/work/${identity_name}.key" \
             --cert "/work/${identity_name}.crt" \
@@ -340,21 +475,21 @@ for identity_name in bootstrap runtime metrics; do
 done
 
 kes_identity_of() {
-    local certificate_name="$1"
+    local identity_name="$1"
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         --cap-drop ALL \
         --security-opt no-new-privileges \
-        --mount "type=bind,src=${WORK_DIR}/kes/${certificate_name},dst=/client.crt,readonly" \
+        --mount "type=bind,src=${WORK_DIR}/kes/${identity_name}/${identity_name}.crt,dst=/client.crt,readonly" \
         "${KES_IMAGE}" identity of /client.crt
 }
 
-KES_BOOTSTRAP_IDENTITY="$(kes_identity_of bootstrap.crt)"
-KES_RUNTIME_IDENTITY="$(kes_identity_of runtime.crt)"
-KES_METRICS_IDENTITY="$(kes_identity_of metrics.crt)"
+KES_BOOTSTRAP_IDENTITY="$(kes_identity_of bootstrap)"
+KES_RUNTIME_IDENTITY="$(kes_identity_of runtime)"
+KES_METRICS_IDENTITY="$(kes_identity_of metrics)"
 readonly KES_BOOTSTRAP_IDENTITY KES_RUNTIME_IDENTITY KES_METRICS_IDENTITY
 render_kes_config \
-    "${WORK_DIR}/kes/config.yml" \
+    "${KES_SERVER_DIR}/config.yml" \
     "${KES_BOOTSTRAP_IDENTITY}" \
     "${KES_RUNTIME_IDENTITY}" \
     "${KES_METRICS_IDENTITY}"
@@ -375,7 +510,7 @@ openssl x509 -req -sha256 -days 1 \
     -CAcreateserial \
     -copy_extensions copy \
     -out "${WORK_DIR}/minio/certs/public.crt" >/dev/null 2>&1
-cp "${WORK_DIR}/kes/server.crt" "${WORK_DIR}/minio/certs/CAs/kes-server.crt"
+cp "${KES_SERVER_DIR}/server.crt" "${WORK_DIR}/minio/certs/CAs/kes-server.crt"
 
 MINIO_ROOT_USER="$(openssl rand -hex 12)"
 MINIO_ROOT_PASSWORD="$(openssl rand -hex 24)"
@@ -393,24 +528,20 @@ docker run -d \
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --mount "type=bind,src=${WORK_DIR}/kes,dst=/config,readonly" \
-    --mount "type=bind,src=${WORK_DIR}/kes/keys,dst=/data" \
+    --mount "type=bind,src=${KES_SERVER_DIR},dst=/config,readonly" \
+    --mount "type=bind,src=${KES_KEYSTORE_DIR},dst=/data" \
     "${KES_IMAGE}" server --config /config/config.yml >/dev/null
+assert_container_bind_mounts \
+    "${KES_NAME}" \
+    "${KES_SERVER_DIR}|/config|false" \
+    "${KES_KEYSTORE_DIR}|/data|true"
+assert_running_directory_files \
+    "${KES_NAME}" \
+    /config \
+    $'config.yml\nserver.crt\nserver.key'
 wait_for_kes
 
-docker run --rm \
-    --network "${KMS_NETWORK}" \
-    --user "$(id -u):$(id -g)" \
-    --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --env "KES_SERVER=https://${KES_NAME}:7373" \
-    --env KES_CLIENT_CERT=/certs/bootstrap.crt \
-    --env KES_CLIENT_KEY=/certs/bootstrap.key \
-    --env SSL_CERT_FILE=/certs/server.crt \
-    --mount "type=bind,src=${WORK_DIR}/kes/bootstrap.crt,dst=/certs/bootstrap.crt,readonly" \
-    --mount "type=bind,src=${WORK_DIR}/kes/bootstrap.key,dst=/certs/bootstrap.key,readonly" \
-    --mount "type=bind,src=${WORK_DIR}/kes/server.crt,dst=/certs/server.crt,readonly" \
-    "${KES_IMAGE}" key create "${KMS_KEY_NAME}" >/dev/null
+run_kes_client bootstrap key create "${KMS_KEY_NAME}" >/dev/null
 
 start_minio() {
     docker run -d \
@@ -433,10 +564,20 @@ start_minio() {
         --tmpfs /tmp:rw,noexec,nosuid,nodev \
         --mount "type=bind,src=${WORK_DIR}/minio/data,dst=/data" \
         --mount "type=bind,src=${WORK_DIR}/minio/certs,dst=/certs,readonly" \
-        --mount "type=bind,src=${WORK_DIR}/kes/runtime.crt,dst=/kes/runtime.crt,readonly" \
-        --mount "type=bind,src=${WORK_DIR}/kes/runtime.key,dst=/kes/runtime.key,readonly" \
+        --mount "type=bind,src=${KES_RUNTIME_DIR}/runtime.crt,dst=/kes/runtime.crt,readonly" \
+        --mount "type=bind,src=${KES_RUNTIME_DIR}/runtime.key,dst=/kes/runtime.key,readonly" \
         "${MINIO_IMAGE}" server /data --certs-dir /certs --address :9000 >/dev/null
     docker network connect "${CLIENT_NETWORK}" "${MINIO_NAME}"
+    assert_container_bind_mounts \
+        "${MINIO_NAME}" \
+        "${WORK_DIR}/minio/certs|/certs|false" \
+        "${WORK_DIR}/minio/data|/data|true" \
+        "${KES_RUNTIME_DIR}/runtime.crt|/kes/runtime.crt|false" \
+        "${KES_RUNTIME_DIR}/runtime.key|/kes/runtime.key|false"
+    assert_running_directory_files \
+        "${MINIO_NAME}" \
+        /kes \
+        $'runtime.crt\nruntime.key'
 }
 
 start_minio
