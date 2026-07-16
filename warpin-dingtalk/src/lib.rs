@@ -1,14 +1,15 @@
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use tokio::sync::RwLock;
 use warpin_errors::{Result, ServiceError};
 
 const DEFAULT_API_BASE: &str = "https://api.dingtalk.com";
 const DEFAULT_OAPI_BASE: &str = "https://oapi.dingtalk.com";
+const REDACTED: &str = "[REDACTED]";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DingTalkConfig {
     #[serde(default)]
     pub corp_id: Option<String>,
@@ -26,6 +27,25 @@ pub struct DingTalkConfig {
     pub oapi_base: String,
 }
 
+impl fmt::Debug for DingTalkConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DingTalkConfig")
+            .field("corp_id", &self.corp_id.as_ref().map(|_| REDACTED))
+            .field("app_id", &self.app_id.as_ref().map(|_| REDACTED))
+            .field("agent_id", &self.agent_id.as_ref().map(|_| REDACTED))
+            .field("app_key", &REDACTED)
+            .field("app_secret", &REDACTED)
+            .field(
+                "callback_token",
+                &self.callback_token.as_ref().map(|_| REDACTED),
+            )
+            .field("api_base", &REDACTED)
+            .field("oapi_base", &REDACTED)
+            .finish()
+    }
+}
+
 impl DingTalkConfig {
     pub fn validate(&self) -> Result<()> {
         if self.app_key.trim().is_empty() {
@@ -38,11 +58,22 @@ impl DingTalkConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DingTalkClient {
     config: DingTalkConfig,
     http: reqwest::Client,
     token: Arc<RwLock<Option<CachedToken>>>,
+}
+
+impl fmt::Debug for DingTalkClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DingTalkClient")
+            .field("config", &self.config)
+            .field("http", &REDACTED)
+            .field("token", &REDACTED)
+            .finish()
+    }
 }
 
 impl DingTalkClient {
@@ -326,10 +357,20 @@ impl DingTalkClient {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CachedToken {
     value: String,
     expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for CachedToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedToken")
+            .field("value", &REDACTED)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl CachedToken {
@@ -346,7 +387,7 @@ impl CachedToken {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct AccessTokenRequest {
     #[serde(rename = "appKey")]
     app_key: String,
@@ -354,12 +395,32 @@ struct AccessTokenRequest {
     app_secret: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl fmt::Debug for AccessTokenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessTokenRequest")
+            .field("app_key", &REDACTED)
+            .field("app_secret", &REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 struct AccessTokenResponse {
     #[serde(rename = "accessToken")]
     access_token: String,
     #[serde(rename = "expireIn")]
     expire_in: i64,
+}
+
+impl fmt::Debug for AccessTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessTokenResponse")
+            .field("access_token", &REDACTED)
+            .field("expire_in", &self.expire_in)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1009,7 +1070,100 @@ pub struct ApprovalTask {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DingTalkBoundaryErrorKind {
+    InvalidUrl,
+    Transport,
+    ResponseDecode,
+    HttpStatus,
+    Api,
+    Oapi,
+}
+
+impl DingTalkBoundaryErrorKind {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidUrl => "dingtalk_invalid_url",
+            Self::Transport => "dingtalk_transport_failed",
+            Self::ResponseDecode => "dingtalk_response_decode_failed",
+            Self::HttpStatus => "dingtalk_http_status_error",
+            Self::Api => "dingtalk_api_error",
+            Self::Oapi => "dingtalk_oapi_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DingTalkBoundaryError {
+    kind: DingTalkBoundaryErrorKind,
+    http_status: Option<u16>,
+    provider_code: Option<i64>,
+    retryable: bool,
+}
+
+impl DingTalkBoundaryError {
+    const fn new(kind: DingTalkBoundaryErrorKind, retryable: bool) -> Self {
+        Self {
+            kind,
+            http_status: None,
+            provider_code: None,
+            retryable,
+        }
+    }
+
+    fn from_transport(error: &reqwest::Error) -> Self {
+        Self::new(
+            DingTalkBoundaryErrorKind::Transport,
+            error.is_timeout() || error.is_connect(),
+        )
+    }
+
+    fn from_http_status(status: reqwest::StatusCode) -> Self {
+        let retryable = status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+        Self {
+            kind: DingTalkBoundaryErrorKind::HttpStatus,
+            http_status: Some(status.as_u16()),
+            provider_code: None,
+            retryable,
+        }
+    }
+
+    const fn from_provider_code(provider_code: i64) -> Self {
+        Self {
+            kind: DingTalkBoundaryErrorKind::Oapi,
+            http_status: None,
+            provider_code: Some(provider_code),
+            retryable: false,
+        }
+    }
+
+    fn into_service_error(self) -> ServiceError {
+        let message = match (self.http_status, self.provider_code) {
+            (Some(status), None) => format!(
+                "kind={} status={status} retryable={}",
+                self.kind.code(),
+                self.retryable
+            ),
+            (None, Some(provider_code)) => format!(
+                "kind={} provider_code={provider_code} retryable={}",
+                self.kind.code(),
+                self.retryable
+            ),
+            (None, None) => format!("kind={} retryable={}", self.kind.code(), self.retryable),
+            (Some(_), Some(_)) => "kind=dingtalk_boundary_error retryable=false".to_owned(),
+        };
+
+        if self.kind == DingTalkBoundaryErrorKind::InvalidUrl {
+            ServiceError::bad_request(message)
+        } else {
+            ServiceError::service_unavailable(message)
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct ApiEnvelope<T> {
     #[serde(default)]
     success: Option<ApiSuccess>,
@@ -1022,12 +1176,15 @@ impl<T> ApiEnvelope<T> {
         if self.success.as_ref().is_none_or(ApiSuccess::is_success) {
             Ok(self.data)
         } else {
-            Err(ServiceError::service_unavailable("dingtalk api error"))
+            Err(
+                DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Api, false)
+                    .into_service_error(),
+            )
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum ApiSuccess {
     Bool(bool),
@@ -1043,12 +1200,12 @@ impl ApiSuccess {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OapiEnvelope<T> {
     #[serde(default)]
     errcode: i64,
-    #[serde(default)]
-    errmsg: String,
+    #[serde(default, rename = "errmsg")]
+    _provider_message: String,
     #[serde(flatten)]
     data: T,
 }
@@ -1058,10 +1215,7 @@ impl<T> OapiEnvelope<T> {
         if self.errcode == 0 {
             Ok(self.data)
         } else {
-            Err(ServiceError::service_unavailable(format!(
-                "dingtalk api error {}: {}",
-                self.errcode, self.errmsg
-            )))
+            Err(DingTalkBoundaryError::from_provider_code(self.errcode).into_service_error())
         }
     }
 }
@@ -1077,17 +1231,19 @@ fn default_oapi_base() -> String {
 fn join_url(base: &str, path: &str) -> Result<Url> {
     let base = base.trim_end_matches('/');
     let path = path.trim_start_matches('/');
-    Url::parse(&format!("{base}/{path}")).map_err(|error| {
-        ServiceError::bad_request(format!("invalid dingtalk url {base}/{path}: {error}"))
+    Url::parse(&format!("{base}/{path}")).map_err(|_| {
+        DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::InvalidUrl, false)
+            .into_service_error()
     })
 }
 
 fn map_transport_error(error: reqwest::Error) -> ServiceError {
-    ServiceError::service_unavailable(format!("dingtalk request failed: {error}"))
+    DingTalkBoundaryError::from_transport(&error).into_service_error()
 }
 
-fn map_decode_error(error: reqwest::Error) -> ServiceError {
-    ServiceError::service_unavailable(format!("failed to decode dingtalk response: {error}"))
+fn map_decode_error(_error: reqwest::Error) -> ServiceError {
+    DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::ResponseDecode, false)
+        .into_service_error()
 }
 
 trait DingTalkResponseExt {
@@ -1101,13 +1257,7 @@ impl DingTalkResponseExt for reqwest::Response {
             return Ok(self);
         }
 
-        let body = self
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-        Err(ServiceError::service_unavailable(format!(
-            "dingtalk http status error {status}: {body}"
-        )))
+        Err(DingTalkBoundaryError::from_http_status(status).into_service_error())
     }
 }
 
@@ -1181,5 +1331,183 @@ mod tests {
             serde_json::from_str(json).expect("api envelope should decode");
 
         assert!(envelope.into_result().is_err());
+    }
+
+    fn sentinel_config() -> DingTalkConfig {
+        DingTalkConfig {
+            corp_id: Some("CORP_PRIVATE_987".to_owned()),
+            app_id: Some("APP_PRIVATE_987".to_owned()),
+            agent_id: Some("AGENT_PRIVATE_987".to_owned()),
+            app_key: "APP_KEY_SECRET_987".to_owned(),
+            app_secret: "APP_SECRET_987".to_owned(),
+            callback_token: Some("CALLBACK_TOKEN_987".to_owned()),
+            api_base: "https://api-private-987.example".to_owned(),
+            oapi_base: "https://oapi-private-987.example".to_owned(),
+        }
+    }
+
+    fn assert_no_sentinel(rendered: &str) {
+        for sentinel in [
+            "CORP_PRIVATE_987",
+            "APP_PRIVATE_987",
+            "AGENT_PRIVATE_987",
+            "APP_KEY_SECRET_987",
+            "APP_SECRET_987",
+            "CALLBACK_TOKEN_987",
+            "api-private-987",
+            "oapi-private-987",
+            "ACCESS_TOKEN_987",
+            "PROVIDER_BODY_987",
+            "PROVIDER_MESSAGE_987",
+            "SIGNED_URL_TOKEN_987",
+            "INVALID_URL_SECRET_987",
+        ] {
+            assert!(
+                !rendered.contains(sentinel),
+                "sensitive sentinel leaked: {sentinel}"
+            );
+        }
+    }
+
+    async fn one_shot_http_response(status: &str, body: &str) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind one-shot HTTP listener");
+        let address = listener.local_addr().expect("one-shot listener address");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept HTTP request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write one-shot HTTP response");
+        });
+
+        Url::parse(&format!("http://{address}/provider")).expect("one-shot HTTP response URL")
+    }
+
+    #[test]
+    fn config_debug_redacts_every_sensitive_value() {
+        let rendered = format!("{:?}", sentinel_config());
+
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("DingTalkConfig"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn client_and_token_debug_redact_credentials_and_cached_tokens() {
+        let client = DingTalkClient::new(sentinel_config()).expect("valid client config");
+        *client.token.write().await = Some(CachedToken {
+            value: "ACCESS_TOKEN_987".to_owned(),
+            expires_at: Utc::now() + Duration::minutes(10),
+        });
+        let request = AccessTokenRequest {
+            app_key: "APP_KEY_SECRET_987".to_owned(),
+            app_secret: "APP_SECRET_987".to_owned(),
+        };
+        let response = AccessTokenResponse {
+            access_token: "ACCESS_TOKEN_987".to_owned(),
+            expire_in: 3600,
+        };
+
+        for rendered in [
+            format!("{client:?}"),
+            format!("{:?}", client.token.read().await.as_ref()),
+            format!("{request:?}"),
+            format!("{response:?}"),
+        ] {
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("[REDACTED]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_and_decode_errors_never_echo_request_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind disconnect listener");
+        let address = listener.local_addr().expect("disconnect listener address");
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept request");
+            drop(socket);
+        });
+        let transport_url = Url::parse(&format!(
+            "http://{address}/provider?access_token=SIGNED_URL_TOKEN_987"
+        ))
+        .expect("transport URL");
+        let transport = reqwest::Client::new()
+            .get(transport_url)
+            .send()
+            .await
+            .expect_err("closed connection must fail");
+
+        let mut decode_url = one_shot_http_response("200 OK", "not-json").await;
+        decode_url
+            .query_pairs_mut()
+            .append_pair("access_token", "SIGNED_URL_TOKEN_987");
+        let decode = reqwest::Client::new()
+            .get(decode_url)
+            .send()
+            .await
+            .expect("decode response")
+            .json::<serde_json::Value>()
+            .await
+            .expect_err("invalid JSON must fail");
+
+        for error in [map_transport_error(transport), map_decode_error(decode)] {
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_status_error_never_echoes_provider_body() {
+        let url = one_shot_http_response("502 Bad Gateway", "PROVIDER_BODY_987").await;
+        let response = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect("HTTP status response");
+
+        let error = response
+            .ensure_success()
+            .await
+            .expect_err("non-success response must fail");
+        let rendered = format!("{error:?} {error}");
+
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("502"));
+    }
+
+    #[test]
+    fn oapi_error_never_echoes_provider_message() {
+        let envelope = OapiEnvelope {
+            errcode: 40_001,
+            _provider_message: "PROVIDER_MESSAGE_987".to_owned(),
+            data: (),
+        };
+
+        let error = envelope.into_result().expect_err("OAPI failure");
+        let rendered = format!("{error:?} {error}");
+
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("40001"));
+    }
+
+    #[test]
+    fn invalid_url_error_never_echoes_config_or_path() {
+        let error = join_url("https://[INVALID_URL_SECRET_987", "provider")
+            .expect_err("invalid URL must fail");
+        let rendered = format!("{error:?} {error}");
+
+        assert_no_sentinel(&rendered);
     }
 }
