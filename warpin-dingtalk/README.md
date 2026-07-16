@@ -23,7 +23,9 @@ remain beneath the configured API or OAPI base path. Absolute references,
 empty or dot segments, percent-encoding, queries, and fragments are rejected
 before any request is sent. Endpoint text must use canonical ASCII without
 control characters, whitespace, an empty authority, or parser-recoverable
-ambiguity.
+ambiguity. Empty userinfo or port delimiters and non-canonical default ports are
+rejected; explicit canonical non-default ports remain available to trusted
+origins.
 
 `DingTalkTransportPolicy` applies bounded connect, request, and read timeouts.
 The production client never follows redirects, accepts HTTPS only, and ignores
@@ -36,6 +38,10 @@ time spent waiting for an in-flight refresh. A detached supervisor converts a
 worker panic or cancellation into a retryable typed failure and releases the
 generation for retry. Provider token values and TTLs are validated and bounded
 before cache arithmetic.
+
+Provider JSON is decoded through a streaming hard limit: 64 KiB for OAuth token
+responses and 8 MiB for other DingTalk APIs. Declared or chunked overflow is
+aborted before JSON allocation or deserialization can grow past that boundary.
 
 ## Security contract
 

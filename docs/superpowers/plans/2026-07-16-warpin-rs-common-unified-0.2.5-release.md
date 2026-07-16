@@ -207,8 +207,9 @@ followed; connect/request/read timeouts are bounded; concurrent token misses
 atomically bind to one immutable generation result (success or typed failure),
 every waiter has a fixed whole-operation deadline, supervised panic/cancellation
 releases the generation, and provider token TTL arithmetic is bounded;
-arbitrary HTTP-client injection is absent; and signed attachment URLs and
-untrusted provider fields cannot enter `Debug` output.
+all provider JSON decode paths enforce streaming hard byte limits; arbitrary
+HTTP-client injection is absent; and signed attachment URLs and untrusted
+provider fields cannot enter `Debug` output.
 
 - [ ] **Step 1: Run Functional Verification independently**
 

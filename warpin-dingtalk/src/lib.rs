@@ -17,6 +17,9 @@ const MAX_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_ACCESS_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
 const TOKEN_CACHE_SAFETY_MARGIN_SECONDS: i64 = 120;
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_API_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ENDPOINT_BYTES: usize = 2048;
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -310,7 +313,7 @@ fn token_refresh_error() -> ServiceError {
     DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true).into_service_error()
 }
 
-fn invalid_token_response_error() -> ServiceError {
+fn response_decode_error() -> ServiceError {
     DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::ResponseDecode, false)
         .into_service_error()
 }
@@ -547,7 +550,7 @@ impl DingTalkClient {
         let token = self.access_token().await?;
         let url = self.api_url(path)?;
 
-        let envelope: ApiEnvelope<R> = self
+        let response = self
             .http
             .post(url)
             .header("x-acs-dingtalk-access-token", token)
@@ -556,10 +559,9 @@ impl DingTalkClient {
             .await
             .map_err(map_transport_error)?
             .ensure_success()
-            .await?
-            .json()
-            .await
-            .map_err(map_decode_error)?;
+            .await?;
+        let envelope: ApiEnvelope<R> =
+            decode_bounded_json(response, MAX_API_RESPONSE_BYTES).await?;
 
         envelope.into_result()
     }
@@ -573,7 +575,7 @@ impl DingTalkClient {
         url.query_pairs_mut()
             .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
 
-        let envelope: ApiEnvelope<R> = self
+        let response = self
             .http
             .get(url)
             .header("x-acs-dingtalk-access-token", token)
@@ -581,10 +583,9 @@ impl DingTalkClient {
             .await
             .map_err(map_transport_error)?
             .ensure_success()
-            .await?
-            .json()
-            .await
-            .map_err(map_decode_error)?;
+            .await?;
+        let envelope: ApiEnvelope<R> =
+            decode_bounded_json(response, MAX_API_RESPONSE_BYTES).await?;
 
         envelope.into_result()
     }
@@ -598,7 +599,7 @@ impl DingTalkClient {
         let mut url = self.oapi_url(path)?;
         url.query_pairs_mut().append_pair("access_token", &token);
 
-        let envelope: OapiEnvelope<R> = self
+        let response = self
             .http
             .post(url)
             .json(body)
@@ -606,10 +607,9 @@ impl DingTalkClient {
             .await
             .map_err(map_transport_error)?
             .ensure_success()
-            .await?
-            .json()
-            .await
-            .map_err(map_decode_error)?;
+            .await?;
+        let envelope: OapiEnvelope<R> =
+            decode_bounded_json(response, MAX_API_RESPONSE_BYTES).await?;
 
         envelope.into_result()
     }
@@ -621,17 +621,16 @@ impl DingTalkClient {
             app_secret: self.config.app_secret.clone(),
         };
 
-        self.http
+        let response = self
+            .http
             .post(url)
             .json(&request)
             .send()
             .await
             .map_err(map_transport_error)?
             .ensure_success()
-            .await?
-            .json()
-            .await
-            .map_err(map_decode_error)
+            .await?;
+        decode_bounded_json(response, MAX_TOKEN_RESPONSE_BYTES).await
     }
 
     async fn fetch_validated_access_token(&self) -> Result<ValidatedAccessToken> {
@@ -716,7 +715,7 @@ impl AccessTokenResponse {
                 .all(|byte| (b'!'..=b'~').contains(&byte));
         let ttl_is_valid = self.expire_in > 0 && self.expire_in <= MAX_ACCESS_TOKEN_TTL_SECONDS;
         if !token_is_valid || !ttl_is_valid {
-            return Err(invalid_token_response_error());
+            return Err(response_decode_error());
         }
 
         let value = self.access_token;
@@ -725,10 +724,10 @@ impl AccessTokenResponse {
             None
         } else {
             let duration =
-                ChronoDuration::try_seconds(cache_ttl).ok_or_else(invalid_token_response_error)?;
+                ChronoDuration::try_seconds(cache_ttl).ok_or_else(response_decode_error)?;
             let expires_at = Utc::now()
                 .checked_add_signed(duration)
-                .ok_or_else(invalid_token_response_error)?;
+                .ok_or_else(response_decode_error)?;
             Some(CachedToken {
                 value: value.clone(),
                 expires_at,
@@ -1605,9 +1604,8 @@ impl DingTalkEndpointPolicy {
 }
 
 fn validate_endpoint_base(raw: &str) -> Result<Url> {
-    if !raw_endpoint_path_is_unambiguous(raw) {
-        return Err(endpoint_policy_error());
-    }
+    let raw_authority =
+        raw_endpoint_authority_if_unambiguous(raw).ok_or_else(endpoint_policy_error)?;
 
     let mut url = Url::parse(raw).map_err(|_| {
         DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::InvalidUrl, false)
@@ -1619,7 +1617,8 @@ fn validate_endpoint_base(raw: &str) -> Result<Url> {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && route_path_is_unambiguous(url.path(), true);
+        && route_path_is_unambiguous(url.path(), true)
+        && url.origin().ascii_serialization() == format!("https://{raw_authority}");
     if !structurally_safe {
         return Err(endpoint_policy_error());
     }
@@ -1654,31 +1653,31 @@ fn endpoint_policy_error() -> ServiceError {
         .into_service_error()
 }
 
-fn raw_endpoint_path_is_unambiguous(raw: &str) -> bool {
-    if !raw.is_ascii()
+fn raw_endpoint_authority_if_unambiguous(raw: &str) -> Option<&str> {
+    if raw.len() > MAX_ENDPOINT_BYTES
+        || !raw.is_ascii()
         || raw != raw.trim()
         || raw
             .bytes()
             .any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'%' | b'\\'))
     {
-        return false;
+        return None;
     }
 
-    let Some(authority_and_path) = raw.strip_prefix("https://") else {
-        return false;
-    };
+    let authority_and_path = raw.strip_prefix("https://")?;
     let authority_end = authority_and_path
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
-    if authority_end == 0 {
-        return false;
+    let authority = &authority_and_path[..authority_end];
+    if authority.is_empty() || authority.contains('@') || authority.ends_with(':') {
+        return None;
     }
     let raw_path = if authority_and_path.as_bytes().get(authority_end) == Some(&b'/') {
         &authority_and_path[authority_end..]
     } else {
         "/"
     };
-    route_path_is_unambiguous(raw_path, true)
+    route_path_is_unambiguous(raw_path, true).then_some(authority)
 }
 
 fn route_path_is_unambiguous(path: &str, root_allowed: bool) -> bool {
@@ -1753,8 +1752,31 @@ fn map_transport_error(error: reqwest::Error) -> ServiceError {
 }
 
 fn map_decode_error(_error: reqwest::Error) -> ServiceError {
-    DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::ResponseDecode, false)
-        .into_service_error()
+    response_decode_error()
+}
+
+async fn decode_bounded_json<T>(mut response: reqwest::Response, limit: usize) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > limit as u64)
+    {
+        return Err(response_decode_error());
+    }
+
+    let capacity = response
+        .content_length()
+        .map_or(0, |content_length| content_length as usize);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(map_decode_error)? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(response_decode_error());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| response_decode_error())
 }
 
 trait DingTalkResponseExt {
@@ -2051,6 +2073,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_json_decode_rejects_declared_and_chunked_overflow_immediately() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::{Duration as TokioDuration, timeout};
+
+        for response_head in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n".to_owned(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n11\r\nAAAAAAAAAAAAAAAAA\r\n"
+                .to_owned(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind oversized response provider");
+            let address = listener.local_addr().expect("oversized provider address");
+            let provider = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept decode request");
+                socket
+                    .write_all(response_head.as_bytes())
+                    .await
+                    .expect("write oversized response prefix");
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+            });
+
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}/bounded-json"))
+                .send()
+                .await
+                .expect("receive oversized response headers");
+            let error = timeout(
+                TokioDuration::from_millis(200),
+                decode_bounded_json::<serde_json::Value>(response, 16),
+            )
+            .await
+            .expect("decoder must reject before the provider finishes")
+            .expect_err("oversized response must fail");
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_response_decode_failed"));
+            provider.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn http_status_error_never_echoes_provider_body() {
         let url = one_shot_http_response("502 Bad Gateway", "PROVIDER_BODY_987").await;
         let response = reqwest::Client::new()
@@ -2114,7 +2178,14 @@ mod tests {
             ("api", "https://api.\rdingtalk.com"),
             ("api", "https://api.\tdingtalk.com"),
             ("api", "https://api．dingtalk.com"),
+            ("api", "https://@api.dingtalk.com"),
+            ("api", "https://api.dingtalk.com:"),
+            ("api", "https://api.dingtalk.com:/"),
+            ("api", "https://API.DINGTALK.COM"),
+            ("api", "https://api.dingtalk.com:443"),
+            ("api", "https://api.dingtalk.com:0443"),
             ("oapi", "https:///oapi.dingtalk.com"),
+            ("oapi", "https://@oapi.dingtalk.com"),
             ("oapi", "https://oapi.dingtalk.com.attacker-987.example"),
         ] {
             let mut config = official.clone();
@@ -2181,6 +2252,18 @@ mod tests {
         let rendered = format!("{policy:?} {error:?} {error}");
         assert_no_sentinel(&rendered);
         assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
+
+        let port_config = DingTalkConfig {
+            api_base: "https://api.private.example:8443/dingtalk".to_owned(),
+            oapi_base: "https://oapi.private.example:9443/dingtalk".to_owned(),
+            ..sentinel_config()
+        };
+        let port_policy = DingTalkEndpointPolicy::TrustedOrigins {
+            api_origin: "https://api.private.example:8443".to_owned(),
+            oapi_origin: "https://oapi.private.example:9443".to_owned(),
+        };
+        DingTalkClient::with_endpoint_policy(port_config, port_policy)
+            .expect("canonical non-default trusted ports must be accepted");
     }
 
     #[test]
