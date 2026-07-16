@@ -287,4 +287,3 @@ state, commit the merge, and push `main` without force.
 Remove the temporary public and AstroNexus integration worktrees and merged
 task branches. Preserve `akr-fusion-analyze` locally and remotely and preserve
 the saved R4 stash.
-

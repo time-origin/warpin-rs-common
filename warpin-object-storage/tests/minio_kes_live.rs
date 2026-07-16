@@ -17,11 +17,12 @@ const CONTEXT_B_DOMAIN: &[u8] = b"warpin:r4:minio-kes-live-gate:context:v2";
 
 #[test]
 fn live_gate_shell_self_check_enforces_identity_and_cleanup_contracts() {
+    let script_path = format!(
+        "{}/scripts/minio-kes-live-gate.sh",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let output = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/minio-kes-live-gate.sh",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(&script_path)
         .arg("--self-check")
         .output()
         .expect("execute live-gate shell self-check");
@@ -33,6 +34,11 @@ fn live_gate_shell_self_check_enforces_identity_and_cleanup_contracts() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("minio_kes_live_gate_self_check=true"));
     assert!(!stdout.contains("ephemeral_resources_cleaned=true"));
+    let script = fs::read_to_string(script_path).expect("read live-gate script");
+    assert!(
+        script.contains("\"s3:DeleteObjectVersion\""),
+        "the versioned live gate principal must be able to exercise exact-version cleanup"
+    );
 }
 
 fn gate_run_id() -> String {

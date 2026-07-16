@@ -1903,7 +1903,7 @@ run_mc version enable "gate/${BUCKET}" >/dev/null
         '    },' \
         '    {' \
         '      "Effect": "Allow",' \
-        '      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"],' \
+        '      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObjectVersion"],' \
         "      \"Resource\": [\"arn:aws:s3:::${BUCKET}/live-gate/*\"]" \
         '    }' \
         '  ]' \

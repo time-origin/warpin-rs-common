@@ -149,4 +149,3 @@ All public crates use the workspace version and will be released together as
 `0.2.6`. Internal workspace dependency versions must also become `0.2.6`.
 Publication follows dependency order, verifies crates.io visibility, and then
 AstroNexus upgrades every `warpin-*` dependency to `0.2.6`.
-
