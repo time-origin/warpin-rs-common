@@ -64,6 +64,15 @@ fn write(key: &str, body: &'static [u8]) -> ImmutableObjectWrite {
     }
 }
 
+fn verified_delete(key: &str, body: &'static [u8]) -> VerifiedObjectDelete {
+    VerifiedObjectDelete {
+        key: ObjectKey::parse(key).expect("key"),
+        context_id: context_id(b"default-test-context"),
+        expected_digest: digest_bytes(body),
+        expected_version: Some("opaque-version".to_owned()),
+    }
+}
+
 fn receipt(idempotent_replay: bool) -> ObjectWriteReceipt {
     ObjectWriteReceipt {
         key: ObjectKey::parse("objects/encrypted.json").expect("key"),
@@ -2877,17 +2886,17 @@ fn trusted_root_pem_is_private_bounded_and_s3_scoped() {
 #[test]
 fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
     let key = ObjectKey::parse("MODEL_RESPONSE/object.json").expect("sentinel key");
-    let context_id = context_id(b"debug-sentinel-context");
+    let sentinel_context_id = context_id(b"debug-sentinel-context");
     let write = ImmutableObjectWrite {
         key: key.clone(),
-        context_id: context_id.clone(),
+        context_id: sentinel_context_id.clone(),
         content: Bytes::from_static(b"PRIVATE_QUERY"),
         expected_digest: digest_bytes(b"PRIVATE_QUERY"),
         content_type: "application/SECRET".to_owned(),
     };
     let receipt = ObjectWriteReceipt {
         key: key.clone(),
-        context_id: context_id.clone(),
+        context_id: sentinel_context_id.clone(),
         size_bytes: 11,
         digest: digest_bytes(b"PRIVATE_QUERY"),
         e_tag: Some("SIGNED_URL".to_owned()),
@@ -2896,12 +2905,25 @@ fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
     };
     let object = VerifiedObject {
         key: key.clone(),
-        context_id,
+        context_id: sentinel_context_id,
         content: Bytes::from_static(b"TOOL_RESULT"),
         digest: digest_bytes(b"TOOL_RESULT"),
         content_type: Some("application/SECRET".to_owned()),
         e_tag: Some("SIGNED_URL".to_owned()),
         version: Some("PROVIDER_BODY".to_owned()),
+    };
+    let delete = VerifiedObjectDelete {
+        key: key.clone(),
+        context_id: context_id(b"debug-sentinel-context"),
+        expected_digest: digest_bytes(b"PRIVATE_QUERY"),
+        expected_version: Some("PROVIDER_BODY".to_owned()),
+    };
+    let delete_receipt = ObjectDeleteReceipt {
+        key: key.clone(),
+        context_id: context_id(b"debug-sentinel-context"),
+        digest: digest_bytes(b"PRIVATE_QUERY"),
+        version: Some("PROVIDER_BODY".to_owned()),
+        outcome: ObjectDeleteOutcome::Deleted,
     };
     let storage = VerifiedObjectStorage::from_settings(ObjectStoreSettings::new(
         "memory:///SIGNED_URL/PROVIDER_BODY",
@@ -2912,6 +2934,8 @@ fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
         format!("{write:?}"),
         format!("{receipt:?}"),
         format!("{object:?}"),
+        format!("{delete:?}"),
+        format!("{delete_receipt:?}"),
         format!("{storage:?}"),
     ];
 
@@ -2934,7 +2958,26 @@ fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
     assert!(rendered[1].contains("content_len"));
     assert!(rendered[2].contains("e_tag_present"));
     assert!(rendered[3].contains("content_len"));
-    assert!(rendered[4].contains("prefix_fingerprint"));
+    assert!(rendered[4].contains("expected_version_present"));
+    assert!(rendered[5].contains("outcome"));
+    assert!(rendered[6].contains("prefix_fingerprint"));
+}
+
+#[test]
+fn verified_delete_contract_binds_context_digest_version_and_typed_outcome() {
+    let delete = verified_delete("objects/delete-contract.json", b"delete-contract");
+    assert_eq!(delete.key.as_str(), "objects/delete-contract.json");
+    assert_eq!(
+        delete.context_id,
+        context_id(b"default-test-context"),
+        "delete must preserve the exact contextual object identity"
+    );
+    assert_eq!(delete.expected_digest, digest_bytes(b"delete-contract"));
+    assert_eq!(delete.expected_version.as_deref(), Some("opaque-version"));
+    assert_ne!(
+        ObjectDeleteOutcome::Deleted,
+        ObjectDeleteOutcome::AlreadyAbsent
+    );
 }
 
 #[test]

@@ -85,6 +85,59 @@ impl fmt::Debug for ObjectWriteReceipt {
     }
 }
 
+/// A request to delete exactly one context-bound object after verifying its
+/// digest and, when present, backend version.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VerifiedObjectDelete {
+    pub key: ObjectKey,
+    pub context_id: ArtifactEncryptionContextId,
+    pub expected_digest: Sha256Digest,
+    pub expected_version: Option<String>,
+}
+
+impl fmt::Debug for VerifiedObjectDelete {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedObjectDelete")
+            .field("key", &self.key)
+            .field("context_id", &self.context_id)
+            .field("expected_digest", &self.expected_digest)
+            .field("expected_version_present", &self.expected_version.is_some())
+            .finish()
+    }
+}
+
+/// Durable classification of one verified deletion attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectDeleteOutcome {
+    Deleted,
+    AlreadyAbsent,
+}
+
+/// Typed receipt that binds a deletion outcome to the exact contextual object
+/// identity requested by the caller.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ObjectDeleteReceipt {
+    pub key: ObjectKey,
+    pub context_id: ArtifactEncryptionContextId,
+    pub digest: Sha256Digest,
+    pub version: Option<String>,
+    pub outcome: ObjectDeleteOutcome,
+}
+
+impl fmt::Debug for ObjectDeleteReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectDeleteReceipt")
+            .field("key", &self.key)
+            .field("context_id", &self.context_id)
+            .field("digest", &self.digest)
+            .field("version_present", &self.version.is_some())
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 enum EncryptionRequirementKind {
     Managed {

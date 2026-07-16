@@ -6,7 +6,8 @@ pub use contract::{
     ArtifactEncryptionContextId, ArtifactEncryptionPolicy, EncryptionAttestation,
     EncryptionAttestationView, EncryptionPolicyError, EncryptionRequirement,
     EncryptionRequirementView, EncryptionVerifiedObjectWriteReceipt, ImmutableObjectWrite,
-    ManagedEncryptionProfileId, ObjectKey, ObjectStorageError, ObjectWriteReceipt, VerifiedObject,
+    ManagedEncryptionProfileId, ObjectDeleteOutcome, ObjectDeleteReceipt, ObjectKey,
+    ObjectStorageError, ObjectWriteReceipt, VerifiedObject, VerifiedObjectDelete,
 };
 pub use storage::{ObjectStoreSettings, VerifiedObjectStorage};
 
