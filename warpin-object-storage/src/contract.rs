@@ -727,12 +727,16 @@ impl fmt::Debug for WriteBinding {
 pub(crate) enum ObservedOperation {
     Put,
     Readback,
+    Delete,
 }
 
 impl ObservedOperation {
     #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     pub(crate) fn matches_method(self, method: &str) -> bool {
-        matches!((self, method), (Self::Put, "PUT") | (Self::Readback, "GET"))
+        matches!(
+            (self, method),
+            (Self::Put, "PUT") | (Self::Readback, "GET") | (Self::Delete, "DELETE")
+        )
     }
 }
 
@@ -771,6 +775,15 @@ impl ObserverRequestBinding {
         Self {
             binding: None,
             operation: ObservedOperation::Readback,
+            expected_location,
+            expected_version,
+        }
+    }
+
+    pub(crate) fn delete(expected_location: Path, expected_version: Option<String>) -> Self {
+        Self {
+            binding: None,
+            operation: ObservedOperation::Delete,
             expected_location,
             expected_version,
         }

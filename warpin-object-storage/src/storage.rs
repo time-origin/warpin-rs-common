@@ -1,20 +1,23 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
 use object_store::{
-    Attribute, AttributeValue, Attributes, Extensions, GetOptions, ObjectStore, PutMode,
-    PutOptions, path::Path,
+    Attribute, AttributeValue, Attributes, Extensions, GetOptions, ObjectStore, ObjectStoreExt,
+    PutMode, PutOptions, path::Path,
 };
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
 
+#[cfg(feature = "aws")]
+use crate::s3_adapter::S3VerifiedDeleteAdapter;
 #[cfg(feature = "aws")]
 use crate::s3_adapter::map_managed_request_error;
 use crate::s3_adapter::{ConfiguredS3Encryption, ObservedEncryptionEvidence};
 use crate::{
     ArtifactEncryptionContextId, ArtifactEncryptionPolicy, EncryptionAttestation,
     EncryptionPolicyError, EncryptionRequirementView, EncryptionVerifiedObjectWriteReceipt,
-    ImmutableObjectWrite, ManagedEncryptionProfileId, ObjectKey, ObjectStorageError,
-    ObjectWriteReceipt, ObserverRequestBinding, VerifiedObject, WriteBinding,
+    ImmutableObjectWrite, ManagedEncryptionProfileId, ObjectDeleteOutcome, ObjectDeleteReceipt,
+    ObjectKey, ObjectStorageError, ObjectWriteReceipt, ObserverRequestBinding, VerifiedObject,
+    VerifiedObjectDelete, WriteBinding,
 };
 
 const DIGEST_METADATA_KEY: &str = "warpin-sha256";
@@ -193,11 +196,13 @@ impl fmt::Debug for ObjectStoreSettings {
     }
 }
 #[cfg_attr(not(feature = "aws"), allow(dead_code))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum BackendSecurityMode {
     DevelopmentOrTestPlaintext,
     S3Observed {
         configured: Box<ConfiguredS3Encryption>,
+        #[cfg(feature = "aws")]
+        delete_adapter: Box<S3VerifiedDeleteAdapter>,
     },
 }
 
@@ -205,6 +210,7 @@ enum BackendSecurityMode {
 pub struct VerifiedObjectStorage {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
+    filesystem_root: Option<PathBuf>,
     max_object_bytes: u64,
     supports_attributes: bool,
     backend_security: BackendSecurityMode,
@@ -232,9 +238,10 @@ impl fmt::Debug for VerifiedObjectStorage {
 impl VerifiedObjectStorage {
     pub fn from_settings(settings: ObjectStoreSettings) -> Result<Self, ObjectStorageError> {
         let url = settings.validate()?;
-        let (store, prefix, supports_attributes, backend_security): (
+        let (store, prefix, filesystem_root, supports_attributes, backend_security): (
             Box<dyn ObjectStore>,
             Path,
+            Option<PathBuf>,
             bool,
             BackendSecurityMode,
         ) = match url.scheme() {
@@ -246,13 +253,16 @@ impl VerifiedObjectStorage {
                     let filesystem_path = url
                         .to_file_path()
                         .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+                    let filesystem_root = std::fs::canonicalize(filesystem_path)
+                        .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
                     let store =
-                        object_store::local::LocalFileSystem::new_with_prefix(filesystem_path)
+                        object_store::local::LocalFileSystem::new_with_prefix(&filesystem_root)
                             .map_err(map_backend_configuration_error)?
                             .with_fsync(true);
                     (
                         Box::new(store),
                         Path::ROOT,
+                        Some(filesystem_root),
                         false,
                         BackendSecurityMode::DevelopmentOrTestPlaintext,
                     )
@@ -264,6 +274,7 @@ impl VerifiedObjectStorage {
                 (
                     store,
                     prefix,
+                    None,
                     true,
                     BackendSecurityMode::DevelopmentOrTestPlaintext,
                 )
@@ -273,19 +284,22 @@ impl VerifiedObjectStorage {
                 return Err(ObjectStorageError::UnsupportedBackend);
                 #[cfg(feature = "aws")]
                 {
-                    let (store, prefix, configured) = ConfiguredS3Encryption::build_store(
-                        &url,
-                        settings.options,
-                        settings.managed_encryption_profile_id,
-                        settings.expected_observed_key_identity_fingerprint,
-                        settings.trusted_root_certificate_pems,
-                    )?;
+                    let (store, prefix, configured, delete_adapter) =
+                        ConfiguredS3Encryption::build_store(
+                            &url,
+                            settings.options,
+                            settings.managed_encryption_profile_id,
+                            settings.expected_observed_key_identity_fingerprint,
+                            settings.trusted_root_certificate_pems,
+                        )?;
                     (
                         store,
                         prefix,
+                        None,
                         true,
                         BackendSecurityMode::S3Observed {
                             configured: Box::new(configured),
+                            delete_adapter: Box::new(delete_adapter),
                         },
                     )
                 }
@@ -295,6 +309,7 @@ impl VerifiedObjectStorage {
         Ok(Self {
             store: Arc::from(store),
             prefix,
+            filesystem_root,
             max_object_bytes: settings.max_object_bytes,
             supports_attributes,
             backend_security,
@@ -307,7 +322,7 @@ impl VerifiedObjectStorage {
     pub const fn managed_encryption_profile_id(&self) -> Option<&ManagedEncryptionProfileId> {
         match &self.backend_security {
             BackendSecurityMode::DevelopmentOrTestPlaintext => None,
-            BackendSecurityMode::S3Observed { configured } => Some(&configured.profile_id),
+            BackendSecurityMode::S3Observed { configured, .. } => Some(&configured.profile_id),
         }
     }
 
@@ -351,7 +366,7 @@ impl VerifiedObjectStorage {
                 EncryptionRequirementView::DevelopmentOrTestPlaintext,
             ) => return Err(EncryptionPolicyError::PolicyBackendMismatch.into()),
         }
-        if let BackendSecurityMode::S3Observed { configured } = &self.backend_security {
+        if let BackendSecurityMode::S3Observed { configured, .. } = &self.backend_security {
             policy.verify_s3_configuration(configured)?;
         }
 
@@ -370,7 +385,7 @@ impl VerifiedObjectStorage {
             BackendSecurityMode::DevelopmentOrTestPlaintext => {
                 EncryptionAttestation::development_or_test_plaintext(&binding, &outcome.receipt)
             }
-            BackendSecurityMode::S3Observed { configured } => {
+            BackendSecurityMode::S3Observed { configured, .. } => {
                 let evidence = outcome
                     .evidence
                     .as_ref()
@@ -494,6 +509,106 @@ impl VerifiedObjectStorage {
             .map(|readback| readback.object)
     }
 
+    /// Deletes only the contextual object identity that first passes digest and
+    /// optional version verification.
+    ///
+    /// Managed S3 backends issue a signed version-specific delete when a
+    /// version is supplied. Missing objects converge to an idempotent
+    /// [`ObjectDeleteOutcome::AlreadyAbsent`] receipt; identity mismatches fail
+    /// closed before deletion.
+    pub async fn delete_verified(
+        &self,
+        delete: VerifiedObjectDelete,
+    ) -> Result<ObjectDeleteReceipt, ObjectStorageError> {
+        let location = self.location(&delete.key, &delete.context_id)?;
+        let verified = match self
+            .read_verified(
+                &delete.key,
+                &delete.context_id,
+                &delete.expected_digest,
+                delete.expected_version.as_deref(),
+            )
+            .await
+        {
+            Ok(object) => object,
+            Err(ObjectStorageError::NotFound) => {
+                if delete.expected_version.is_some() {
+                    match self
+                        .read_verified(
+                            &delete.key,
+                            &delete.context_id,
+                            &delete.expected_digest,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => return Err(ObjectStorageError::VersionMismatch),
+                        Err(ObjectStorageError::NotFound) => {}
+                        Err(ObjectStorageError::DigestMismatch) => {
+                            return Err(ObjectStorageError::VersionMismatch);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                self.sync_local_absence(&location).await?;
+                return Ok(ObjectDeleteReceipt {
+                    key: delete.key,
+                    context_id: delete.context_id,
+                    digest: delete.expected_digest,
+                    version: delete.expected_version,
+                    outcome: ObjectDeleteOutcome::AlreadyAbsent,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let delete_result = match &self.backend_security {
+            BackendSecurityMode::DevelopmentOrTestPlaintext => self
+                .store
+                .delete(&location)
+                .await
+                .map_err(|error| match error {
+                    object_store::Error::NotFound { .. } => ObjectStorageError::NotFound,
+                    _ => ObjectStorageError::Backend,
+                }),
+            BackendSecurityMode::S3Observed {
+                #[cfg(feature = "aws")]
+                delete_adapter,
+                ..
+            } => {
+                #[cfg(feature = "aws")]
+                {
+                    delete_adapter
+                        .delete_exact(location.clone(), verified.version.clone())
+                        .await
+                }
+                #[cfg(not(feature = "aws"))]
+                {
+                    Err(ObjectStorageError::UnsupportedBackend)
+                }
+            }
+        };
+        let outcome = match delete_result {
+            Ok(()) => ObjectDeleteOutcome::Deleted,
+            Err(ObjectStorageError::NotFound) => ObjectDeleteOutcome::AlreadyAbsent,
+            Err(error) => return Err(error),
+        };
+        self.sync_local_absence(&location).await?;
+        Ok(ObjectDeleteReceipt {
+            key: delete.key,
+            context_id: delete.context_id,
+            digest: delete.expected_digest,
+            version: verified.version,
+            outcome,
+        })
+    }
+
+    async fn sync_local_absence(&self, location: &Path) -> Result<(), ObjectStorageError> {
+        let Some(root) = self.filesystem_root.as_deref() else {
+            return Ok(());
+        };
+        sync_deleted_entry_parent(root.to_owned(), location.clone()).await
+    }
+
     async fn read_verified_internal(
         &self,
         key: &ObjectKey,
@@ -592,6 +707,48 @@ impl VerifiedObjectStorage {
         };
         Path::parse(value).map_err(|_| ObjectStorageError::InvalidKey)
     }
+}
+
+#[cfg(all(feature = "fs", unix))]
+async fn sync_deleted_entry_parent(
+    filesystem_root: PathBuf,
+    location: Path,
+) -> Result<(), ObjectStorageError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime
+            .spawn_blocking(move || sync_deleted_entry_parent_blocking(&filesystem_root, &location))
+            .await
+            .map_err(|_| ObjectStorageError::Backend)?,
+        Err(_) => sync_deleted_entry_parent_blocking(&filesystem_root, &location),
+    }
+}
+
+#[cfg(all(feature = "fs", unix))]
+fn sync_deleted_entry_parent_blocking(
+    filesystem_root: &std::path::Path,
+    location: &Path,
+) -> Result<(), ObjectStorageError> {
+    let object_path = filesystem_root.join(location.as_ref());
+    let mut directory = object_path
+        .parent()
+        .ok_or(ObjectStorageError::Backend)?
+        .to_owned();
+    while !directory.exists() && directory != filesystem_root {
+        if !directory.pop() {
+            return Err(ObjectStorageError::Backend);
+        }
+    }
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ObjectStorageError::Backend)
+}
+
+#[cfg(not(all(feature = "fs", unix)))]
+async fn sync_deleted_entry_parent(
+    _filesystem_root: PathBuf,
+    _location: Path,
+) -> Result<(), ObjectStorageError> {
+    Ok(())
 }
 
 pub(crate) fn read_options(expected_version: Option<&str>, extensions: Extensions) -> GetOptions {

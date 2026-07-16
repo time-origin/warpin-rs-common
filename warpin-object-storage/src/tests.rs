@@ -23,11 +23,11 @@ use super::*;
 #[cfg(feature = "aws")]
 use async_trait::async_trait;
 #[cfg(feature = "aws")]
-use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential};
 #[cfg(feature = "aws")]
 use object_store::client::{
     ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpRequestBody,
-    HttpResponse, HttpResponseBody, HttpService,
+    HttpResponse, HttpResponseBody, HttpService, StaticCredentialProvider,
 };
 #[cfg(feature = "aws")]
 use s3_adapter::{
@@ -69,7 +69,7 @@ fn verified_delete(key: &str, body: &'static [u8]) -> VerifiedObjectDelete {
         key: ObjectKey::parse(key).expect("key"),
         context_id: context_id(b"default-test-context"),
         expected_digest: digest_bytes(body),
-        expected_version: Some("opaque-version".to_owned()),
+        expected_version: None,
     }
 }
 
@@ -130,6 +130,7 @@ fn signed_artifact_request(
     *request.method_mut() = match binding.operation {
         ObservedOperation::Put => "PUT",
         ObservedOperation::Readback => "GET",
+        ObservedOperation::Delete => "DELETE",
     }
     .parse()
     .expect("artifact method");
@@ -150,6 +151,7 @@ fn signed_artifact_request(
             .and_then(|binding| binding.content_digest().as_str().strip_prefix("sha256:"))
             .unwrap_or(TEST_EMPTY_SHA256_HEX),
         ObservedOperation::Readback => TEST_EMPTY_SHA256_HEX,
+        ObservedOperation::Delete => TEST_EMPTY_SHA256_HEX,
     };
     request.headers_mut().insert(
         "x-amz-content-sha256",
@@ -168,6 +170,7 @@ fn signed_artifact_request(
             "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;x-amz-server-side-encryption-bucket-key-enabled"
         }
         ObservedOperation::Readback => "host;x-amz-content-sha256;x-amz-date",
+        ObservedOperation::Delete => "host;x-amz-content-sha256;x-amz-date",
     };
     request.headers_mut().insert(
         "authorization",
@@ -891,6 +894,88 @@ fn readback_target_allows_one_canonical_exact_version_query() {
                 .is_err(),
             "non-canonical or non-unique version query must fail"
         );
+    }
+}
+
+#[cfg(feature = "aws")]
+#[test]
+fn delete_target_requires_one_canonical_exact_version_query() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("native AWS configuration");
+    let location = Path::parse("private-prefix/objects/encrypted.json").expect("path");
+    let request = ObserverRequestBinding::delete(location, Some("opaque version+/=".to_owned()));
+    let base =
+        "https://s3.eu-west-1.amazonaws.com/tenant-artifacts/private-prefix/objects/encrypted.json";
+
+    assert!(
+        configured
+            .verify_request_target(
+                &request,
+                "DELETE",
+                &format!("{base}?versionId=opaque+version%2B%2F%3D"),
+            )
+            .is_ok()
+    );
+    for wrong in [
+        base.to_owned(),
+        format!("{base}?versionId=wrong"),
+        format!("{base}?versionId=opaque+version%2B%2F%3D&versionId=second"),
+        format!("{base}?unexpected=value"),
+    ] {
+        assert!(
+            configured
+                .verify_request_target(&request, "DELETE", &wrong)
+                .is_err(),
+            "non-canonical or non-unique delete version query must fail"
+        );
+    }
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn signed_exact_delete_requires_matching_response_version() {
+    let url = Url::parse("s3://tenant-artifacts/private-prefix").expect("S3 URL");
+    let configured =
+        ConfiguredS3Encryption::from_options(&url, &exact_target_options("eu-west-1"), None, None)
+            .expect("native AWS configuration");
+    let credentials = Arc::new(StaticCredentialProvider::new(AwsCredential {
+        key_id: "TESTACCESS".to_owned(),
+        secret_key: "test-secret".to_owned(),
+        token: None,
+    }));
+    let location = Path::parse("private-prefix/objects/encrypted.json").expect("path");
+
+    for (response_version, expected) in [
+        ("opaque-version", Ok(())),
+        (
+            "different-version",
+            Err(ObjectStorageError::VersionMismatch),
+        ),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut headers = object_store::HeaderMap::new();
+        headers.insert(
+            "x-amz-version-id",
+            response_version.parse().expect("version header"),
+        );
+        let adapter = configured.delete_adapter(
+            credentials.clone(),
+            HttpClient::new(CountingHttpResponseService {
+                calls: Arc::clone(&calls),
+                status: 204,
+                headers,
+            }),
+        );
+
+        assert_eq!(
+            adapter
+                .delete_exact(location.clone(), Some("opaque-version".to_owned()))
+                .await,
+            expected
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2965,7 +3050,8 @@ fn public_debug_matrix_never_discloses_artifact_or_backend_sentinels() {
 
 #[test]
 fn verified_delete_contract_binds_context_digest_version_and_typed_outcome() {
-    let delete = verified_delete("objects/delete-contract.json", b"delete-contract");
+    let mut delete = verified_delete("objects/delete-contract.json", b"delete-contract");
+    delete.expected_version = Some("opaque-version".to_owned());
     assert_eq!(delete.key.as_str(), "objects/delete-contract.json");
     assert_eq!(
         delete.context_id,
@@ -3165,6 +3251,175 @@ async fn concurrent_exact_creates_converge_to_one_object() {
             .filter(|receipt| receipt.receipt().idempotent_replay)
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn delete_verified_removes_only_the_matching_contextual_object() {
+    let storage = storage(1_024);
+    let policy = development_policy();
+    let receipt = storage
+        .put_immutable(write("objects/delete.json", b"verified-delete"), &policy)
+        .await
+        .expect("immutable write");
+
+    let deleted = storage
+        .delete_verified(VerifiedObjectDelete {
+            key: receipt.receipt().key.clone(),
+            context_id: receipt.receipt().context_id.clone(),
+            expected_digest: receipt.receipt().digest.clone(),
+            expected_version: receipt.receipt().version.clone(),
+        })
+        .await
+        .expect("verified delete");
+
+    assert_eq!(deleted.outcome, ObjectDeleteOutcome::Deleted);
+    assert_eq!(deleted.key, receipt.receipt().key);
+    assert_eq!(deleted.context_id, receipt.receipt().context_id);
+    assert_eq!(deleted.digest, receipt.receipt().digest);
+    assert_eq!(deleted.version, receipt.receipt().version);
+    assert_eq!(
+        storage
+            .read_verified(
+                &deleted.key,
+                &deleted.context_id,
+                &deleted.digest,
+                deleted.version.as_deref(),
+            )
+            .await,
+        Err(ObjectStorageError::NotFound)
+    );
+}
+
+#[tokio::test]
+async fn delete_verified_replay_is_typed_and_idempotent() {
+    let storage = storage(1_024);
+    let policy = development_policy();
+    let receipt = storage
+        .put_immutable(
+            write("objects/delete-replay.json", b"delete-replay"),
+            &policy,
+        )
+        .await
+        .expect("immutable write");
+    let request = VerifiedObjectDelete {
+        key: receipt.receipt().key.clone(),
+        context_id: receipt.receipt().context_id.clone(),
+        expected_digest: receipt.receipt().digest.clone(),
+        expected_version: receipt.receipt().version.clone(),
+    };
+
+    assert_eq!(
+        storage
+            .delete_verified(request.clone())
+            .await
+            .expect("first delete")
+            .outcome,
+        ObjectDeleteOutcome::Deleted
+    );
+    assert_eq!(
+        storage
+            .delete_verified(request)
+            .await
+            .expect("replayed delete")
+            .outcome,
+        ObjectDeleteOutcome::AlreadyAbsent
+    );
+}
+
+#[tokio::test]
+async fn delete_verified_wrong_identity_fails_closed() {
+    let storage = storage(1_024);
+    let policy = development_policy();
+    let receipt = storage
+        .put_immutable(write("objects/delete-guard.json", b"delete-guard"), &policy)
+        .await
+        .expect("immutable write");
+    let exact = VerifiedObjectDelete {
+        key: receipt.receipt().key.clone(),
+        context_id: receipt.receipt().context_id.clone(),
+        expected_digest: receipt.receipt().digest.clone(),
+        expected_version: receipt.receipt().version.clone(),
+    };
+    let mut wrong_context = exact.clone();
+    wrong_context.context_id = context_id(b"other-context");
+    let mut wrong_digest = exact.clone();
+    wrong_digest.expected_digest = digest_bytes(b"wrong-digest");
+    let mut wrong_version = exact.clone();
+    wrong_version.expected_version = Some("wrong-version".to_owned());
+
+    assert_eq!(
+        storage.delete_verified(wrong_context).await,
+        Ok(ObjectDeleteReceipt {
+            key: exact.key.clone(),
+            context_id: context_id(b"other-context"),
+            digest: exact.expected_digest.clone(),
+            version: exact.expected_version.clone(),
+            outcome: ObjectDeleteOutcome::AlreadyAbsent,
+        })
+    );
+    assert_eq!(
+        storage.delete_verified(wrong_digest).await,
+        Err(ObjectStorageError::DigestMismatch)
+    );
+    assert_eq!(
+        storage.delete_verified(wrong_version).await,
+        Err(ObjectStorageError::VersionMismatch)
+    );
+    storage
+        .read_verified(
+            &exact.key,
+            &exact.context_id,
+            &exact.expected_digest,
+            exact.expected_version.as_deref(),
+        )
+        .await
+        .expect("object remains after rejected deletes");
+}
+
+#[tokio::test]
+async fn concurrent_delete_verified_requests_converge_to_absence() {
+    let storage = storage(1_024);
+    let policy = development_policy();
+    let receipt = storage
+        .put_immutable(
+            write("objects/delete-concurrent.json", b"delete-concurrent"),
+            &policy,
+        )
+        .await
+        .expect("immutable write");
+    let request = VerifiedObjectDelete {
+        key: receipt.receipt().key.clone(),
+        context_id: receipt.receipt().context_id.clone(),
+        expected_digest: receipt.receipt().digest.clone(),
+        expected_version: receipt.receipt().version.clone(),
+    };
+    let left = storage.clone();
+    let right = storage.clone();
+
+    let (left, right) = tokio::join!(
+        left.delete_verified(request.clone()),
+        right.delete_verified(request.clone()),
+    );
+    let outcomes = [
+        left.expect("left delete").outcome,
+        right.expect("right delete").outcome,
+    ];
+    assert!(outcomes.contains(&ObjectDeleteOutcome::Deleted));
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        ObjectDeleteOutcome::Deleted | ObjectDeleteOutcome::AlreadyAbsent
+    )));
+    assert_eq!(
+        storage
+            .read_verified(
+                &request.key,
+                &request.context_id,
+                &request.expected_digest,
+                request.expected_version.as_deref(),
+            )
+            .await,
+        Err(ObjectStorageError::NotFound)
     );
 }
 

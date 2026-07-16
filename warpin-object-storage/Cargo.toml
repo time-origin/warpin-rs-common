@@ -21,7 +21,7 @@ include = [
 
 [features]
 default = ["fs"]
-fs = ["object_store/fs"]
+fs = ["object_store/fs", "dep:tokio"]
 aws = ["object_store/aws", "dep:async-trait", "dep:humantime", "dep:reqwest"]
 
 [dependencies]
@@ -31,6 +31,7 @@ humantime = { workspace = true, optional = true }
 object_store.workspace = true
 reqwest = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 url.workspace = true
 warpin-integrity.workspace = true
 

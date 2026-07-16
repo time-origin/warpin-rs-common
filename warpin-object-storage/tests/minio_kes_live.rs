@@ -6,8 +6,9 @@ use bytes::Bytes;
 use warpin_integrity::digest_bytes;
 use warpin_object_storage::{
     ArtifactEncryptionContextId, ArtifactEncryptionPolicy, EncryptionAttestationView,
-    EncryptionRequirement, ImmutableObjectWrite, ObjectKey, ObjectStoreSettings,
-    VerifiedObjectStorage, s3_adapter::with_minio_kes_object_context_profile,
+    EncryptionRequirement, ImmutableObjectWrite, ObjectDeleteOutcome, ObjectKey,
+    ObjectStoreSettings, VerifiedObjectDelete, VerifiedObjectStorage,
+    s3_adapter::with_minio_kes_object_context_profile,
 };
 
 const MINIO_GATE_KEY_IDENTITY: &[u8] = b"arn:aws:kms:minio-r4-default";
@@ -115,6 +116,33 @@ async fn tls_minio_kes_managed_write_is_attested_and_readable() {
             .expect("post-restart exact-version read for context B");
         assert_eq!(read_a.content, content_a);
         assert_eq!(read_b.content, content_b);
+        for (context_id, digest, version) in [
+            (context_a, digest_a, version_a),
+            (context_b, digest_b, version_b),
+        ] {
+            let request = VerifiedObjectDelete {
+                key: key.clone(),
+                context_id,
+                expected_digest: digest,
+                expected_version: Some(version),
+            };
+            assert_eq!(
+                storage
+                    .delete_verified(request.clone())
+                    .await
+                    .expect("exact-version live cleanup")
+                    .outcome,
+                ObjectDeleteOutcome::Deleted
+            );
+            assert_eq!(
+                storage
+                    .delete_verified(request)
+                    .await
+                    .expect("idempotent exact-version live cleanup replay")
+                    .outcome,
+                ObjectDeleteOutcome::AlreadyAbsent
+            );
+        }
         return;
     }
     assert!(

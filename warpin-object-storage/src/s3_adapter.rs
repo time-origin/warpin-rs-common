@@ -10,10 +10,10 @@ use object_store::path::Path;
 #[cfg(feature = "aws")]
 use object_store::{
     ObjectStore,
-    aws::{AmazonS3Builder, AmazonS3ConfigKey},
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsAuthorizer, AwsCredentialProvider},
     client::{
         ClientConfigKey, HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest,
-        HttpResponse, HttpService,
+        HttpRequestBody, HttpResponse, HttpService,
     },
 };
 #[cfg(feature = "aws")]
@@ -197,6 +197,21 @@ impl ExpectedRequestTarget {
         if !request.operation.matches_method(method) {
             return Err(ObjectStorageError::InvalidConfiguration);
         }
+        let expected = self.request_url(request)?;
+        let actual =
+            Url::parse(request_uri).map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+        if actual.scheme() != "https"
+            || actual.username() != ""
+            || actual.password().is_some()
+            || actual.fragment().is_some()
+            || actual.as_str() != expected.as_str()
+        {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
+        Ok(digest_bytes(actual.as_str().as_bytes()))
+    }
+
+    fn request_url(&self, request: &ObserverRequestBinding) -> Result<Url, ObjectStorageError> {
         // `object_store` signs S3 paths with AWS's RFC 3986 encoding rules.
         // WHATWG URL path-segment encoding is intentionally different (for
         // example, it leaves `=` unescaped), so using `Url::path_segments_mut`
@@ -217,23 +232,13 @@ impl ExpectedRequestTarget {
                     return Err(ObjectStorageError::InvalidConfiguration);
                 }
             }
-            ObservedOperation::Readback => {
+            ObservedOperation::Readback | ObservedOperation::Delete => {
                 if let Some(version) = request.expected_version.as_deref() {
                     expected.query_pairs_mut().append_pair("versionId", version);
                 }
             }
         }
-        let actual =
-            Url::parse(request_uri).map_err(|_| ObjectStorageError::InvalidConfiguration)?;
-        if actual.scheme() != "https"
-            || actual.username() != ""
-            || actual.password().is_some()
-            || actual.fragment().is_some()
-            || actual.as_str() != expected.as_str()
-        {
-            return Err(ObjectStorageError::InvalidConfiguration);
-        }
-        Ok(digest_bytes(actual.as_str().as_bytes()))
+        Ok(expected)
     }
 
     fn verify_sigv4(
@@ -332,7 +337,7 @@ impl ExpectedRequestTarget {
                 .as_ref()
                 .and_then(|binding| binding.content_digest().as_str().strip_prefix("sha256:"))
                 .ok_or(ObjectStorageError::InvalidConfiguration)?,
-            ObservedOperation::Readback => EMPTY_SHA256_HEX,
+            ObservedOperation::Readback | ObservedOperation::Delete => EMPTY_SHA256_HEX,
         };
         if content_sha != expected_content_sha {
             return Err(ObjectStorageError::InvalidConfiguration);
@@ -663,13 +668,23 @@ impl ConfiguredS3Encryption {
         selected_profile_id: Option<ManagedEncryptionProfileId>,
         expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
         trusted_root_certificate_pems: Vec<Vec<u8>>,
-    ) -> Result<(Box<dyn ObjectStore>, Path, Self), ObjectStorageError> {
+    ) -> Result<(Box<dyn ObjectStore>, Path, Self, S3VerifiedDeleteAdapter), ObjectStorageError>
+    {
         let configured = Self::from_options(
             url,
             &options,
             selected_profile_id,
             expected_observed_key_identity_fingerprint,
         )?;
+        let client_options = managed_client_options(&options)?;
+        let delete_connector = S3EncryptionObserverConnector::new(
+            configured.expected_request_target.clone(),
+            configured.credential_mode.clone(),
+            &trusted_root_certificate_pems,
+        )?;
+        let delete_client = delete_connector
+            .connect(&client_options)
+            .map_err(map_backend_configuration_error)?;
         let mut builder = AmazonS3Builder::new()
             .with_url(url.as_str())
             .with_config(
@@ -688,9 +703,97 @@ impl ConfiguredS3Encryption {
             builder = builder.with_config(key, value);
         }
         let store = builder.build().map_err(map_backend_configuration_error)?;
+        let delete_adapter = S3VerifiedDeleteAdapter {
+            credentials: store.credentials().clone(),
+            client: delete_client,
+            expected_request_target: configured.expected_request_target.clone(),
+            sigv4_region: configured.expected_request_target.sigv4_region.clone(),
+        };
         let prefix = Path::from_url_path(url.path())
             .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
-        Ok((Box::new(store), prefix, configured))
+        Ok((Box::new(store), prefix, configured, delete_adapter))
+    }
+}
+
+#[cfg(feature = "aws")]
+fn managed_client_options(
+    options: &BTreeMap<String, String>,
+) -> Result<object_store::ClientOptions, ObjectStorageError> {
+    let mut client_options = object_store::ClientOptions::new()
+        .with_config(ClientConfigKey::RandomizeAddresses, "false");
+    for (key, value) in options {
+        if let AmazonS3ConfigKey::Client(key) = key
+            .parse::<AmazonS3ConfigKey>()
+            .map_err(|_| ObjectStorageError::InvalidConfiguration)?
+        {
+            client_options = client_options.with_config(key, value);
+        }
+    }
+    Ok(client_options)
+}
+
+#[cfg(feature = "aws")]
+#[derive(Clone)]
+pub(crate) struct S3VerifiedDeleteAdapter {
+    credentials: AwsCredentialProvider,
+    client: HttpClient,
+    expected_request_target: ExpectedRequestTarget,
+    sigv4_region: String,
+}
+
+#[cfg(feature = "aws")]
+impl fmt::Debug for S3VerifiedDeleteAdapter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S3VerifiedDeleteAdapter")
+            .field("target", &"[BOUND]")
+            .field("credentials", &"[CONFIGURED]")
+            .finish()
+    }
+}
+
+#[cfg(feature = "aws")]
+impl S3VerifiedDeleteAdapter {
+    pub(crate) async fn delete_exact(
+        &self,
+        location: Path,
+        expected_version: Option<String>,
+    ) -> Result<(), ObjectStorageError> {
+        let binding = ObserverRequestBinding::delete(location, expected_version.clone());
+        let url = self.expected_request_target.request_url(&binding)?;
+        let mut request = HttpRequest::new(HttpRequestBody::empty());
+        *request.method_mut() = "DELETE"
+            .parse()
+            .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+        *request.uri_mut() = url
+            .as_str()
+            .parse()
+            .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+        request.extensions_mut().insert(binding);
+        let credentials = self
+            .credentials
+            .get_credential()
+            .await
+            .map_err(|_| ObjectStorageError::Backend)?;
+        AwsAuthorizer::new(&credentials, "s3", &self.sigv4_region)
+            .try_authorize(&mut request, None)
+            .map_err(|_| ObjectStorageError::RequestSignatureInvalid)?;
+        let response = self.client.execute(request).await.map_err(|error| {
+            map_managed_request_error(&error).unwrap_or(ObjectStorageError::Backend)
+        })?;
+        match response.status().as_u16() {
+            200 | 204 => {
+                if let Some(expected_version) = expected_version.as_deref()
+                    && single_header_value(response.headers(), S3_VERSION_HEADER)
+                        != Some(expected_version)
+                {
+                    return Err(ObjectStorageError::VersionMismatch);
+                }
+                Ok(())
+            }
+            404 => Err(ObjectStorageError::NotFound),
+            _ => Err(ObjectStorageError::Backend),
+        }
     }
 }
 
@@ -721,6 +824,24 @@ impl ConfiguredS3Encryption {
             inner,
             expected_request_target: self.expected_request_target.clone(),
             credential_mode: self.credential_mode.clone(),
+        }
+    }
+
+    #[cfg(all(test, feature = "aws"))]
+    pub(crate) fn delete_adapter(
+        &self,
+        credentials: AwsCredentialProvider,
+        inner: HttpClient,
+    ) -> S3VerifiedDeleteAdapter {
+        S3VerifiedDeleteAdapter {
+            credentials,
+            client: HttpClient::new(S3EncryptionObserverService {
+                inner,
+                expected_request_target: self.expected_request_target.clone(),
+                credential_mode: self.credential_mode.clone(),
+            }),
+            expected_request_target: self.expected_request_target.clone(),
+            sigv4_region: self.expected_request_target.sigv4_region.clone(),
         }
     }
 
