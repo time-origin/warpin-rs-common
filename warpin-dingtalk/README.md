@@ -18,11 +18,18 @@ Custom origins are rejected unless the caller supplies an explicit
 `DingTalkEndpointPolicy::TrustedOrigins` value. API and legacy OAPI origins are
 purpose-bound separately. Every configured base and trusted origin must use
 HTTPS and must not contain user information, a query, or a fragment.
+Request paths are restricted to unambiguous relative route characters and must
+remain beneath the configured API or OAPI base path. Absolute references,
+empty or dot segments, percent-encoding, queries, and fragments are rejected
+before any request is sent.
 
 `DingTalkTransportPolicy` applies bounded connect, request, and read timeouts.
 The production client never follows redirects, accepts HTTPS only, and ignores
 ambient proxy configuration. Arbitrary `reqwest::Client` injection is not
 supported because it could bypass these outbound security controls.
+Concurrent access-token misses share one refresh operation. Every caller is
+bounded from entry by the configured request timeout, including time spent
+waiting for an in-flight refresh.
 
 ## Security contract
 

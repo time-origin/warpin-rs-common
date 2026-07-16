@@ -39,10 +39,12 @@ tests must prove that raw values cannot cross those boundaries.
 
 Its outbound transport is fail closed: official HTTPS origins are the default;
 private origins require an explicit purpose-bound trusted-origin policy; URL
-userinfo, query, fragment, cross-origin path escape, redirects, ambient proxies,
-unbounded timeouts, and arbitrary HTTP-client injection are forbidden. Public
-provider/user-content DTOs do not implement `Debug`; signed URL DTOs expose
-redacted debug output only.
+userinfo, query, fragment, absolute references, dot segments, encoded path
+ambiguity, base-path escape, redirects, ambient proxies, unbounded timeouts,
+and arbitrary HTTP-client injection are forbidden. Concurrent token misses use
+a single-flight refresh, and every waiter has a fixed whole-operation deadline.
+Public provider/user-content DTOs do not implement `Debug`; signed URL DTOs
+expose redacted debug output only.
 
 ## 3. Release Scope
 

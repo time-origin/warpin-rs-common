@@ -201,10 +201,12 @@ DingTalk README and security contract are present in the archive.
 
 Also require outbound endpoint and transport tests to prove, before sensitive
 egress, that the default client accepts only official HTTPS origins; explicit
-private origins are purpose-bound; absolute request paths cannot replace the
-validated origin; redirects are never followed; connect/request/read timeouts
-are bounded; arbitrary HTTP-client injection is absent; and signed attachment
-URLs and untrusted provider fields cannot enter `Debug` output.
+private origins are purpose-bound; request routes reject absolute references,
+dot segments, encoded ambiguity, and base-path escape; redirects are never
+followed; connect/request/read timeouts are bounded; concurrent token misses
+share one refresh and every waiter has a fixed whole-operation deadline;
+arbitrary HTTP-client injection is absent; and signed attachment URLs and
+untrusted provider fields cannot enter `Debug` output.
 
 - [ ] **Step 1: Run Functional Verification independently**
 
