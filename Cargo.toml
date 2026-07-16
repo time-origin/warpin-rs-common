@@ -19,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.2.3"
+version = "0.2.5"
 license = "MIT"
 authors = ["Warpin Engineering <dev@warpin.io>"]
 repository = "https://github.com/time-origin/warpin-rs-common"
@@ -82,8 +82,8 @@ jsonwebtoken = "9.3"
 config = "0.15.19"
 
 # ── Workspace 内部互依赖 ──
-warpin-types  = { path = "warpin-types",  version = "0.2.4" }
-warpin-errors = { path = "warpin-errors", version = "0.2.2" }
-warpin-config = { path = "warpin-config", version = "0.2.2" }
-warpin-dingtalk = { path = "warpin-dingtalk", version = "0.2.2" }
-warpin-integrity = { path = "warpin-integrity", version = "0.1.1" }
+warpin-types  = { path = "warpin-types",  version = "0.2.5" }
+warpin-errors = { path = "warpin-errors", version = "0.2.5" }
+warpin-config = { path = "warpin-config", version = "0.2.5" }
+warpin-dingtalk = { path = "warpin-dingtalk", version = "0.2.5" }
+warpin-integrity = { path = "warpin-integrity", version = "0.2.5" }
