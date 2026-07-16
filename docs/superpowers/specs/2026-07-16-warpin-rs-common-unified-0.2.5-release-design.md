@@ -42,10 +42,11 @@ private origins require an explicit purpose-bound trusted-origin policy; URL
 userinfo, query, fragment, absolute references, dot segments, encoded path
 ambiguity, base-path escape, redirects, ambient proxies, unbounded timeouts,
 and arbitrary HTTP-client injection are forbidden. Concurrent token misses use
-a single-flight refresh whose success or typed failure result is shared, and
-every waiter has a fixed whole-operation deadline. Public provider/user-content
-DTOs do not implement `Debug`; signed URL DTOs expose redacted debug output
-only.
+an atomically selected, immutable per-generation single-flight result; every
+waiter has a fixed whole-operation deadline, and supervised worker failure must
+release the generation for retry. Provider token values and TTLs are validated
+and bounded before cache arithmetic. Public provider/user-content DTOs do not
+implement `Debug`; signed URL DTOs expose redacted debug output only.
 
 ## 3. Release Scope
 

@@ -21,16 +21,21 @@ HTTPS and must not contain user information, a query, or a fragment.
 Request paths are restricted to unambiguous relative route characters and must
 remain beneath the configured API or OAPI base path. Absolute references,
 empty or dot segments, percent-encoding, queries, and fragments are rejected
-before any request is sent.
+before any request is sent. Endpoint text must use canonical ASCII without
+control characters, whitespace, an empty authority, or parser-recoverable
+ambiguity.
 
 `DingTalkTransportPolicy` applies bounded connect, request, and read timeouts.
 The production client never follows redirects, accepts HTTPS only, and ignores
 ambient proxy configuration. Arbitrary `reqwest::Client` injection is not
 supported because it could bypass these outbound security controls.
-Concurrent access-token misses share one refresh operation and observe the same
-success or typed failure result. Every caller is bounded from entry by the
-configured request timeout, including time spent waiting for an in-flight
-refresh.
+Concurrent access-token misses bind atomically to one immutable refresh
+generation and observe that generation's same success or typed failure result.
+Every caller is bounded from entry by the configured request timeout, including
+time spent waiting for an in-flight refresh. A detached supervisor converts a
+worker panic or cancellation into a retryable typed failure and releases the
+generation for retry. Provider token values and TTLs are validated and bounded
+before cache arithmetic.
 
 ## Security contract
 

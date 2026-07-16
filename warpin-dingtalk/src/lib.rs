@@ -1,8 +1,12 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{fmt, sync::Arc, time::Duration as StdDuration};
-use tokio::sync::{Mutex, RwLock, watch};
+use std::{
+    fmt,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration as StdDuration,
+};
+use tokio::sync::watch;
 use warpin_errors::{Result, ServiceError};
 
 const DEFAULT_API_BASE: &str = "https://api.dingtalk.com";
@@ -10,6 +14,9 @@ const DEFAULT_OAPI_BASE: &str = "https://oapi.dingtalk.com";
 const REDACTED: &str = "[REDACTED]";
 const MIN_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const MAX_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_ACCESS_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
+const TOKEN_CACHE_SAFETY_MARGIN_SECONDS: i64 = 120;
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -169,39 +176,143 @@ pub struct DingTalkClient {
     api_base: Url,
     oapi_base: Url,
     http: reqwest::Client,
-    token: Arc<RwLock<Option<CachedToken>>>,
     token_refresh: Arc<TokenRefreshCoordinator>,
     token_refresh_timeout: StdDuration,
 }
 
 struct TokenRefreshCoordinator {
-    state: Mutex<TokenRefreshState>,
-    completion: watch::Sender<TokenRefreshSnapshot>,
+    state: StdMutex<TokenRefreshState>,
 }
 
 #[derive(Default)]
 struct TokenRefreshState {
-    generation: u64,
-    in_flight: bool,
+    cached: Option<CachedToken>,
+    in_flight: Option<Arc<TokenRefreshOperation>>,
 }
 
-#[derive(Clone)]
-struct TokenRefreshSnapshot {
-    generation: u64,
-    result: Option<Result<String>>,
+struct TokenRefreshOperation {
+    completion: watch::Sender<Option<Result<String>>>,
+}
+
+enum TokenRefreshAction {
+    Cached(String),
+    Join(Arc<TokenRefreshOperation>),
+    Start(Arc<TokenRefreshOperation>),
+}
+
+struct ValidatedAccessToken {
+    value: String,
+    cached: Option<CachedToken>,
 }
 
 impl TokenRefreshCoordinator {
     fn new() -> Self {
-        let (completion, _) = watch::channel(TokenRefreshSnapshot {
-            generation: 0,
-            result: None,
-        });
         Self {
-            state: Mutex::new(TokenRefreshState::default()),
-            completion,
+            state: StdMutex::new(TokenRefreshState::default()),
         }
     }
+
+    fn acquire(&self) -> Result<TokenRefreshAction> {
+        let mut state = self.state.lock().map_err(|_| token_refresh_error())?;
+        if let Some(value) = state
+            .cached
+            .as_ref()
+            .filter(|token| token.is_valid())
+            .map(|token| token.value.clone())
+        {
+            return Ok(TokenRefreshAction::Cached(value));
+        }
+        state.cached = None;
+
+        if let Some(operation) = &state.in_flight {
+            return Ok(TokenRefreshAction::Join(operation.clone()));
+        }
+
+        let operation = Arc::new(TokenRefreshOperation::new());
+        state.in_flight = Some(operation.clone());
+        Ok(TokenRefreshAction::Start(operation))
+    }
+
+    fn complete(
+        &self,
+        operation: &Arc<TokenRefreshOperation>,
+        result: Result<ValidatedAccessToken>,
+    ) {
+        let shared_result = match self.state.lock() {
+            Ok(mut state) => {
+                let owns_generation = state
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, operation));
+                if !owns_generation {
+                    Err(token_refresh_error())
+                } else {
+                    state.in_flight = None;
+                    match result {
+                        Ok(validated) => {
+                            let value = validated.value.clone();
+                            state.cached = validated.cached;
+                            Ok(value)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                if state
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, operation))
+                {
+                    state.in_flight = None;
+                }
+                state.cached = None;
+                Err(token_refresh_error())
+            }
+        };
+        operation.complete(shared_result);
+    }
+}
+
+impl TokenRefreshOperation {
+    fn new() -> Self {
+        let (completion, _) = watch::channel(None);
+        Self { completion }
+    }
+
+    async fn wait(&self) -> Result<String> {
+        let mut completion = self.completion.subscribe();
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| token_refresh_error())?;
+        }
+    }
+
+    fn complete(&self, result: Result<String>) {
+        self.completion.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(result);
+                true
+            }
+        });
+    }
+}
+
+fn token_refresh_error() -> ServiceError {
+    DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true).into_service_error()
+}
+
+fn invalid_token_response_error() -> ServiceError {
+    DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::ResponseDecode, false)
+        .into_service_error()
 }
 
 impl fmt::Debug for DingTalkClient {
@@ -250,7 +361,6 @@ impl DingTalkClient {
             api_base,
             oapi_base,
             http,
-            token: Arc::new(RwLock::new(None)),
             token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: transport_policy.request_timeout(),
         })
@@ -269,70 +379,33 @@ impl DingTalkClient {
     }
 
     async fn access_token_before_deadline(&self) -> Result<String> {
-        if let Some(token) = self.valid_cached_token().await {
-            return Ok(token);
-        }
-
-        let mut completion = self.token_refresh.completion.subscribe();
-        let observed_generation = completion.borrow().generation;
-        loop {
-            if let Some(token) = self.valid_cached_token().await {
-                return Ok(token);
+        match self.token_refresh.acquire()? {
+            TokenRefreshAction::Cached(value) => Ok(value),
+            TokenRefreshAction::Join(operation) => operation.wait().await,
+            TokenRefreshAction::Start(operation) => {
+                self.spawn_access_token_refresh(operation.clone());
+                operation.wait().await
             }
-
-            let snapshot = completion.borrow().clone();
-            if snapshot.generation != observed_generation {
-                return snapshot.result.unwrap_or_else(|| {
-                    Err(
-                        DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true)
-                            .into_service_error(),
-                    )
-                });
-            }
-
-            let should_start = {
-                let mut state = self.token_refresh.state.lock().await;
-                if state.generation != observed_generation || state.in_flight {
-                    false
-                } else {
-                    state.in_flight = true;
-                    true
-                }
-            };
-            if should_start {
-                let client = self.clone();
-                tokio::spawn(async move {
-                    client.complete_access_token_refresh().await;
-                });
-            }
-
-            completion.changed().await.map_err(|_| {
-                DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true)
-                    .into_service_error()
-            })?;
         }
     }
 
-    async fn complete_access_token_refresh(&self) {
-        let result = match self.fetch_access_token().await {
-            Ok(response) => {
-                let value = response.access_token.clone();
-                *self.token.write().await = Some(CachedToken::from_response(response));
-                Ok(value)
-            }
-            Err(error) => Err(error),
-        };
+    fn spawn_access_token_refresh(&self, operation: Arc<TokenRefreshOperation>) {
+        let worker_client = self.clone();
+        self.spawn_access_token_refresh_worker(operation, async move {
+            worker_client.fetch_validated_access_token().await
+        });
+    }
 
-        let snapshot = {
-            let mut state = self.token_refresh.state.lock().await;
-            state.generation = state.generation.wrapping_add(1);
-            state.in_flight = false;
-            TokenRefreshSnapshot {
-                generation: state.generation,
-                result: Some(result),
-            }
-        };
-        self.token_refresh.completion.send_replace(snapshot);
+    fn spawn_access_token_refresh_worker<F>(&self, operation: Arc<TokenRefreshOperation>, worker: F)
+    where
+        F: std::future::Future<Output = Result<ValidatedAccessToken>> + Send + 'static,
+    {
+        let worker = tokio::spawn(worker);
+        let supervisor = self.clone();
+        tokio::spawn(async move {
+            let result = worker.await.unwrap_or_else(|_| Err(token_refresh_error()));
+            supervisor.token_refresh.complete(&operation, result);
+        });
     }
 
     pub async fn get_attendance_records(
@@ -541,15 +614,6 @@ impl DingTalkClient {
         envelope.into_result()
     }
 
-    async fn valid_cached_token(&self) -> Option<String> {
-        self.token
-            .read()
-            .await
-            .as_ref()
-            .filter(|token| token.is_valid())
-            .map(|token| token.value.clone())
-    }
-
     async fn fetch_access_token(&self) -> Result<AccessTokenResponse> {
         let url = self.api_url("/v1.0/oauth2/accessToken")?;
         let request = AccessTokenRequest {
@@ -568,6 +632,10 @@ impl DingTalkClient {
             .json()
             .await
             .map_err(map_decode_error)
+    }
+
+    async fn fetch_validated_access_token(&self) -> Result<ValidatedAccessToken> {
+        self.fetch_access_token().await?.into_validated()
     }
 
     fn api_url(&self, path: &str) -> Result<Url> {
@@ -596,14 +664,6 @@ impl fmt::Debug for CachedToken {
 }
 
 impl CachedToken {
-    fn from_response(response: AccessTokenResponse) -> Self {
-        let ttl = response.expire_in.saturating_sub(120).max(60);
-        Self {
-            value: response.access_token,
-            expires_at: Utc::now() + ChronoDuration::seconds(ttl),
-        }
-    }
-
     fn is_valid(&self) -> bool {
         Utc::now() < self.expires_at
     }
@@ -642,6 +702,40 @@ impl fmt::Debug for AccessTokenResponse {
             .field("access_token", &REDACTED)
             .field("expire_in", &self.expire_in)
             .finish()
+    }
+}
+
+impl AccessTokenResponse {
+    fn into_validated(self) -> Result<ValidatedAccessToken> {
+        let token_is_valid = !self.access_token.is_empty()
+            && self.access_token.len() <= MAX_ACCESS_TOKEN_BYTES
+            && self.access_token.is_ascii()
+            && self
+                .access_token
+                .bytes()
+                .all(|byte| (b'!'..=b'~').contains(&byte));
+        let ttl_is_valid = self.expire_in > 0 && self.expire_in <= MAX_ACCESS_TOKEN_TTL_SECONDS;
+        if !token_is_valid || !ttl_is_valid {
+            return Err(invalid_token_response_error());
+        }
+
+        let value = self.access_token;
+        let cache_ttl = (self.expire_in - TOKEN_CACHE_SAFETY_MARGIN_SECONDS).max(0);
+        let cached = if cache_ttl == 0 {
+            None
+        } else {
+            let duration =
+                ChronoDuration::try_seconds(cache_ttl).ok_or_else(invalid_token_response_error)?;
+            let expires_at = Utc::now()
+                .checked_add_signed(duration)
+                .ok_or_else(invalid_token_response_error)?;
+            Some(CachedToken {
+                value: value.clone(),
+                expires_at,
+            })
+        };
+
+        Ok(ValidatedAccessToken { value, cached })
     }
 }
 
@@ -1561,16 +1655,29 @@ fn endpoint_policy_error() -> ServiceError {
 }
 
 fn raw_endpoint_path_is_unambiguous(raw: &str) -> bool {
-    if raw != raw.trim() || raw.bytes().any(|byte| matches!(byte, b'%' | b'\\')) {
+    if !raw.is_ascii()
+        || raw != raw.trim()
+        || raw
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'%' | b'\\'))
+    {
         return false;
     }
 
     let Some(authority_and_path) = raw.strip_prefix("https://") else {
         return false;
     };
-    let raw_path = authority_and_path
-        .find('/')
-        .map_or("/", |path_start| &authority_and_path[path_start..]);
+    let authority_end = authority_and_path
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_path.len());
+    if authority_end == 0 {
+        return false;
+    }
+    let raw_path = if authority_and_path.as_bytes().get(authority_end) == Some(&b'/') {
+        &authority_and_path[authority_end..]
+    } else {
+        "/"
+    };
     route_path_is_unambiguous(raw_path, true)
 }
 
@@ -1737,6 +1844,57 @@ mod tests {
         assert!(envelope.into_result().is_err());
     }
 
+    #[test]
+    fn access_token_response_validation_is_bounded_and_canonical() {
+        let invalid = [
+            AccessTokenResponse {
+                access_token: String::new(),
+                expire_in: 7200,
+            },
+            AccessTokenResponse {
+                access_token: " ACCESS_TOKEN_987".to_owned(),
+                expire_in: 7200,
+            },
+            AccessTokenResponse {
+                access_token: "ACCESS_TOKEN_987\n".to_owned(),
+                expire_in: 7200,
+            },
+            AccessTokenResponse {
+                access_token: "访问令牌".to_owned(),
+                expire_in: 7200,
+            },
+            AccessTokenResponse {
+                access_token: "A".repeat(MAX_ACCESS_TOKEN_BYTES + 1),
+                expire_in: 7200,
+            },
+            AccessTokenResponse {
+                access_token: "ACCESS_TOKEN_987".to_owned(),
+                expire_in: 0,
+            },
+            AccessTokenResponse {
+                access_token: "ACCESS_TOKEN_987".to_owned(),
+                expire_in: MAX_ACCESS_TOKEN_TTL_SECONDS + 1,
+            },
+        ];
+        for response in invalid {
+            let error = match response.into_validated() {
+                Ok(_) => panic!("invalid token response must fail closed"),
+                Err(error) => error,
+            };
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_response_decode_failed"));
+        }
+
+        let short_lived = AccessTokenResponse {
+            access_token: "SHORT_LIVED_TOKEN_987".to_owned(),
+            expire_in: TOKEN_CACHE_SAFETY_MARGIN_SECONDS,
+        }
+        .into_validated()
+        .expect("valid short-lived token");
+        assert!(short_lived.cached.is_none());
+    }
+
     fn sentinel_config() -> DingTalkConfig {
         DingTalkConfig {
             corp_id: Some("CORP_PRIVATE_987".to_owned()),
@@ -1814,7 +1972,12 @@ mod tests {
             ..sentinel_config()
         })
         .expect("valid client config");
-        *client.token.write().await = Some(CachedToken {
+        client
+            .token_refresh
+            .state
+            .lock()
+            .expect("token state")
+            .cached = Some(CachedToken {
             value: "ACCESS_TOKEN_987".to_owned(),
             expires_at: Utc::now() + ChronoDuration::minutes(10),
         });
@@ -1827,9 +1990,19 @@ mod tests {
             expire_in: 3600,
         };
 
+        let cached_token = format!(
+            "{:?}",
+            client
+                .token_refresh
+                .state
+                .lock()
+                .expect("token state")
+                .cached
+                .as_ref()
+        );
         for rendered in [
             format!("{client:?}"),
-            format!("{:?}", client.token.read().await.as_ref()),
+            cached_token,
             format!("{request:?}"),
             format!("{response:?}"),
         ] {
@@ -1936,6 +2109,12 @@ mod tests {
             ("api", "https://api.dingtalk.com#APP_SECRET_987"),
             ("api", "https://api.dingtalk.com/%2e%2e/private"),
             ("api", "https://api.dingtalk.com/private%2fescape"),
+            ("api", "https:///api.dingtalk.com"),
+            ("api", "https://api.\ndingtalk.com"),
+            ("api", "https://api.\rdingtalk.com"),
+            ("api", "https://api.\tdingtalk.com"),
+            ("api", "https://api．dingtalk.com"),
+            ("oapi", "https:///oapi.dingtalk.com"),
             ("oapi", "https://oapi.dingtalk.com.attacker-987.example"),
         ] {
             let mut config = official.clone();
@@ -1950,6 +2129,25 @@ mod tests {
             assert_no_sentinel(&rendered);
             assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
         }
+    }
+
+    #[test]
+    fn trusted_endpoint_authority_cannot_be_recovered_from_a_raw_path() {
+        let config = DingTalkConfig {
+            api_base: "https:///api.private.example/dingtalk".to_owned(),
+            oapi_base: "https://oapi.private.example/dingtalk".to_owned(),
+            ..sentinel_config()
+        };
+        let policy = DingTalkEndpointPolicy::TrustedOrigins {
+            api_origin: "https://api.private.example".to_owned(),
+            oapi_origin: "https://oapi.private.example".to_owned(),
+        };
+
+        let error = DingTalkClient::with_endpoint_policy(config, policy)
+            .expect_err("raw endpoint authority must be non-empty");
+        let rendered = format!("{error:?} {error}");
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
     }
 
     #[test]
@@ -2116,7 +2314,6 @@ mod tests {
             oapi_base: api_base,
             http: build_http_client_for_loopback_test(policy)
                 .expect("build bounded loopback client"),
-            token: Arc::new(RwLock::new(None)),
             token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: policy.request_timeout(),
         };
@@ -2201,7 +2398,6 @@ mod tests {
             oapi_base: api_base,
             http: build_http_client_for_loopback_test(policy)
                 .expect("build single-flight loopback client"),
-            token: Arc::new(RwLock::new(None)),
             token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: policy.request_timeout(),
         };
@@ -2269,7 +2465,6 @@ mod tests {
             oapi_base: api_base,
             http: build_http_client_for_loopback_test(policy)
                 .expect("build failure-sharing loopback client"),
-            token: Arc::new(RwLock::new(None)),
             token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: policy.request_timeout(),
         };
@@ -2286,11 +2481,258 @@ mod tests {
                 .expect_err("shared refresh must fail");
             let rendered = format!("{error:?} {error}");
             assert_no_sentinel(&rendered);
-            assert!(rendered.contains("dingtalk_http_status_error"));
-            assert!(rendered.contains("status=503"));
-            assert!(rendered.contains("retryable=true"));
+            assert!(
+                rendered.contains("dingtalk_http_status_error"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("status=503"), "{rendered}");
+            assert!(rendered.contains("retryable=true"), "{rendered}");
         }
         provider.await.expect("failing token provider task");
+    }
+
+    #[tokio::test]
+    async fn malicious_token_ttl_fails_typed_and_the_next_generation_can_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TTL token provider");
+        let address = listener.local_addr().expect("TTL provider address");
+        let provider = tokio::spawn(async move {
+            for body in [
+                r#"{"accessToken":"ACCESS_TOKEN_987","expireIn":9223372036854775807}"#,
+                r#"{"accessToken":"RECOVERED_ACCESS_TOKEN_987","expireIn":7200}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept token request");
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write token response");
+            }
+        });
+
+        let policy = DingTalkTransportPolicy::new(
+            StdDuration::from_millis(100),
+            StdDuration::from_secs(1),
+            StdDuration::from_millis(500),
+        )
+        .expect("valid TTL policy");
+        let api_base = Url::parse(&format!("http://{address}")).expect("loopback API base");
+        let client = DingTalkClient {
+            config: DingTalkConfig {
+                api_base: api_base.to_string(),
+                oapi_base: api_base.to_string(),
+                ..sentinel_config()
+            },
+            api_base: api_base.clone(),
+            oapi_base: api_base,
+            http: build_http_client_for_loopback_test(policy).expect("build TTL loopback client"),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
+            token_refresh_timeout: policy.request_timeout(),
+        };
+
+        let error = client
+            .access_token()
+            .await
+            .expect_err("unbounded provider TTL must fail");
+        let rendered = format!("{error:?} {error}");
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("dingtalk_response_decode_failed"));
+
+        assert_eq!(
+            client.access_token().await.expect("next generation retry"),
+            "RECOVERED_ACCESS_TOKEN_987"
+        );
+        provider.await.expect("TTL provider task");
+    }
+
+    #[tokio::test]
+    async fn refresh_result_is_bound_to_one_immutable_generation() {
+        let coordinator = TokenRefreshCoordinator::new();
+        let first = match coordinator.acquire().expect("first generation") {
+            TokenRefreshAction::Start(operation) => operation,
+            _ => panic!("first generation must start"),
+        };
+        let delayed_waiter = match coordinator.acquire().expect("join first generation") {
+            TokenRefreshAction::Join(operation) => operation,
+            _ => panic!("concurrent caller must bind to first generation"),
+        };
+        assert!(Arc::ptr_eq(&first, &delayed_waiter));
+
+        coordinator.complete(
+            &first,
+            Err(
+                DingTalkBoundaryError::from_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+                    .into_service_error(),
+            ),
+        );
+        let second = match coordinator.acquire().expect("second generation") {
+            TokenRefreshAction::Start(operation) => operation,
+            _ => panic!("new caller must be able to retry"),
+        };
+        coordinator.complete(
+            &second,
+            Ok(ValidatedAccessToken {
+                value: "RECOVERED_ACCESS_TOKEN_987".to_owned(),
+                cached: None,
+            }),
+        );
+
+        assert_eq!(
+            second.wait().await.expect("second generation result"),
+            "RECOVERED_ACCESS_TOKEN_987"
+        );
+        let first_error = delayed_waiter
+            .wait()
+            .await
+            .expect_err("delayed first-generation waiter must keep the first result");
+        let rendered = format!("{first_error:?} {first_error}");
+        assert!(rendered.contains("dingtalk_http_status_error"));
+        assert!(rendered.contains("status=503"));
+        assert!(rendered.contains("retryable=true"));
+    }
+
+    #[tokio::test]
+    async fn starter_cancellation_does_not_cancel_the_shared_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration as TokioDuration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cancellation provider");
+        let address = listener
+            .local_addr()
+            .expect("cancellation provider address");
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept token request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(TokioDuration::from_millis(150)).await;
+            let body = r#"{"accessToken":"CANCELLATION_SAFE_TOKEN_987","expireIn":7200}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write token response");
+            assert!(
+                timeout(TokioDuration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "starter cancellation triggered another refresh"
+            );
+        });
+
+        let policy = DingTalkTransportPolicy::new(
+            StdDuration::from_millis(100),
+            StdDuration::from_secs(1),
+            StdDuration::from_millis(500),
+        )
+        .expect("valid cancellation policy");
+        let api_base = Url::parse(&format!("http://{address}")).expect("loopback API base");
+        let client = DingTalkClient {
+            config: DingTalkConfig {
+                api_base: api_base.to_string(),
+                oapi_base: api_base.to_string(),
+                ..sentinel_config()
+            },
+            api_base: api_base.clone(),
+            oapi_base: api_base,
+            http: build_http_client_for_loopback_test(policy)
+                .expect("build cancellation loopback client"),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
+            token_refresh_timeout: policy.request_timeout(),
+        };
+
+        assert!(
+            timeout(TokioDuration::from_millis(50), client.access_token())
+                .await
+                .is_err(),
+            "starter call should be cancelled by its caller"
+        );
+        assert_eq!(
+            client.access_token().await.expect("join detached refresh"),
+            "CANCELLATION_SAFE_TOKEN_987"
+        );
+        provider.await.expect("cancellation provider task");
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_panic_is_supervised_and_the_next_generation_can_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind panic recovery provider");
+        let address = listener.local_addr().expect("panic recovery address");
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept retry request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"accessToken":"PANIC_RECOVERED_TOKEN_987","expireIn":7200}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write retry response");
+        });
+
+        let policy = DingTalkTransportPolicy::new(
+            StdDuration::from_millis(100),
+            StdDuration::from_secs(1),
+            StdDuration::from_millis(500),
+        )
+        .expect("valid panic recovery policy");
+        let api_base = Url::parse(&format!("http://{address}")).expect("loopback API base");
+        let client = DingTalkClient {
+            config: DingTalkConfig {
+                api_base: api_base.to_string(),
+                oapi_base: api_base.to_string(),
+                ..sentinel_config()
+            },
+            api_base: api_base.clone(),
+            oapi_base: api_base,
+            http: build_http_client_for_loopback_test(policy)
+                .expect("build panic recovery loopback client"),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
+            token_refresh_timeout: policy.request_timeout(),
+        };
+
+        let failed_operation = match client.token_refresh.acquire().expect("panic generation") {
+            TokenRefreshAction::Start(operation) => operation,
+            _ => panic!("panic generation must start"),
+        };
+        client.spawn_access_token_refresh_worker(failed_operation.clone(), async {
+            panic!("provider-controlled refresh panic sentinel")
+        });
+        let error = failed_operation
+            .wait()
+            .await
+            .expect_err("panic must become a typed failure");
+        let rendered = format!("{error:?} {error}");
+        assert!(rendered.contains("dingtalk_transport_failed"));
+        assert!(rendered.contains("retryable=true"));
+
+        assert_eq!(
+            client
+                .access_token()
+                .await
+                .expect("retry after supervised panic"),
+            "PANIC_RECOVERED_TOKEN_987"
+        );
+        provider.await.expect("panic recovery provider task");
     }
 
     #[test]
