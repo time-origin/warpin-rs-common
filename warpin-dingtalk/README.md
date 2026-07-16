@@ -27,9 +27,10 @@ before any request is sent.
 The production client never follows redirects, accepts HTTPS only, and ignores
 ambient proxy configuration. Arbitrary `reqwest::Client` injection is not
 supported because it could bypass these outbound security controls.
-Concurrent access-token misses share one refresh operation. Every caller is
-bounded from entry by the configured request timeout, including time spent
-waiting for an in-flight refresh.
+Concurrent access-token misses share one refresh operation and observe the same
+success or typed failure result. Every caller is bounded from entry by the
+configured request timeout, including time spent waiting for an in-flight
+refresh.
 
 ## Security contract
 

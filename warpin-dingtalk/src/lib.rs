@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, sync::Arc, time::Duration as StdDuration};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use warpin_errors::{Result, ServiceError};
 
 const DEFAULT_API_BASE: &str = "https://api.dingtalk.com";
@@ -170,8 +170,38 @@ pub struct DingTalkClient {
     oapi_base: Url,
     http: reqwest::Client,
     token: Arc<RwLock<Option<CachedToken>>>,
-    token_refresh: Arc<Mutex<()>>,
+    token_refresh: Arc<TokenRefreshCoordinator>,
     token_refresh_timeout: StdDuration,
+}
+
+struct TokenRefreshCoordinator {
+    state: Mutex<TokenRefreshState>,
+    completion: watch::Sender<TokenRefreshSnapshot>,
+}
+
+#[derive(Default)]
+struct TokenRefreshState {
+    generation: u64,
+    in_flight: bool,
+}
+
+#[derive(Clone)]
+struct TokenRefreshSnapshot {
+    generation: u64,
+    result: Option<Result<String>>,
+}
+
+impl TokenRefreshCoordinator {
+    fn new() -> Self {
+        let (completion, _) = watch::channel(TokenRefreshSnapshot {
+            generation: 0,
+            result: None,
+        });
+        Self {
+            state: Mutex::new(TokenRefreshState::default()),
+            completion,
+        }
+    }
 }
 
 impl fmt::Debug for DingTalkClient {
@@ -221,7 +251,7 @@ impl DingTalkClient {
             oapi_base,
             http,
             token: Arc::new(RwLock::new(None)),
-            token_refresh: Arc::new(Mutex::new(())),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: transport_policy.request_timeout(),
         })
     }
@@ -243,15 +273,66 @@ impl DingTalkClient {
             return Ok(token);
         }
 
-        let _refresh_guard = self.token_refresh.lock().await;
-        if let Some(token) = self.valid_cached_token().await {
-            return Ok(token);
-        }
+        let mut completion = self.token_refresh.completion.subscribe();
+        let observed_generation = completion.borrow().generation;
+        loop {
+            if let Some(token) = self.valid_cached_token().await {
+                return Ok(token);
+            }
 
-        let token = self.fetch_access_token().await?;
-        let value = token.access_token.clone();
-        *self.token.write().await = Some(CachedToken::from_response(token));
-        Ok(value)
+            let snapshot = completion.borrow().clone();
+            if snapshot.generation != observed_generation {
+                return snapshot.result.unwrap_or_else(|| {
+                    Err(
+                        DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true)
+                            .into_service_error(),
+                    )
+                });
+            }
+
+            let should_start = {
+                let mut state = self.token_refresh.state.lock().await;
+                if state.generation != observed_generation || state.in_flight {
+                    false
+                } else {
+                    state.in_flight = true;
+                    true
+                }
+            };
+            if should_start {
+                let client = self.clone();
+                tokio::spawn(async move {
+                    client.complete_access_token_refresh().await;
+                });
+            }
+
+            completion.changed().await.map_err(|_| {
+                DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::Transport, true)
+                    .into_service_error()
+            })?;
+        }
+    }
+
+    async fn complete_access_token_refresh(&self) {
+        let result = match self.fetch_access_token().await {
+            Ok(response) => {
+                let value = response.access_token.clone();
+                *self.token.write().await = Some(CachedToken::from_response(response));
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        };
+
+        let snapshot = {
+            let mut state = self.token_refresh.state.lock().await;
+            state.generation = state.generation.wrapping_add(1);
+            state.in_flight = false;
+            TokenRefreshSnapshot {
+                generation: state.generation,
+                result: Some(result),
+            }
+        };
+        self.token_refresh.completion.send_replace(snapshot);
     }
 
     pub async fn get_attendance_records(
@@ -1430,13 +1511,15 @@ impl DingTalkEndpointPolicy {
 }
 
 fn validate_endpoint_base(raw: &str) -> Result<Url> {
+    if !raw_endpoint_path_is_unambiguous(raw) {
+        return Err(endpoint_policy_error());
+    }
+
     let mut url = Url::parse(raw).map_err(|_| {
         DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::InvalidUrl, false)
             .into_service_error()
     })?;
-    let structurally_safe = raw == raw.trim()
-        && !raw.bytes().any(|byte| matches!(byte, b'%' | b'\\'))
-        && url.scheme() == "https"
+    let structurally_safe = url.scheme() == "https"
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
@@ -1475,6 +1558,20 @@ fn same_origin(left: &Url, right: &Url) -> bool {
 fn endpoint_policy_error() -> ServiceError {
     DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::EndpointPolicy, false)
         .into_service_error()
+}
+
+fn raw_endpoint_path_is_unambiguous(raw: &str) -> bool {
+    if raw != raw.trim() || raw.bytes().any(|byte| matches!(byte, b'%' | b'\\')) {
+        return false;
+    }
+
+    let Some(authority_and_path) = raw.strip_prefix("https://") else {
+        return false;
+    };
+    let raw_path = authority_and_path
+        .find('/')
+        .map_or("/", |path_start| &authority_and_path[path_start..]);
+    route_path_is_unambiguous(raw_path, true)
 }
 
 fn route_path_is_unambiguous(path: &str, root_allowed: bool) -> bool {
@@ -1889,6 +1986,31 @@ mod tests {
     }
 
     #[test]
+    fn trusted_base_rejects_raw_dot_segments_before_url_normalization() {
+        let policy = DingTalkEndpointPolicy::TrustedOrigins {
+            api_origin: "https://api.private.example".to_owned(),
+            oapi_origin: "https://oapi.private.example".to_owned(),
+        };
+
+        for api_base in [
+            "https://api.private.example/dingtalk/../capture",
+            "https://api.private.example/dingtalk/./capture",
+            "https://api.private.example/a/../../capture",
+        ] {
+            let config = DingTalkConfig {
+                api_base: api_base.to_owned(),
+                oapi_base: "https://oapi.private.example/dingtalk".to_owned(),
+                ..sentinel_config()
+            };
+            let error = DingTalkClient::with_endpoint_policy(config, policy.clone())
+                .expect_err("raw base dot segments must fail before URL normalization");
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
+        }
+    }
+
+    #[test]
     fn request_path_cannot_escape_the_validated_origin() {
         let base = validate_endpoint_base("https://api.private.example/dingtalk")
             .expect("trusted API base");
@@ -1995,7 +2117,7 @@ mod tests {
             http: build_http_client_for_loopback_test(policy)
                 .expect("build bounded loopback client"),
             token: Arc::new(RwLock::new(None)),
-            token_refresh: Arc::new(Mutex::new(())),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: policy.request_timeout(),
         };
 
@@ -2080,7 +2202,7 @@ mod tests {
             http: build_http_client_for_loopback_test(policy)
                 .expect("build single-flight loopback client"),
             token: Arc::new(RwLock::new(None)),
-            token_refresh: Arc::new(Mutex::new(())),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
             token_refresh_timeout: policy.request_timeout(),
         };
 
@@ -2099,6 +2221,76 @@ mod tests {
             );
         }
         provider.await.expect("token provider task");
+    }
+
+    #[tokio::test]
+    async fn concurrent_token_refresh_shares_the_same_failure_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration as TokioDuration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing token provider");
+        let address = listener.local_addr().expect("failing provider address");
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept token request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            tokio::time::sleep(TokioDuration::from_millis(100)).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write token failure");
+
+            assert!(
+                timeout(TokioDuration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "concurrent waiters retried an already completed refresh"
+            );
+        });
+
+        let policy = DingTalkTransportPolicy::new(
+            StdDuration::from_millis(100),
+            StdDuration::from_secs(1),
+            StdDuration::from_millis(500),
+        )
+        .expect("valid failure-sharing policy");
+        let api_base = Url::parse(&format!("http://{address}")).expect("loopback API base");
+        let client = DingTalkClient {
+            config: DingTalkConfig {
+                api_base: api_base.to_string(),
+                oapi_base: api_base.to_string(),
+                ..sentinel_config()
+            },
+            api_base: api_base.clone(),
+            oapi_base: api_base,
+            http: build_http_client_for_loopback_test(policy)
+                .expect("build failure-sharing loopback client"),
+            token: Arc::new(RwLock::new(None)),
+            token_refresh: Arc::new(TokenRefreshCoordinator::new()),
+            token_refresh_timeout: policy.request_timeout(),
+        };
+
+        let mut waiters = Vec::new();
+        for _ in 0..16 {
+            let client = client.clone();
+            waiters.push(tokio::spawn(async move { client.access_token().await }));
+        }
+        for waiter in waiters {
+            let error = waiter
+                .await
+                .expect("token waiter task")
+                .expect_err("shared refresh must fail");
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_http_status_error"));
+            assert!(rendered.contains("status=503"));
+            assert!(rendered.contains("retryable=true"));
+        }
+        provider.await.expect("failing token provider task");
     }
 
     #[test]
