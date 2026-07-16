@@ -39,9 +39,10 @@ worker panic or cancellation into a retryable typed failure and releases the
 generation for retry. Provider token values and TTLs are validated and bounded
 before cache arithmetic.
 
-Provider JSON is decoded through a streaming hard limit: 64 KiB for OAuth token
-responses and 8 MiB for other DingTalk APIs. Declared or chunked overflow is
-aborted before JSON allocation or deserialization can grow past that boundary.
+Provider JSON is decoded through a streaming response-buffer limit: 64 KiB for
+OAuth token responses and 8 MiB for other DingTalk APIs. Declared or chunked
+overflow is aborted before deserialization. These limits bound wire-response
+bytes, not the in-memory size of the resulting deserialized DTO.
 
 ## Security contract
 
