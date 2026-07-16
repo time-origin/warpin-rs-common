@@ -727,6 +727,7 @@ impl fmt::Debug for WriteBinding {
 pub(crate) enum ObservedOperation {
     Put,
     Readback,
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     Delete,
 }
 
@@ -780,6 +781,7 @@ impl ObserverRequestBinding {
         }
     }
 
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     pub(crate) fn delete(expected_location: Path, expected_version: Option<String>) -> Self {
         Self {
             binding: None,
