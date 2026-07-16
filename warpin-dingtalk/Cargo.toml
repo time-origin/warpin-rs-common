@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "DingTalk OpenAPI client primitives for Warpin applications"
+readme = "README.md"
+keywords = ["dingtalk", "api-client", "enterprise", "oauth"]
+categories = ["api-bindings", "authentication"]
 
 [dependencies]
 chrono.workspace = true

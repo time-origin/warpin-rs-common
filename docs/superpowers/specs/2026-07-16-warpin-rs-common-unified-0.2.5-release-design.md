@@ -1,7 +1,7 @@
 # warpin-rs-common 0.2.5 Unified Release Design
 
-**Date:** 2026-07-16  
-**Status:** Approved design, pending implementation plan  
+**Date:** 2026-07-16
+**Status:** Approved design, pending implementation plan
 **Owners:** Public Rust Modules, AstroNexus Runtime R4
 
 ## 1. Objective
@@ -26,6 +26,16 @@ valid patch version.
 `warpin-dingtalk` is a workspace member but is not currently present on
 crates.io. It is included in the unified release and will use `0.2.5` as its
 first public version.
+
+Every package archive must include the repository's MIT license text. Because
+`warpin-dingtalk` is a first publication, its archive must also include a README
+that documents its API purpose and secret-safe error and logging contract.
+
+The DingTalk client treats configuration values, access tokens, request URLs,
+provider response bodies, and provider messages as sensitive boundary data.
+Its `Debug` implementations and returned `ServiceError` values may expose only
+stable error kinds, numeric HTTP or provider codes, and retryability; sentinel
+tests must prove that raw values cannot cross those boundaries.
 
 ## 3. Release Scope
 

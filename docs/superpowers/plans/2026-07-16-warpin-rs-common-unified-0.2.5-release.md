@@ -185,6 +185,20 @@ Expected: valid normalized manifests and a checksum for every generated Layer 0 
 - Consumes: Tasks 1 through 3 evidence and package archives.
 - Produces: explicit P0/P1/P2 findings and PUBLISH GO or NO-GO.
 
+- [ ] **Step 0: Verify first-publication security and legal packaging gates**
+
+    cargo test -p warpin-dingtalk --all-features --locked
+
+Require secret-bearing configuration, cached tokens, OAuth payloads, request
+URLs, provider response bodies, and provider messages to remain absent from
+all tested `Debug`, `Display`, transport, decode, HTTP-status, and OAPI error
+paths. Require every one of the 14 package archives to contain the exact MIT
+license text, and require the first `warpin-dingtalk` archive to contain its
+README and normalized `readme = "README.md"` metadata.
+
+Expected: sentinel leakage count is zero; all package license hashes match; the
+DingTalk README and security contract are present in the archive.
+
 - [ ] **Step 1: Run Functional Verification independently**
 
 Verify member count, version consistency, internal dependency requirements, workspace gates, object-storage security gates, package contents, normalized manifests, checksums, and the unpublished state of all 14 exact versions.
