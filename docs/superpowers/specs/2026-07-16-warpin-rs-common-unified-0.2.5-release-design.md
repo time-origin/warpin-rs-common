@@ -110,7 +110,8 @@ The release uses the following gates:
 
 1. Confirm all 14 package names and verify that `0.2.5` is unoccupied.
 2. Apply the unified workspace and internal dependency versions.
-3. Regenerate the public workspace lockfile.
+3. Regenerate the ignored public workspace lockfile as local verification
+   input; the library repository intentionally does not commit `Cargo.lock`.
 4. Run formatting, workspace check, tests, all-target/all-feature clippy, and
    package-content inspection.
 5. Run `cargo package` and `cargo publish --dry-run` wherever the current

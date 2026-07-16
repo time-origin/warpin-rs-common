@@ -27,7 +27,7 @@
 
 **Files:**
 - Modify: Cargo.toml
-- Modify: Cargo.lock
+- Regenerate locally: Cargo.lock (intentionally ignored by this library repository)
 - Modify: warpin-integrity/Cargo.toml
 - Modify: warpin-types/Cargo.toml
 - Modify: warpin-object-storage/Cargo.toml
@@ -54,11 +54,13 @@ Set workspace.package.version to 0.2.5. Set the workspace dependency versions fo
 
 No source, feature, or third-party dependency entry changes in this task.
 
-- [ ] **Step 3: Regenerate the lockfile through Cargo**
+- [ ] **Step 3: Regenerate the ignored local lockfile through Cargo**
 
     cargo check --workspace --all-targets --all-features
 
-Expected: success and local workspace package entries at 0.2.5.
+Expected: success and local workspace package entries at 0.2.5. Cargo.lock is
+used by the locked verification commands but remains ignored and is not added
+to the release commit.
 
 - [ ] **Step 4: Run the unified member and internal dependency contracts and require GREEN**
 
@@ -80,7 +82,7 @@ Expected: JSON true, no member-specific package version, and no whitespace error
 
 - [ ] **Step 5: Commit the unified public manifests**
 
-    git add Cargo.toml Cargo.lock \
+    git add Cargo.toml \
       warpin-integrity/Cargo.toml warpin-types/Cargo.toml \
       warpin-object-storage/Cargo.toml warpin-event-bus/Cargo.toml
     git commit -m "release: unify public crates at 0.2.5"
