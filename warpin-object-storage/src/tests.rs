@@ -15,7 +15,7 @@ use bytes::Bytes;
 use object_store::{Extensions, path::Path};
 #[cfg(feature = "aws")]
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutOptions};
-#[cfg(feature = "fs")]
+#[cfg(any(feature = "aws", feature = "fs"))]
 use url::Url;
 use warpin_integrity::{Sha256Digest, digest_bytes};
 
