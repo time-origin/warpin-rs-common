@@ -37,6 +37,13 @@ Its `Debug` implementations and returned `ServiceError` values may expose only
 stable error kinds, numeric HTTP or provider codes, and retryability; sentinel
 tests must prove that raw values cannot cross those boundaries.
 
+Its outbound transport is fail closed: official HTTPS origins are the default;
+private origins require an explicit purpose-bound trusted-origin policy; URL
+userinfo, query, fragment, cross-origin path escape, redirects, ambient proxies,
+unbounded timeouts, and arbitrary HTTP-client injection are forbidden. Public
+provider/user-content DTOs do not implement `Debug`; signed URL DTOs expose
+redacted debug output only.
+
 ## 3. Release Scope
 
 The public release contains all workspace members:

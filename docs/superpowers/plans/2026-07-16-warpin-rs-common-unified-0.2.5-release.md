@@ -199,6 +199,13 @@ README and normalized `readme = "README.md"` metadata.
 Expected: sentinel leakage count is zero; all package license hashes match; the
 DingTalk README and security contract are present in the archive.
 
+Also require outbound endpoint and transport tests to prove, before sensitive
+egress, that the default client accepts only official HTTPS origins; explicit
+private origins are purpose-bound; absolute request paths cannot replace the
+validated origin; redirects are never followed; connect/request/read timeouts
+are bounded; arbitrary HTTP-client injection is absent; and signed attachment
+URLs and untrusted provider fields cannot enter `Debug` output.
+
 - [ ] **Step 1: Run Functional Verification independently**
 
 Verify member count, version consistency, internal dependency requirements, workspace gates, object-storage security gates, package contents, normalized manifests, checksums, and the unpublished state of all 14 exact versions.

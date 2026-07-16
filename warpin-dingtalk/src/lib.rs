@@ -1,13 +1,105 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration as StdDuration};
 use tokio::sync::RwLock;
 use warpin_errors::{Result, ServiceError};
 
 const DEFAULT_API_BASE: &str = "https://api.dingtalk.com";
 const DEFAULT_OAPI_BASE: &str = "https://oapi.dingtalk.com";
 const REDACTED: &str = "[REDACTED]";
+const MIN_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_millis(100);
+const MAX_TRANSPORT_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DingTalkEndpointPolicy {
+    #[default]
+    OfficialOnly,
+    TrustedOrigins {
+        api_origin: String,
+        oapi_origin: String,
+    },
+}
+
+impl fmt::Debug for DingTalkEndpointPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OfficialOnly => formatter.write_str("OfficialOnly"),
+            Self::TrustedOrigins { .. } => formatter
+                .debug_struct("TrustedOrigins")
+                .field("api_origin", &REDACTED)
+                .field("oapi_origin", &REDACTED)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DingTalkTransportPolicy {
+    connect_timeout: StdDuration,
+    request_timeout: StdDuration,
+    read_timeout: StdDuration,
+}
+
+impl Default for DingTalkTransportPolicy {
+    fn default() -> Self {
+        Self {
+            connect_timeout: StdDuration::from_secs(5),
+            request_timeout: StdDuration::from_secs(30),
+            read_timeout: StdDuration::from_secs(15),
+        }
+    }
+}
+
+impl DingTalkTransportPolicy {
+    pub fn new(
+        connect_timeout: StdDuration,
+        request_timeout: StdDuration,
+        read_timeout: StdDuration,
+    ) -> Result<Self> {
+        let policy = Self {
+            connect_timeout,
+            request_timeout,
+            read_timeout,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub const fn connect_timeout(self) -> StdDuration {
+        self.connect_timeout
+    }
+
+    pub const fn request_timeout(self) -> StdDuration {
+        self.request_timeout
+    }
+
+    pub const fn read_timeout(self) -> StdDuration {
+        self.read_timeout
+    }
+
+    fn validate(self) -> Result<()> {
+        let timeouts = [
+            self.connect_timeout,
+            self.request_timeout,
+            self.read_timeout,
+        ];
+        let bounded = timeouts
+            .iter()
+            .all(|timeout| *timeout >= MIN_TRANSPORT_TIMEOUT && *timeout <= MAX_TRANSPORT_TIMEOUT);
+        let coherent = self.connect_timeout <= self.request_timeout
+            && self.read_timeout <= self.request_timeout;
+        if bounded && coherent {
+            Ok(())
+        } else {
+            Err(
+                DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::TransportPolicy, false)
+                    .into_service_error(),
+            )
+        }
+    }
+}
 
 #[derive(Clone, Deserialize)]
 pub struct DingTalkConfig {
@@ -48,6 +140,12 @@ impl fmt::Debug for DingTalkConfig {
 
 impl DingTalkConfig {
     pub fn validate(&self) -> Result<()> {
+        self.validate_credentials()?;
+        self.validated_bases(&DingTalkEndpointPolicy::default())?;
+        Ok(())
+    }
+
+    fn validate_credentials(&self) -> Result<()> {
         if self.app_key.trim().is_empty() {
             return Err(ServiceError::bad_request("dingtalk.app_key is required"));
         }
@@ -56,11 +154,20 @@ impl DingTalkConfig {
         }
         Ok(())
     }
+
+    fn validated_bases(&self, policy: &DingTalkEndpointPolicy) -> Result<(Url, Url)> {
+        let api_base = validate_endpoint_base(&self.api_base)?;
+        let oapi_base = validate_endpoint_base(&self.oapi_base)?;
+        policy.validate_bases(&api_base, &oapi_base)?;
+        Ok((api_base, oapi_base))
+    }
 }
 
 #[derive(Clone)]
 pub struct DingTalkClient {
     config: DingTalkConfig,
+    api_base: Url,
+    oapi_base: Url,
     http: reqwest::Client,
     token: Arc<RwLock<Option<CachedToken>>>,
 }
@@ -70,6 +177,8 @@ impl fmt::Debug for DingTalkClient {
         formatter
             .debug_struct("DingTalkClient")
             .field("config", &self.config)
+            .field("api_base", &REDACTED)
+            .field("oapi_base", &REDACTED)
             .field("http", &REDACTED)
             .field("token", &REDACTED)
             .finish()
@@ -78,20 +187,34 @@ impl fmt::Debug for DingTalkClient {
 
 impl DingTalkClient {
     pub fn new(config: DingTalkConfig) -> Result<Self> {
-        config.validate()?;
-
-        Ok(Self {
+        Self::with_policies(
             config,
-            http: reqwest::Client::new(),
-            token: Arc::new(RwLock::new(None)),
-        })
+            DingTalkEndpointPolicy::default(),
+            DingTalkTransportPolicy::default(),
+        )
     }
 
-    pub fn with_http_client(config: DingTalkConfig, http: reqwest::Client) -> Result<Self> {
-        config.validate()?;
+    pub fn with_endpoint_policy(
+        config: DingTalkConfig,
+        endpoint_policy: DingTalkEndpointPolicy,
+    ) -> Result<Self> {
+        Self::with_policies(config, endpoint_policy, DingTalkTransportPolicy::default())
+    }
+
+    pub fn with_policies(
+        config: DingTalkConfig,
+        endpoint_policy: DingTalkEndpointPolicy,
+        transport_policy: DingTalkTransportPolicy,
+    ) -> Result<Self> {
+        config.validate_credentials()?;
+        let (api_base, oapi_base) = config.validated_bases(&endpoint_policy)?;
+        transport_policy.validate()?;
+        let http = build_http_client(transport_policy)?;
 
         Ok(Self {
             config,
+            api_base,
+            oapi_base,
             http,
             token: Arc::new(RwLock::new(None)),
         })
@@ -349,11 +472,11 @@ impl DingTalkClient {
     }
 
     fn api_url(&self, path: &str) -> Result<Url> {
-        join_url(&self.config.api_base, path)
+        join_url(&self.api_base, path)
     }
 
     fn oapi_url(&self, path: &str) -> Result<Url> {
-        join_url(&self.config.oapi_base, path)
+        join_url(&self.oapi_base, path)
     }
 }
 
@@ -378,7 +501,7 @@ impl CachedToken {
         let ttl = response.expire_in.saturating_sub(120).max(60);
         Self {
             value: response.access_token,
-            expires_at: Utc::now() + Duration::seconds(ttl),
+            expires_at: Utc::now() + ChronoDuration::seconds(ttl),
         }
     }
 
@@ -423,7 +546,7 @@ impl fmt::Debug for AccessTokenResponse {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceRecordRequest {
     #[serde(rename = "checkDateFrom")]
     pub check_date_from: String,
@@ -435,19 +558,19 @@ pub struct AttendanceRecordRequest {
     pub is_i18n: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceRecordResponse {
     #[serde(rename = "recordresult", default)]
     pub records: Vec<AttendanceRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceRecord {
     #[serde(flatten)]
     pub fields: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceDetailRequest {
     #[serde(rename = "workDateFrom")]
     pub work_date_from: String,
@@ -461,7 +584,7 @@ pub struct AttendanceDetailRequest {
     pub is_i18n: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceDetailResponse {
     #[serde(default)]
     pub has_more: bool,
@@ -469,13 +592,13 @@ pub struct AttendanceDetailResponse {
     pub records: Vec<AttendanceDetail>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceDetail {
     #[serde(flatten)]
     pub fields: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DepartmentListRequest {
     #[serde(rename = "dept_id", skip_serializing_if = "Option::is_none")]
     pub dept_id: Option<i64>,
@@ -483,7 +606,7 @@ pub struct DepartmentListRequest {
     pub language: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DepartmentListResponse {
     #[serde(default, deserialize_with = "deserialize_department_list_result")]
     pub result: DepartmentListResult,
@@ -491,7 +614,7 @@ pub struct DepartmentListResponse {
 
 pub type DepartmentListResult = Vec<DingTalkDepartment>;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DingTalkDepartment {
     #[serde(rename = "dept_id", alias = "deptId", default)]
     pub dept_id: Option<i64>,
@@ -543,7 +666,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DepartmentUserListRequest {
     #[serde(rename = "dept_id")]
     pub dept_id: i64,
@@ -560,13 +683,13 @@ pub struct DepartmentUserListRequest {
     pub language: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DepartmentUserListResponse {
     #[serde(default)]
     pub result: DepartmentUserListResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DepartmentUserListResult {
     #[serde(default)]
     pub list: Vec<DingTalkUser>,
@@ -578,20 +701,20 @@ pub struct DepartmentUserListResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserGetRequest {
     pub userid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct UserGetResponse {
     #[serde(default)]
     pub result: DingTalkUser,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct DingTalkUser {
     #[serde(rename = "userid", alias = "userId", default)]
     pub user_id: Option<String>,
@@ -633,12 +756,12 @@ pub struct DingTalkUser {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProcessCodeByNameRequest {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProcessCodeByNameResponse {
     #[serde(default)]
     pub result: Option<ProcessCodeByNameResult>,
@@ -660,7 +783,7 @@ impl ProcessCodeByNameResponse {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProcessCodeByNameResult {
     #[serde(rename = "process_code", alias = "processCode", default)]
     pub process_code: Option<String>,
@@ -670,20 +793,20 @@ pub struct ProcessCodeByNameResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProcessListByUserRequest {
     pub userid: String,
     pub offset: u64,
     pub size: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProcessListByUserResponse {
     #[serde(default)]
     pub result: ProcessListByUserResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProcessListByUserResult {
     #[serde(default, alias = "process_list", alias = "processList")]
     pub list: Vec<VisibleProcess>,
@@ -695,7 +818,7 @@ pub struct ProcessListByUserResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct VisibleProcess {
     #[serde(default)]
     pub name: Option<String>,
@@ -709,7 +832,7 @@ pub struct VisibleProcess {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApprovalInstanceIdListRequest {
     #[serde(rename = "processCode")]
     pub process_code: String,
@@ -727,7 +850,7 @@ pub struct ApprovalInstanceIdListRequest {
     pub statuses: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalInstanceIdListResponse {
     #[serde(default)]
     pub list: Vec<String>,
@@ -735,17 +858,17 @@ pub struct ApprovalInstanceIdListResponse {
     pub next_token: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ApprovalInstanceIdListApiResponse {
     result: ApprovalInstanceIdListResponse,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ApprovalProcessInstanceApiResponse {
     result: ApprovalProcessInstance,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalProcessInstance {
     #[serde(default)]
     pub title: Option<String>,
@@ -805,7 +928,7 @@ impl ApprovalProcessInstance {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalFormComponentValue {
     #[serde(default)]
     pub id: Option<String>,
@@ -829,7 +952,7 @@ impl ApprovalFormComponentValue {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApprovalAttachmentDownloadUrlRequest {
     #[serde(rename = "process_instance_id")]
     pub process_instance_id: String,
@@ -837,13 +960,22 @@ pub struct ApprovalAttachmentDownloadUrlRequest {
     pub file_id: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalAttachmentDownloadUrlResponse {
     #[serde(default)]
     pub result: ApprovalAttachmentDownloadUrlResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+impl fmt::Debug for ApprovalAttachmentDownloadUrlResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalAttachmentDownloadUrlResponse")
+            .field("result", &self.result)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalAttachmentDownloadUrlResult {
     #[serde(
         rename = "download_url",
@@ -860,19 +992,33 @@ pub struct ApprovalAttachmentDownloadUrlResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+impl fmt::Debug for ApprovalAttachmentDownloadUrlResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalAttachmentDownloadUrlResult")
+            .field(
+                "download_url",
+                &self.download_url.as_ref().map(|_| REDACTED),
+            )
+            .field("expiration", &self.expiration)
+            .field("extra", &REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct HolidayTypeListRequest {
     #[serde(rename = "op_userid", skip_serializing_if = "Option::is_none")]
     pub op_user_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct HolidayTypeListResponse {
     #[serde(default, deserialize_with = "deserialize_holiday_type_list_result")]
     pub result: HolidayTypeListResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct HolidayTypeListResult {
     #[serde(default, alias = "leave_types", alias = "leaveTypes")]
     pub list: Vec<HolidayType>,
@@ -880,7 +1026,7 @@ pub struct HolidayTypeListResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct HolidayType {
     #[serde(rename = "leave_code", alias = "leaveCode", alias = "id", default)]
     pub leave_code: Option<String>,
@@ -920,7 +1066,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupListRequest {
     #[serde(rename = "op_user_id", skip_serializing_if = "Option::is_none")]
     pub op_user_id: Option<String>,
@@ -930,13 +1076,13 @@ pub struct AttendanceGroupListRequest {
     pub size: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupListResponse {
     #[serde(default, deserialize_with = "deserialize_attendance_group_list_result")]
     pub result: AttendanceGroupListResult,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupListResult {
     #[serde(default, alias = "groups")]
     pub list: Vec<AttendanceGroupSummary>,
@@ -948,7 +1094,7 @@ pub struct AttendanceGroupListResult {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupSummary {
     #[serde(rename = "group_id", alias = "groupId", alias = "id", default)]
     pub group_id: Option<i64>,
@@ -982,7 +1128,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AttendanceGroupGetRequest {
     #[serde(rename = "group_id")]
     pub group_id: i64,
@@ -990,13 +1136,13 @@ pub struct AttendanceGroupGetRequest {
     pub op_user_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupGetResponse {
     #[serde(default)]
     pub result: AttendanceGroupDetail,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AttendanceGroupDetail {
     #[serde(rename = "group_id", alias = "groupId", alias = "id", default)]
     pub group_id: Option<i64>,
@@ -1010,7 +1156,7 @@ pub struct AttendanceGroupDetail {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalOperationRecord {
     #[serde(rename = "userId", default)]
     pub user_id: Option<String>,
@@ -1030,7 +1176,7 @@ pub struct ApprovalOperationRecord {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalAttachment {
     #[serde(rename = "fileName", default)]
     pub file_name: Option<String>,
@@ -1044,7 +1190,7 @@ pub struct ApprovalAttachment {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ApprovalTask {
     #[serde(rename = "taskId", default)]
     pub task_id: Option<i64>,
@@ -1073,6 +1219,9 @@ pub struct ApprovalTask {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DingTalkBoundaryErrorKind {
     InvalidUrl,
+    EndpointPolicy,
+    TransportPolicy,
+    ClientBuild,
     Transport,
     ResponseDecode,
     HttpStatus,
@@ -1084,6 +1233,9 @@ impl DingTalkBoundaryErrorKind {
     const fn code(self) -> &'static str {
         match self {
             Self::InvalidUrl => "dingtalk_invalid_url",
+            Self::EndpointPolicy => "dingtalk_endpoint_policy_violation",
+            Self::TransportPolicy => "dingtalk_transport_policy_violation",
+            Self::ClientBuild => "dingtalk_client_build_failed",
             Self::Transport => "dingtalk_transport_failed",
             Self::ResponseDecode => "dingtalk_response_decode_failed",
             Self::HttpStatus => "dingtalk_http_status_error",
@@ -1155,7 +1307,12 @@ impl DingTalkBoundaryError {
             (Some(_), Some(_)) => "kind=dingtalk_boundary_error retryable=false".to_owned(),
         };
 
-        if self.kind == DingTalkBoundaryErrorKind::InvalidUrl {
+        if matches!(
+            self.kind,
+            DingTalkBoundaryErrorKind::InvalidUrl
+                | DingTalkBoundaryErrorKind::EndpointPolicy
+                | DingTalkBoundaryErrorKind::TransportPolicy
+        ) {
             ServiceError::bad_request(message)
         } else {
             ServiceError::service_unavailable(message)
@@ -1228,13 +1385,116 @@ fn default_oapi_base() -> String {
     DEFAULT_OAPI_BASE.to_string()
 }
 
-fn join_url(base: &str, path: &str) -> Result<Url> {
-    let base = base.trim_end_matches('/');
-    let path = path.trim_start_matches('/');
-    Url::parse(&format!("{base}/{path}")).map_err(|_| {
+impl DingTalkEndpointPolicy {
+    fn validate_bases(&self, api_base: &Url, oapi_base: &Url) -> Result<()> {
+        let allowed = match self {
+            Self::OfficialOnly => {
+                let official_api = validate_endpoint_base(DEFAULT_API_BASE)?;
+                let official_oapi = validate_endpoint_base(DEFAULT_OAPI_BASE)?;
+                api_base == &official_api && oapi_base == &official_oapi
+            }
+            Self::TrustedOrigins {
+                api_origin,
+                oapi_origin,
+            } => {
+                let trusted_api = validate_trusted_origin(api_origin)?;
+                let trusted_oapi = validate_trusted_origin(oapi_origin)?;
+                same_origin(api_base, &trusted_api) && same_origin(oapi_base, &trusted_oapi)
+            }
+        };
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(endpoint_policy_error())
+        }
+    }
+}
+
+fn validate_endpoint_base(raw: &str) -> Result<Url> {
+    let mut url = Url::parse(raw).map_err(|_| {
         DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::InvalidUrl, false)
             .into_service_error()
-    })
+    })?;
+    let structurally_safe = url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if !structurally_safe {
+        return Err(endpoint_policy_error());
+    }
+
+    let path = url.path().trim_end_matches('/');
+    let normalized_path = if path.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("{path}/")
+    };
+    url.set_path(&normalized_path);
+    Ok(url)
+}
+
+fn validate_trusted_origin(raw: &str) -> Result<Url> {
+    let origin = validate_endpoint_base(raw)?;
+    if origin.path() == "/" {
+        Ok(origin)
+    } else {
+        Err(endpoint_policy_error())
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn endpoint_policy_error() -> ServiceError {
+    DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::EndpointPolicy, false)
+        .into_service_error()
+}
+
+fn join_url(base: &Url, path: &str) -> Result<Url> {
+    let path = path.trim_start_matches('/');
+    let url = base.join(path).map_err(|_| {
+        DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::InvalidUrl, false)
+            .into_service_error()
+    })?;
+    if same_origin(base, &url) && url.username().is_empty() && url.password().is_none() {
+        Ok(url)
+    } else {
+        Err(endpoint_policy_error())
+    }
+}
+
+fn build_http_client(policy: DingTalkTransportPolicy) -> Result<reqwest::Client> {
+    build_http_client_inner(policy, true)
+}
+
+fn build_http_client_inner(
+    policy: DingTalkTransportPolicy,
+    https_only: bool,
+) -> Result<reqwest::Client> {
+    policy.validate()?;
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(policy.connect_timeout())
+        .timeout(policy.request_timeout())
+        .read_timeout(policy.read_timeout())
+        .https_only(https_only)
+        .no_proxy()
+        .build()
+        .map_err(|_| {
+            DingTalkBoundaryError::new(DingTalkBoundaryErrorKind::ClientBuild, false)
+                .into_service_error()
+        })
+}
+
+#[cfg(test)]
+fn build_http_client_for_loopback_test(policy: DingTalkTransportPolicy) -> Result<reqwest::Client> {
+    build_http_client_inner(policy, false)
 }
 
 fn map_transport_error(error: reqwest::Error) -> ServiceError {
@@ -1404,10 +1664,15 @@ mod tests {
 
     #[tokio::test]
     async fn client_and_token_debug_redact_credentials_and_cached_tokens() {
-        let client = DingTalkClient::new(sentinel_config()).expect("valid client config");
+        let client = DingTalkClient::new(DingTalkConfig {
+            api_base: DEFAULT_API_BASE.to_owned(),
+            oapi_base: DEFAULT_OAPI_BASE.to_owned(),
+            ..sentinel_config()
+        })
+        .expect("valid client config");
         *client.token.write().await = Some(CachedToken {
             value: "ACCESS_TOKEN_987".to_owned(),
-            expires_at: Utc::now() + Duration::minutes(10),
+            expires_at: Utc::now() + ChronoDuration::minutes(10),
         });
         let request = AccessTokenRequest {
             app_key: "APP_KEY_SECRET_987".to_owned(),
@@ -1504,10 +1769,252 @@ mod tests {
 
     #[test]
     fn invalid_url_error_never_echoes_config_or_path() {
-        let error = join_url("https://[INVALID_URL_SECRET_987", "provider")
+        let error = validate_endpoint_base("https://[INVALID_URL_SECRET_987")
             .expect_err("invalid URL must fail");
         let rendered = format!("{error:?} {error}");
 
         assert_no_sentinel(&rendered);
+    }
+
+    #[test]
+    fn endpoint_policy_rejects_untrusted_or_ambiguous_origins_before_io() {
+        let official = DingTalkConfig {
+            api_base: DEFAULT_API_BASE.to_owned(),
+            oapi_base: DEFAULT_OAPI_BASE.to_owned(),
+            ..sentinel_config()
+        };
+
+        for (field, value) in [
+            ("api", "http://api.dingtalk.com"),
+            ("api", "https://api.dingtalk.com.attacker-987.example"),
+            ("api", "https://APP_SECRET_987@api.dingtalk.com"),
+            ("api", "https://api.dingtalk.com?token=APP_SECRET_987"),
+            ("api", "https://api.dingtalk.com#APP_SECRET_987"),
+            ("oapi", "https://oapi.dingtalk.com.attacker-987.example"),
+        ] {
+            let mut config = official.clone();
+            if field == "api" {
+                config.api_base = value.to_owned();
+            } else {
+                config.oapi_base = value.to_owned();
+            }
+
+            let error = DingTalkClient::new(config).expect_err("origin must be rejected");
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
+        }
+    }
+
+    #[test]
+    fn trusted_origin_policy_is_explicit_and_purpose_bound() {
+        let config = DingTalkConfig {
+            api_base: "https://api.private-987.example/dingtalk".to_owned(),
+            oapi_base: "https://oapi.private-987.example/dingtalk".to_owned(),
+            ..sentinel_config()
+        };
+        let policy = DingTalkEndpointPolicy::TrustedOrigins {
+            api_origin: "https://api.private-987.example".to_owned(),
+            oapi_origin: "https://oapi.private-987.example".to_owned(),
+        };
+
+        let client = DingTalkClient::with_endpoint_policy(config.clone(), policy.clone())
+            .expect("explicit trusted origins must be accepted");
+        assert_eq!(
+            client
+                .api_url("/v1.0/oauth2/accessToken")
+                .expect("trusted API URL")
+                .as_str(),
+            "https://api.private-987.example/dingtalk/v1.0/oauth2/accessToken"
+        );
+
+        let swapped = DingTalkEndpointPolicy::TrustedOrigins {
+            api_origin: "https://oapi.private-987.example".to_owned(),
+            oapi_origin: "https://api.private-987.example".to_owned(),
+        };
+        let error = DingTalkClient::with_endpoint_policy(config, swapped)
+            .expect_err("purpose-swapped origins must fail");
+        let rendered = format!("{policy:?} {error:?} {error}");
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
+    }
+
+    #[test]
+    fn request_path_cannot_escape_the_validated_origin() {
+        let base = validate_endpoint_base(DEFAULT_API_BASE).expect("official API base");
+        let error = join_url(
+            &base,
+            "https://path-escape-987.example/capture?token=SIGNED_URL_TOKEN_987",
+        )
+        .expect_err("absolute request path must not replace the validated origin");
+        let rendered = format!("{error:?} {error}");
+
+        assert_no_sentinel(&rendered);
+        assert!(rendered.contains("dingtalk_endpoint_policy_violation"));
+    }
+
+    #[tokio::test]
+    async fn production_redirect_policy_never_follows_cross_origin_redirects() {
+        use tokio::time::{Duration as TokioDuration, timeout};
+
+        for status in [
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect target");
+            let target_address = target.local_addr().expect("redirect target address");
+            let source = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirect source");
+            let source_address = source.local_addr().expect("redirect source address");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: http://{target_address}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let (mut socket, _) = source.accept().await.expect("accept redirect request");
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write redirect response");
+            });
+
+            let client = build_http_client_for_loopback_test(DingTalkTransportPolicy::default())
+                .expect("build secure loopback client");
+            let response = client
+                .post(format!("http://{source_address}/oauth"))
+                .header("x-acs-dingtalk-access-token", "ACCESS_TOKEN_987")
+                .body("APP_SECRET_987")
+                .send()
+                .await
+                .expect("receive redirect response without following it");
+
+            assert!(response.status().is_redirection());
+            assert!(
+                timeout(TokioDuration::from_millis(200), target.accept())
+                    .await
+                    .is_err(),
+                "redirect target unexpectedly received a request for {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_token_refresh_is_bounded_and_returns_typed_retryable_timeout() {
+        use tokio::time::{Duration as TokioDuration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging provider");
+        let address = listener.local_addr().expect("hanging provider address");
+        tokio::spawn(async move {
+            let mut held_connections = Vec::new();
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.expect("accept token request");
+                held_connections.push(socket);
+            }
+            tokio::time::sleep(TokioDuration::from_secs(2)).await;
+        });
+
+        let policy = DingTalkTransportPolicy::new(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_millis(100),
+        )
+        .expect("valid bounded test transport policy");
+        let api_base = Url::parse(&format!("http://{address}")).expect("loopback API base");
+        let client = DingTalkClient {
+            config: DingTalkConfig {
+                api_base: api_base.to_string(),
+                oapi_base: api_base.to_string(),
+                ..sentinel_config()
+            },
+            api_base: api_base.clone(),
+            oapi_base: api_base,
+            http: build_http_client_for_loopback_test(policy)
+                .expect("build bounded loopback client"),
+            token: Arc::new(RwLock::new(None)),
+        };
+
+        let (first, second) = timeout(TokioDuration::from_secs(2), async {
+            tokio::join!(client.access_token(), client.access_token())
+        })
+        .await
+        .expect("all token waiters must finish within the bounded policy");
+
+        for error in [
+            first.expect_err("first refresh must time out"),
+            second.expect_err("second refresh must time out"),
+        ] {
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_transport_failed"));
+            assert!(rendered.contains("retryable=true"));
+        }
+    }
+
+    #[test]
+    fn transport_policy_rejects_unbounded_or_incoherent_timeouts() {
+        let cases = [
+            (
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+            (
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+            (
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+            ),
+            (
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(121),
+                std::time::Duration::from_secs(1),
+            ),
+        ];
+
+        for (connect, request, read) in cases {
+            let error = DingTalkTransportPolicy::new(connect, request, read)
+                .expect_err("unbounded transport policy must fail");
+            let rendered = format!("{error:?} {error}");
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("dingtalk_transport_policy_violation"));
+        }
+    }
+
+    #[test]
+    fn signed_url_debug_redacts_url_and_untrusted_provider_fields() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "provider_payload".to_owned(),
+            serde_json::Value::String("PROVIDER_BODY_987".to_owned()),
+        );
+        let result = ApprovalAttachmentDownloadUrlResult {
+            download_url: Some(
+                "https://download.example/object?token=SIGNED_URL_TOKEN_987".to_owned(),
+            ),
+            expiration: Some(123_456),
+            extra,
+        };
+        let response = ApprovalAttachmentDownloadUrlResponse {
+            result: result.clone(),
+        };
+
+        for rendered in [format!("{result:?}"), format!("{response:?}")] {
+            assert_no_sentinel(&rendered);
+            assert!(rendered.contains("[REDACTED]"));
+            assert!(rendered.contains("123456"));
+        }
     }
 }
