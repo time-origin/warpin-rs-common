@@ -31,7 +31,8 @@ readonly KES_ONE_SHOT_MAX_RECORDS=256
 readonly KES_ONE_SHOT_MAX_RECORD_FILE_BYTES=65536
 readonly KMS_NETWORK="warpin-kms-gate-${RUN_TOKEN}"
 readonly CLIENT_NETWORK="warpin-client-gate-${RUN_TOKEN}"
-readonly WORK_DIR="$(mktemp -d -t warpin-minio-kes-gate.XXXXXX)"
+mkdir -p "${WORKSPACE_DIR}/target/minio-kes-gate"
+readonly WORK_DIR="$(mktemp -d "${WORKSPACE_DIR}/target/minio-kes-gate/run.XXXXXX")"
 readonly ONE_SHOT_LEDGER="${WORK_DIR}/one-shot-containers.ledger"
 readonly KES_SERVER_DIR="${WORK_DIR}/kes/server"
 readonly KES_KEYSTORE_DIR="${WORK_DIR}/kes/keystore"
@@ -1698,6 +1699,7 @@ run_live_test() {
         WARPIN_MINIO_CA_PEM="${WORK_DIR}/minio/ca.crt" \
         WARPIN_MINIO_GATE_RUN_ID="${RUN_TOKEN}" \
         WARPIN_MINIO_GATE_MODE="${mode}" \
+        WARPIN_STREAM_RECEIPT_PATH="${WORK_DIR}/stream-receipt.json" \
         "${version_env[@]}" \
         cargo test -p warpin-object-storage --all-features \
             --test minio_kes_live -- --ignored
@@ -1891,6 +1893,9 @@ docker run --rm \
 run_mc mb --ignore-existing "gate/${BUCKET}" >/dev/null
 run_mc version enable "gate/${BUCKET}" >/dev/null
 
+# The pinned MinIO authorizeRequest implementation requires the base
+# DeleteObject Allow in addition to honoring DeleteObjectVersion Deny. Both
+# grants remain confined to this ephemeral gate's owned object prefix.
 {
     printf '%s\n' \
         '{' \
@@ -1903,7 +1908,7 @@ run_mc version enable "gate/${BUCKET}" >/dev/null
         '    },' \
         '    {' \
         '      "Effect": "Allow",' \
-        '      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObjectVersion"],' \
+        '      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],' \
         "      \"Resource\": [\"arn:aws:s3:::${BUCKET}/live-gate/*\"]" \
         '    }' \
         '  ]' \

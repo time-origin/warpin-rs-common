@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc};
 
+use futures::TryStreamExt;
 use object_store::{
     Attribute, AttributeValue, Attributes, Extensions, GetOptions, ObjectStore, ObjectStoreExt,
     PutMode, PutOptions, path::Path,
@@ -34,6 +35,7 @@ pub struct ObjectStoreSettings {
     pub url: String,
     pub options: BTreeMap<String, String>,
     pub max_object_bytes: u64,
+    pub max_streamed_object_bytes: u64,
     expected_observed_key_identity_fingerprint: Option<Sha256Digest>,
     managed_encryption_profile_id: Option<ManagedEncryptionProfileId>,
     trusted_root_certificate_pems: Vec<Vec<u8>>,
@@ -45,6 +47,7 @@ impl ObjectStoreSettings {
             url: url.into(),
             options: BTreeMap::new(),
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+            max_streamed_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
             expected_observed_key_identity_fingerprint: None,
             managed_encryption_profile_id: None,
             trusted_root_certificate_pems: Vec::new(),
@@ -58,6 +61,13 @@ impl ObjectStoreSettings {
 
     pub fn with_max_object_bytes(mut self, max_object_bytes: u64) -> Self {
         self.max_object_bytes = max_object_bytes;
+        self
+    }
+
+    /// Sets the application limit for a logical chunked file. Physical chunk
+    /// and index reads remain independently bounded by `max_object_bytes`.
+    pub fn with_max_streamed_object_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_streamed_object_bytes = max_bytes;
         self
     }
 
@@ -101,7 +111,11 @@ impl ObjectStoreSettings {
     }
 
     fn validate(&self) -> Result<Url, ObjectStorageError> {
-        if self.url.is_empty() || self.url.len() > MAX_URL_BYTES || self.max_object_bytes == 0 {
+        if self.url.is_empty()
+            || self.url.len() > MAX_URL_BYTES
+            || self.max_object_bytes == 0
+            || self.max_streamed_object_bytes == 0
+        {
             return Err(ObjectStorageError::InvalidConfiguration);
         }
         let url = Url::parse(&self.url).map_err(|_| ObjectStorageError::InvalidConfiguration)?;
@@ -192,6 +206,7 @@ impl fmt::Debug for ObjectStoreSettings {
                 &self.trusted_root_certificate_pems.len(),
             )
             .field("max_object_bytes", &self.max_object_bytes)
+            .field("max_streamed_object_bytes", &self.max_streamed_object_bytes)
             .finish()
     }
 }
@@ -212,6 +227,7 @@ pub struct VerifiedObjectStorage {
     prefix: Path,
     filesystem_root: Option<PathBuf>,
     max_object_bytes: u64,
+    pub(crate) max_streamed_object_bytes: u64,
     supports_attributes: bool,
     backend_security: BackendSecurityMode,
 }
@@ -230,6 +246,7 @@ impl fmt::Debug for VerifiedObjectStorage {
                 &self.managed_encryption_profile_id(),
             )
             .field("max_object_bytes", &self.max_object_bytes)
+            .field("max_streamed_object_bytes", &self.max_streamed_object_bytes)
             .field("supports_attributes", &self.supports_attributes)
             .finish()
     }
@@ -311,6 +328,7 @@ impl VerifiedObjectStorage {
             prefix,
             filesystem_root,
             max_object_bytes: settings.max_object_bytes,
+            max_streamed_object_bytes: settings.max_streamed_object_bytes,
             supports_attributes,
             backend_security,
         })
@@ -617,6 +635,26 @@ impl VerifiedObjectStorage {
         expected_version: Option<&str>,
         binding: Option<&WriteBinding>,
     ) -> Result<VerifiedReadback, ObjectStorageError> {
+        self.read_verified_internal_bounded(
+            key,
+            context_id,
+            expected_digest,
+            expected_version,
+            binding,
+            self.max_object_bytes,
+        )
+        .await
+    }
+
+    async fn read_verified_internal_bounded(
+        &self,
+        key: &ObjectKey,
+        context_id: &ArtifactEncryptionContextId,
+        expected_digest: &Sha256Digest,
+        expected_version: Option<&str>,
+        binding: Option<&WriteBinding>,
+        max_bytes: u64,
+    ) -> Result<VerifiedReadback, ObjectStorageError> {
         let location = self.location(key, context_id)?;
         let mut extensions = Extensions::new();
         let request_binding = match binding {
@@ -636,7 +674,7 @@ impl VerifiedObjectStorage {
             .get_opts(&location, options)
             .await
             .map_err(map_backend_read_error)?;
-        if result.meta.size > self.max_object_bytes {
+        if result.meta.size > self.max_object_bytes.min(max_bytes) {
             return Err(ObjectStorageError::SizeLimitExceeded);
         }
         let declared_digest = result
@@ -666,10 +704,22 @@ impl VerifiedObjectStorage {
             .extensions
             .get::<ObservedEncryptionEvidence>()
             .cloned();
-        let content = result
-            .bytes()
+        let mut stream = result.into_stream();
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream
+            .try_next()
             .await
-            .map_err(|_| ObjectStorageError::Backend)?;
+            .map_err(|_| ObjectStorageError::Backend)?
+        {
+            let size = (buffer.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .ok_or(ObjectStorageError::SizeLimitExceeded)?;
+            if size > expected_size || size > self.max_object_bytes.min(max_bytes) {
+                return Err(ObjectStorageError::SizeLimitExceeded);
+            }
+            buffer.extend_from_slice(&chunk);
+        }
+        let content = bytes::Bytes::from(buffer);
         let actual_size =
             u64::try_from(content.len()).map_err(|_| ObjectStorageError::SizeLimitExceeded)?;
         if actual_size != expected_size || digest_bytes(&content) != *expected_digest {
@@ -687,6 +737,71 @@ impl VerifiedObjectStorage {
             },
             evidence,
         })
+    }
+
+    #[cfg(feature = "streaming")]
+    pub(crate) async fn read_receipt_bounded(
+        &self,
+        receipt: &ObjectWriteReceipt,
+        policy: &ArtifactEncryptionPolicy,
+        max_bytes: u64,
+    ) -> Result<bytes::Bytes, ObjectStorageError> {
+        if receipt.size_bytes > max_bytes {
+            return Err(ObjectStorageError::SizeLimitExceeded);
+        }
+        // Reject policy/context and incomplete managed pins before any I/O.
+        match (&self.backend_security, policy.requirement().view()) {
+            (
+                BackendSecurityMode::DevelopmentOrTestPlaintext,
+                EncryptionRequirementView::DevelopmentOrTestPlaintext,
+            ) => {}
+            (
+                BackendSecurityMode::S3Observed { configured, .. },
+                EncryptionRequirementView::Managed { context_id, .. },
+            ) => {
+                if context_id != &receipt.context_id {
+                    return Err(EncryptionPolicyError::ContextMismatch.into());
+                }
+                if receipt.version.as_deref().is_none_or(str::is_empty)
+                    || receipt.e_tag.as_deref().is_none_or(str::is_empty)
+                {
+                    return Err(ObjectStorageError::VersionMismatch);
+                }
+                policy.verify_s3_configuration(configured)?;
+            }
+            _ => return Err(EncryptionPolicyError::PolicyBackendMismatch.into()),
+        }
+        let binding = WriteBinding::for_write(
+            &receipt.key,
+            &receipt.context_id,
+            receipt.size_bytes,
+            &receipt.digest,
+        );
+        let readback = self
+            .read_verified_internal_bounded(
+                &receipt.key,
+                &receipt.context_id,
+                &receipt.digest,
+                receipt.version.as_deref(),
+                Some(&binding),
+                max_bytes,
+            )
+            .await?;
+        if readback.object.e_tag != receipt.e_tag
+            || readback.object.version != receipt.version
+            || readback.object.content.len() as u64 != receipt.size_bytes
+        {
+            return Err(ObjectStorageError::VersionMismatch);
+        }
+        if let BackendSecurityMode::S3Observed { configured, .. } = &self.backend_security {
+            let evidence = readback
+                .evidence
+                .as_ref()
+                .ok_or(EncryptionPolicyError::EvidenceBindingMismatch)?;
+            configured.verify_observed(evidence)?;
+            policy.verify_managed_evidence(receipt, &binding, evidence)?;
+        }
+        Ok(readback.object.content)
     }
 
     pub(crate) fn location(
@@ -812,5 +927,122 @@ fn map_backend_read_error(error: object_store::Error) -> ObjectStorageError {
     match error {
         object_store::Error::NotFound { .. } => ObjectStorageError::NotFound,
         _ => ObjectStorageError::Backend,
+    }
+}
+
+#[cfg(all(test, feature = "streaming", feature = "aws"))]
+mod streaming_policy_tests {
+    use super::*;
+    use crate::{EncryptionRequirement, s3_adapter::with_minio_kes_object_context_profile};
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingStore(AtomicUsize);
+    impl fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("counting-test-store")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            _: &Path,
+            _: PutPayload,
+            _: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            panic!("unexpected PUT")
+        }
+        async fn put_multipart_opts(
+            &self,
+            _: &Path,
+            _: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            panic!("unexpected multipart")
+        }
+        async fn get_opts(&self, _: &Path, _: GetOptions) -> object_store::Result<GetResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("policy must reject before GET")
+        }
+        fn delete_stream(
+            &self,
+            _: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            panic!("unexpected DELETE")
+        }
+        fn list(&self, _: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            panic!("unexpected LIST")
+        }
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> object_store::Result<ListResult> {
+            panic!("unexpected LIST")
+        }
+        async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> object_store::Result<()> {
+            panic!("unexpected COPY")
+        }
+    }
+    #[tokio::test]
+    async fn streaming_policy_context_and_missing_pins_reject_before_backend_io() {
+        let mut storage =
+            VerifiedObjectStorage::from_settings(with_minio_kes_object_context_profile(
+                ObjectStoreSettings::new("s3://constructed/test")
+                    .with_option("aws_region", "us-east-1")
+                    .with_option("aws_endpoint", "https://minio.invalid.example")
+                    .with_option("aws_access_key_id", "constructed-access-key")
+                    .with_option("aws_secret_access_key", "constructed-secret-key"),
+            ))
+            .unwrap();
+        let counter = Arc::new(CountingStore::default());
+        storage.store = counter.clone();
+        let context = ArtifactEncryptionContextId::from_digest(digest_bytes(b"owner"));
+        let wrong = ArtifactEncryptionContextId::from_digest(digest_bytes(b"foreign"));
+        let mut receipt = ObjectWriteReceipt {
+            key: ObjectKey::parse("constructed/object").unwrap(),
+            context_id: context.clone(),
+            digest: digest_bytes(b"x"),
+            size_bytes: 1,
+            e_tag: Some("etag".into()),
+            version: Some("version".into()),
+            idempotent_replay: false,
+        };
+        let wrong_policy = ArtifactEncryptionPolicy::new(EncryptionRequirement::managed(
+            storage.managed_encryption_profile_id().unwrap().clone(),
+            wrong,
+            None,
+        ));
+        assert_eq!(
+            storage
+                .read_receipt_bounded(&receipt, &wrong_policy, 10)
+                .await
+                .unwrap_err(),
+            ObjectStorageError::EncryptionPolicy(EncryptionPolicyError::ContextMismatch)
+        );
+        let policy = ArtifactEncryptionPolicy::new(EncryptionRequirement::managed(
+            storage.managed_encryption_profile_id().unwrap().clone(),
+            context,
+            None,
+        ));
+        receipt.version = None;
+        assert_eq!(
+            storage
+                .read_receipt_bounded(&receipt, &policy, 10)
+                .await
+                .unwrap_err(),
+            ObjectStorageError::VersionMismatch
+        );
+        let plaintext =
+            ArtifactEncryptionPolicy::new(EncryptionRequirement::development_or_test_plaintext());
+        assert_eq!(
+            storage
+                .read_receipt_bounded(&receipt, &plaintext, 10)
+                .await
+                .unwrap_err(),
+            ObjectStorageError::EncryptionPolicy(EncryptionPolicyError::PolicyBackendMismatch)
+        );
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
     }
 }

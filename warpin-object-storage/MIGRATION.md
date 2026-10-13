@@ -164,3 +164,14 @@ references readable, but write new artifacts only through the context-bound
 0.2 contract. Before enabling the MinIO/KES profile in a deployment, run the
 packaged live gate and retain its sanitized PASS matrix as verification
 evidence.
+
+## Opting into the chunked streaming format
+
+Enable feature `streaming` only after the consumer persists a separate physical
+root receipt and logical file identity. Route the explicit storage format to
+`open_chunked`; retain legacy `read_verified` routing for old objects. Never try
+to detect the format from the filename, MIME type, or a JSON parse fallback.
+For managed storage, enable object versioning and keep exact versions available
+for every referenced root, page and chunk. Extend scoped IAM only to the same
+logical-key `.parts/` subtree; do not broaden unrelated object access. Implement
+the durable write journal and same-root retirement fence before production use.

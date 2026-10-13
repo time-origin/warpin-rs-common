@@ -225,3 +225,56 @@ fixture. Production deployments must supply their approved KMS-backed
 `ArtifactEncryptionPolicy` through the Processing storage adapter.
 
 See [MIGRATION.md](MIGRATION.md) for the v0.1 to v0.2 API changes.
+
+## Bounded streaming and authenticated ranges (`streaming` feature)
+
+`streaming::ChunkedObjectWrite` and `VerifiedObjectStorage::put_chunked` accept
+an `AsyncRead`, declared logical length/SHA-256, content type and a power-of-two
+chunk size between 64 KiB and 16 MiB. Configure the logical file limit explicitly
+with `ObjectStoreSettings::with_max_streamed_object_bytes`; its default is 64 MiB.
+The physical `max_object_bytes` limit remains separate. No entire-file `Bytes`
+value is created. At most one physical chunk, its verification buffer, one index
+page (256 pointers) and a bounded root (4096 page pointers, 4 MiB maximum) are
+retained. The format ceiling is 16 TiB; application limits should be lower when
+appropriate. Applications must also stream their HTTP responses and file writes.
+
+The `warpin-chunked/v1` root occupies the requested logical key. Chunks and pages
+use `<key>.parts/chunks/<sha256>` and `<key>.parts/pages/<sha256>` in the same
+context namespace. Each physical write uses the existing immutable encrypted
+write and final GET attestation. Managed streaming requires versioned storage
+with nonempty exact version and ETag pins. Every level contains the child digest,
+size, exact version and ETag. The root additionally binds logical key, encryption
+context, full-file digest, logical length, content type and chunk size. Its
+physical digest is **different from** the logical file digest.
+
+Persist all fields of `ChunkedObjectReceipt` in the authorized artifact record;
+never substitute the root digest for the logical content digest. This crate does
+not authorize a caller-provided receipt. Applications must resolve it from their
+own authorized durable record. `open_chunked(receipt, range, policy)` verifies
+the root, each required page and each selected complete chunk, including current
+managed-encryption response evidence, before releasing bytes. Ranges are
+half-open and select only containing chunks. `ChunkedObjectReader::verification`
+is unavailable until the reader has successfully returned `None`; a full read
+returns `WholeDigestVerified` after recomputing the complete SHA-256. A range
+returns `AuthenticatedRange`, which binds verified chunks to the pinned root
+but does **not** claim the full file was downloaded or its full hash recomputed.
+Dropping the reader early never declares full-file verification.
+
+`ChunkWriteJournal` is mandatory. Persist `before_write` intents before network
+I/O (including each physical digest, size and content type) and persist
+`after_write` exact receipts before acknowledging them. A failed
+or cancelled upload has no logical success receipt; only the final root commits
+the object, after exact length and full SHA-256 verification. Journal entries
+without outcomes require digest/context-aware reconciliation. The format does
+not automatically delete uncommitted parts or shared content-addressed parts;
+applications must apply durable ownership/reference accounting before verified
+cleanup. Never remove parts belonging to a retained root.
+
+Applications using retirement fences can atomically create their retirement
+marker at the **same root key and encryption context** via `put_immutable`.
+That marker conflicts with any late root commit, including one whose chunks are
+already uploaded. A marker at another key is not a fence. Retirement state and
+recovery policy remain application responsibilities.
+
+Legacy 0.2.6 objects continue using `read_verified`; existing Bytes-based APIs and
+formats remain available. Upgrade readers before enabling chunked producers.

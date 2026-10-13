@@ -17,3 +17,6 @@ pub(crate) use storage::map_backend_configuration_error;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "streaming")]
+pub mod streaming;

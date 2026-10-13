@@ -1,6 +1,6 @@
 [package]
 name = "warpin-object-storage"
-version.workspace = true
+version = "0.2.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -20,11 +20,16 @@ include = [
 ]
 
 [features]
+streaming = ["dep:tokio", "dep:async-trait", "dep:serde", "dep:serde_json", "dep:sha2"]
 default = ["fs"]
 fs = ["object_store/fs", "dep:tokio"]
 aws = ["object_store/aws", "dep:async-trait", "dep:humantime", "dep:reqwest"]
 
 [dependencies]
+futures.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes.workspace = true
 humantime = { workspace = true, optional = true }
