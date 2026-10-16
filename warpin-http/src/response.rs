@@ -6,10 +6,7 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use warpin_errors::{
-    BAD_REQUEST, FORBIDDEN, INTERNAL_ERROR, NOT_FOUND, ResultCode, ResultObject,
-    SERVICE_UNAVAILABLE, SUCCESS, ServiceError, UNAUTHORIZED,
-};
+use warpin_errors::{ResultCode, ResultObject, SUCCESS, ServiceError};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 pub type ServiceResult<T> = ResultEnvelope<T>;
@@ -153,12 +150,85 @@ impl IntoResponse for ApiError {
 fn status_from_code(code: ResultCode) -> StatusCode {
     match code {
         SUCCESS => StatusCode::OK,
-        BAD_REQUEST => StatusCode::BAD_REQUEST,
-        UNAUTHORIZED => StatusCode::UNAUTHORIZED,
-        FORBIDDEN => StatusCode::FORBIDDEN,
-        NOT_FOUND => StatusCode::NOT_FOUND,
-        SERVICE_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
-        INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
+        // Preserve HTTP errors, including conflict, validation and rate-limit
+        // responses. Other application codes retain the internal-error fallback.
+        400..=599 => StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, ServiceError, ServiceResult};
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use serde_json::{Value, json};
+
+    async fn check_error_response(response: axum::response::Response, code: u16, status: u16) {
+        assert_eq!(response.status().as_u16(), status);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            json!({"code":code,"data":null,"count":0,"msg":"closed_error"})
+        );
+    }
+
+    #[tokio::test]
+    async fn result_envelope_preserves_http_error_status_and_body() {
+        for code in [
+            400, 401, 403, 404, 405, 409, 410, 422, 429, 451, 499, 500, 502, 503, 504, 599,
+        ] {
+            let response =
+                ServiceResult::<()>::failure(ServiceError::with_message(code, "closed_error"))
+                    .into_response();
+            check_error_response(response, code, code).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn api_error_preserves_http_error_status_and_body() {
+        for code in [404, 409, 422, 429, 500, 503] {
+            let response =
+                ApiError::from(ServiceError::with_message(code, "closed_error")).into_response();
+            check_error_response(response, code, code).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn non_error_application_codes_keep_internal_error_fallback() {
+        for code in [
+            0,
+            99,
+            100,
+            199,
+            201,
+            204,
+            206,
+            299,
+            301,
+            399,
+            600,
+            999,
+            1001,
+            u16::MAX,
+        ] {
+            let result =
+                ServiceResult::<()>::failure(ServiceError::with_message(code, "closed_error"));
+            check_error_response(result.into_response(), code, 500).await;
+            let error = ApiError::from(ServiceError::with_message(code, "closed_error"));
+            check_error_response(error.into_response(), code, 500).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn success_envelope_keeps_existing_status_and_body() {
+        let response = ServiceResult::success(json!({"value":1})).into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"code":200,"data":{"value":1},"count":0,"msg":"SUCCESS"})
+        );
     }
 }
