@@ -13,6 +13,7 @@
 
 mod capture;
 mod json;
+mod limits;
 mod number;
 
 use std::{fmt, str::FromStr};
@@ -20,6 +21,13 @@ use std::{fmt, str::FromStr};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+pub use crate::limits::{
+    CanonicalLimits, canonical_bytes_from_json_with_profile_and_limits,
+    canonical_bytes_with_profile_and_limits, digest_bound_with_profile_and_limits,
+    digest_from_json_with_profile_and_limits, digest_typed_with_profile_and_limits,
+    parse_json_strict_with_limits,
+};
 
 use crate::capture::{CapturedValue, capture_typed};
 use crate::json::parse_captured_json;
@@ -266,3 +274,6 @@ fn valid_binding_label(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod limits_tests;

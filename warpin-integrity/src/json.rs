@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::capture::CapturedValue;
 use crate::number::parse_json_number;
-use crate::{CanonicalProfile, IntegrityError};
+use crate::{CanonicalLimits, CanonicalProfile, IntegrityError};
 
 const MAX_INPUT_BYTES: usize = 1_048_576;
 const MAX_NESTING_DEPTH: usize = 128;
@@ -13,7 +13,24 @@ pub(crate) fn parse_captured_json(
     input: &str,
     profile: CanonicalProfile,
 ) -> Result<CapturedValue, IntegrityError> {
-    if input.len() > MAX_INPUT_BYTES {
+    parse_with_byte_budget(input, profile, MAX_INPUT_BYTES, false)
+}
+
+pub(crate) fn parse_captured_json_with_limits(
+    input: &str,
+    profile: CanonicalProfile,
+    limits: CanonicalLimits,
+) -> Result<CapturedValue, IntegrityError> {
+    parse_with_byte_budget(input, profile, limits.maximum_document_bytes(), true)
+}
+
+fn parse_with_byte_budget(
+    input: &str,
+    profile: CanonicalProfile,
+    maximum_bytes: usize,
+    bounded_structure: bool,
+) -> Result<CapturedValue, IntegrityError> {
+    if input.len() > maximum_bytes {
         return Err(IntegrityError::InvalidJson { line: 1, column: 1 });
     }
     let mut parser = Parser {
@@ -21,6 +38,9 @@ pub(crate) fn parse_captured_json(
         bytes: input.as_bytes(),
         index: 0,
         profile,
+        bounded_structure,
+        nodes: 0,
+        collection_items: 0,
     };
     parser.skip_whitespace();
     let value = parser.parse_value(0)?;
@@ -36,12 +56,21 @@ struct Parser<'a> {
     bytes: &'a [u8],
     index: usize,
     profile: CanonicalProfile,
+    bounded_structure: bool,
+    nodes: usize,
+    collection_items: usize,
 }
 
 impl Parser<'_> {
     fn parse_value(&mut self, depth: usize) -> Result<CapturedValue, IntegrityError> {
         if depth > MAX_NESTING_DEPTH {
             return Err(self.invalid());
+        }
+        if self.bounded_structure {
+            if self.nodes >= 100_000 {
+                return Err(self.invalid());
+            }
+            self.nodes += 1;
         }
         self.skip_whitespace();
         match self.peek() {
@@ -77,6 +106,7 @@ impl Parser<'_> {
             return Ok(CapturedValue::Array(values));
         }
         loop {
+            self.claim_collection_item()?;
             values.push(self.parse_value(depth)?);
             self.skip_whitespace();
             if self.consume(b']') {
@@ -98,6 +128,7 @@ impl Parser<'_> {
             return Ok(CapturedValue::Object(entries));
         }
         loop {
+            self.claim_collection_item()?;
             if self.peek() != Some(b'"') {
                 return Err(self.invalid());
             }
@@ -184,6 +215,16 @@ impl Parser<'_> {
             return Err(IntegrityError::Canonicalization);
         }
         parse_json_number(lexeme, self.profile).map(CapturedValue::Number)
+    }
+
+    fn claim_collection_item(&mut self) -> Result<(), IntegrityError> {
+        if self.bounded_structure {
+            if self.collection_items >= 100_000 {
+                return Err(self.invalid());
+            }
+            self.collection_items += 1;
+        }
+        Ok(())
     }
 
     fn consume_digits(&mut self) {

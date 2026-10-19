@@ -7,7 +7,7 @@ use serde::ser::{
 use serde::{Serialize, Serializer};
 
 use crate::number::{CapturedNumber, map_ser_error};
-use crate::{CanonicalProfile, IntegrityError};
+use crate::{CanonicalLimits, CanonicalProfile, IntegrityError};
 
 const MAX_CAPTURE_DEPTH: usize = 128;
 const MAX_CAPTURE_NODES: usize = 100_000;
@@ -19,15 +19,17 @@ struct CaptureBudget {
     nodes: usize,
     bytes: usize,
     collection_items: usize,
+    maximum_bytes: usize,
 }
 
 impl CaptureBudget {
-    fn new(profile: CanonicalProfile) -> Self {
+    fn new(profile: CanonicalProfile, maximum_bytes: usize) -> Self {
         Self {
             profile,
             nodes: 0,
             bytes: 0,
             collection_items: 0,
+            maximum_bytes,
         }
     }
 
@@ -54,10 +56,24 @@ impl CaptureBudget {
     }
 
     fn ensure_bytes(&self, bytes: usize) -> Result<(), CaptureError> {
-        if bytes > MAX_CAPTURE_BYTES.saturating_sub(self.bytes) {
+        if bytes > self.maximum_bytes.saturating_sub(self.bytes) {
             return Err(CaptureError);
         }
         Ok(())
+    }
+
+    fn ensure_string_bytes(&self, bytes: usize) -> Result<(), CaptureError> {
+        // Expanding a document never expands one typed string/key beyond the
+        // original aggregate bound. The default behavior remains identical.
+        if bytes > MAX_CAPTURE_BYTES {
+            return Err(CaptureError);
+        }
+        self.ensure_bytes(bytes)
+    }
+
+    fn claim_string_bytes(&mut self, bytes: usize) -> Result<(), CaptureError> {
+        self.ensure_string_bytes(bytes)?;
+        self.claim_bytes(bytes)
     }
 
     fn claim_collection_item(&mut self) -> Result<(), CaptureError> {
@@ -163,7 +179,29 @@ pub(crate) fn capture_typed<T>(
 where
     T: Serialize + ?Sized,
 {
-    let mut budget = CaptureBudget::new(profile);
+    capture_with_byte_budget(value, profile, MAX_CAPTURE_BYTES)
+}
+
+pub(crate) fn capture_typed_with_limits<T>(
+    value: &T,
+    profile: CanonicalProfile,
+    limits: CanonicalLimits,
+) -> Result<CapturedValue, IntegrityError>
+where
+    T: Serialize + ?Sized,
+{
+    capture_with_byte_budget(value, profile, limits.maximum_document_bytes())
+}
+
+fn capture_with_byte_budget<T>(
+    value: &T,
+    profile: CanonicalProfile,
+    maximum_bytes: usize,
+) -> Result<CapturedValue, IntegrityError>
+where
+    T: Serialize + ?Sized,
+{
+    let mut budget = CaptureBudget::new(profile, maximum_bytes);
     value
         .serialize(CaptureSerializer {
             budget: &mut budget,
@@ -184,7 +222,7 @@ impl<'a> CaptureSerializer<'a> {
 
     fn capture_string(mut self, value: &str) -> Result<CapturedValue, CaptureError> {
         self.claim_node()?;
-        self.budget.claim_bytes(value.len())?;
+        self.budget.claim_string_bytes(value.len())?;
         Ok(CapturedValue::String(value.to_owned()))
     }
 
@@ -355,7 +393,7 @@ impl<'a> Serializer for CaptureSerializer<'a> {
     {
         self.claim_node()?;
         self.budget.claim_collection_item()?;
-        self.budget.claim_bytes(variant.len())?;
+        self.budget.claim_string_bytes(variant.len())?;
         Ok(wrap_variant(variant, self.nested(value)?))
     }
 
@@ -388,7 +426,7 @@ impl<'a> Serializer for CaptureSerializer<'a> {
         self.claim_node()?;
         self.budget.claim_node(self.depth + 1)?;
         self.budget.claim_collection_item()?;
-        self.budget.claim_bytes(variant.len())?;
+        self.budget.claim_string_bytes(variant.len())?;
         SequenceCapture::new(self.budget, self.depth + 2, len, Some(variant))
     }
 
@@ -416,7 +454,7 @@ impl<'a> Serializer for CaptureSerializer<'a> {
         self.claim_node()?;
         self.budget.claim_node(self.depth + 1)?;
         self.budget.claim_collection_item()?;
-        self.budget.claim_bytes(variant.len())?;
+        self.budget.claim_string_bytes(variant.len())?;
         ObjectCapture::new(self.budget, self.depth + 2, len, Some(variant))
     }
 }
@@ -557,7 +595,7 @@ impl<'a> ObjectCapture<'a> {
         }
         let result = (|| {
             self.budget.claim_collection_item()?;
-            self.budget.claim_bytes(key.len())?;
+            self.budget.claim_string_bytes(key.len())?;
             if !self.seen.insert(key.clone()) {
                 return Err(CaptureError);
             }
@@ -680,13 +718,13 @@ impl MapKeySerializer<'_> {
     {
         CaptureBudget::ensure_depth(self.depth)?;
         let value = value.to_string();
-        self.budget.ensure_bytes(value.len())?;
+        self.budget.ensure_string_bytes(value.len())?;
         Ok(value)
     }
 
     fn capture_str(self, value: &str) -> Result<String, CaptureError> {
         CaptureBudget::ensure_depth(self.depth)?;
-        self.budget.ensure_bytes(value.len())?;
+        self.budget.ensure_string_bytes(value.len())?;
         Ok(value.to_owned())
     }
 
