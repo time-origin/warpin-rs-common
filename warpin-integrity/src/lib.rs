@@ -15,6 +15,7 @@ mod capture;
 mod json;
 mod limits;
 mod number;
+mod object_table;
 
 use std::{fmt, str::FromStr};
 
@@ -28,6 +29,8 @@ pub use crate::limits::{
     digest_from_json_with_profile_and_limits, digest_typed_with_profile_and_limits,
     parse_json_strict_with_limits,
 };
+
+pub use crate::object_table::{ObjectTableLimits, object_table_decode, object_table_encode};
 
 use crate::capture::{CapturedValue, capture_typed};
 use crate::json::parse_captured_json;
