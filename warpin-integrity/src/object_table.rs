@@ -12,6 +12,8 @@ use crate::{
 mod decode;
 mod encode;
 #[cfg(test)]
+mod format_tests;
+#[cfg(test)]
 mod tests;
 
 const SCHEMA: &str = "warpin-indexed-json/v1";
@@ -20,6 +22,33 @@ const MAX_DEPTH: usize = 128;
 const MAX_NODES: usize = 100_000;
 const MAX_WORK_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PASSES: usize = 128;
+
+/// Explicit wire format for a bounded lossless object table.
+///
+/// Neither decoder falls back to another format. The selected format reserves
+/// only its own reference key; other keys remain ordinary source data. This
+/// permits an encoded v1 document to be retained literally inside a v2 source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectTableFormat {
+    /// Original `warpin-indexed-json/v1`, with `$objectRef` references.
+    IndexedV1,
+    /// `warpin-indexed-json/v2`, with the shorter `$r` reference field.
+    ShortReferencesV2,
+}
+impl ObjectTableFormat {
+    fn schema(self) -> &'static str {
+        match self {
+            Self::IndexedV1 => SCHEMA,
+            Self::ShortReferencesV2 => "warpin-indexed-json/v2",
+        }
+    }
+    fn reference_key(self) -> &'static str {
+        match self {
+            Self::IndexedV1 => REFERENCE,
+            Self::ShortReferencesV2 => "$r",
+        }
+    }
+}
 
 /// Independent finite wire and expanded-document budgets, each 1..=16 MiB.
 ///
@@ -55,12 +84,21 @@ struct Document {
 }
 
 struct Work {
+    format: ObjectTableFormat,
     bytes: usize,
     nodes: usize,
 }
 impl Work {
+    #[cfg(test)]
     fn new() -> Self {
-        Self { bytes: 0, nodes: 0 }
+        Self::with_format(ObjectTableFormat::IndexedV1)
+    }
+    fn with_format(format: ObjectTableFormat) -> Self {
+        Self {
+            format,
+            bytes: 0,
+            nodes: 0,
+        }
     }
     fn node(&mut self, depth: usize) -> Result<(), IntegrityError> {
         self.nodes = self
@@ -109,7 +147,7 @@ pub fn object_table_encode<T: Serialize + ?Sized>(
     source: &T,
     limits: ObjectTableLimits,
 ) -> Result<Vec<u8>, IntegrityError> {
-    encode::run(source, limits)
+    object_table_encode_with_format(source, ObjectTableFormat::IndexedV1, limits)
 }
 
 /// Strictly validates an exact canonical object table before expanding it.
@@ -121,16 +159,53 @@ pub fn object_table_decode(
     encoded: &[u8],
     limits: ObjectTableLimits,
 ) -> Result<Value, IntegrityError> {
-    decode::run(encoded, limits)
+    object_table_decode_with_format(encoded, ObjectTableFormat::IndexedV1, limits)
 }
 
-fn reference(index: &str) -> Value {
-    serde_json::json!({ (REFERENCE): index })
+/// Encodes with an explicit format while retaining the original independent
+/// wire, expanded, work, depth, node, profitability and canonicalization bounds.
+/// The caller's serializer is captured exactly once. V2 rejects literal `$r`
+/// keys; it preserves `$objectRef` keys as ordinary data, including nested v1
+/// documents. A format is representation only and conveys no authority.
+///
+/// ```
+/// use warpin_integrity::{ObjectTableFormat, ObjectTableLimits,
+///     object_table_encode_with_format, object_table_decode_with_format};
+/// let source = serde_json::json!({"value": ["complete", "ordered"]});
+/// let limits = ObjectTableLimits::new(1024, 4096)?;
+/// let format = ObjectTableFormat::ShortReferencesV2;
+/// let wire = object_table_encode_with_format(&source, format, limits)?;
+/// assert_eq!(object_table_decode_with_format(&wire, format, limits)?, source);
+/// # Ok::<(), warpin_integrity::IntegrityError>(())
+/// ```
+pub fn object_table_encode_with_format<T: Serialize + ?Sized>(
+    source: &T,
+    format: ObjectTableFormat,
+    limits: ObjectTableLimits,
+) -> Result<Vec<u8>, IntegrityError> {
+    encode::run(source, limits, format)
 }
 
-fn reference_index(value: &Value) -> Result<Option<&str>, IntegrityError> {
+/// Strictly decodes only the explicitly selected format. An unknown or different
+/// schema is rejected; the original two-argument decoder remains v1-only.
+pub fn object_table_decode_with_format(
+    encoded: &[u8],
+    format: ObjectTableFormat,
+    limits: ObjectTableLimits,
+) -> Result<Value, IntegrityError> {
+    decode::run(encoded, limits, format)
+}
+
+fn reference(index: &str, format: ObjectTableFormat) -> Value {
+    serde_json::json!({ (format.reference_key()): index })
+}
+
+fn reference_index(
+    value: &Value,
+    format: ObjectTableFormat,
+) -> Result<Option<&str>, IntegrityError> {
     if let Value::Object(map) = value
-        && let Some(index) = map.get(REFERENCE)
+        && let Some(index) = map.get(format.reference_key())
     {
         if map.len() != 1 {
             return Err(IntegrityError::Canonicalization);
@@ -150,7 +225,7 @@ fn references(
     depth: usize,
 ) -> Result<(), IntegrityError> {
     work.node(depth)?;
-    if let Some(index) = reference_index(value)? {
+    if let Some(index) = reference_index(value, work.format)? {
         let number = index
             .parse::<usize>()
             .map_err(|_| IntegrityError::Canonicalization)?;
@@ -194,7 +269,9 @@ fn unprofitable(
     for (index, body) in &document.objects {
         let uses = counts.get(index).copied().unwrap_or_default() as u128;
         let body_bytes = work.canonical(body, limits.expanded)?.len() as u128;
-        let ref_bytes = work.canonical(&reference(index), limits.encoded)?.len() as u128;
+        let ref_bytes = work
+            .canonical(&reference(index, work.format), limits.encoded)?
+            .len() as u128;
         let entry_bytes = body_bytes + work.canonical(index, limits.encoded)?.len() as u128 + 2;
         if uses < 2 || uses * body_bytes <= uses * ref_bytes + entry_bytes {
             rejected.insert(index.clone());

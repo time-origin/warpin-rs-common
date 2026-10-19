@@ -2,10 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use super::{Document, ObjectTableLimits, SCHEMA, Work, reference_index, unprofitable};
+use super::{Document, ObjectTableFormat, ObjectTableLimits, Work, reference_index, unprofitable};
 use crate::{IntegrityError, Sha256Digest, digest_bytes, parse_json_strict_with_limits};
 
-pub(super) fn run(raw: &[u8], limits: ObjectTableLimits) -> Result<Value, IntegrityError> {
+pub(super) fn run(
+    raw: &[u8],
+    limits: ObjectTableLimits,
+    format: ObjectTableFormat,
+) -> Result<Value, IntegrityError> {
     if raw.is_empty() || raw.len() > limits.encoded.maximum_document_bytes() {
         return Err(IntegrityError::Canonicalization);
     }
@@ -15,9 +19,9 @@ pub(super) fn run(raw: &[u8], limits: ObjectTableLimits) -> Result<Value, Integr
     )?;
     let document: Document =
         serde_json::from_slice(raw).map_err(|_| IntegrityError::Canonicalization)?;
-    let mut work = Work::new();
+    let mut work = Work::with_format(format);
     let _: Sha256Digest = document.source_digest.parse()?;
-    if document.schema_version != SCHEMA
+    if document.schema_version != format.schema()
         || work.canonical(&document, limits.encoded)? != raw
         || !unprofitable(&document, limits, &mut work)?.is_empty()
     {
@@ -80,7 +84,7 @@ impl Decoder<'_> {
     }
     fn expand(&mut self, value: &Value, depth: usize) -> Result<Value, IntegrityError> {
         self.work.node(depth)?;
-        if let Some(index) = reference_index(value)? {
+        if let Some(index) = reference_index(value, self.work.format)? {
             let body = self
                 .document
                 .objects

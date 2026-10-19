@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    Document, MAX_PASSES, ObjectTableLimits, REFERENCE, SCHEMA, Work, reference, unprofitable,
+    Document, MAX_PASSES, ObjectTableFormat, ObjectTableLimits, Work, reference, unprofitable,
 };
 use crate::{
     CanonicalProfile, IntegrityError, canonical_bytes_with_profile_and_limits, digest_bytes,
@@ -13,6 +13,7 @@ use crate::{
 pub(super) fn run<T: Serialize + ?Sized>(
     source: &T,
     limits: ObjectTableLimits,
+    format: ObjectTableFormat,
 ) -> Result<Vec<u8>, IntegrityError> {
     // Only this capture can invoke caller Serialize code. All subsequent work
     // reads the captured JSON value rather than serializing caller state again.
@@ -23,7 +24,7 @@ pub(super) fn run<T: Serialize + ?Sized>(
     )?;
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| IntegrityError::Canonicalization)?;
-    let mut work = Work::new();
+    let mut work = Work::with_format(format);
     work.bytes = bytes.len();
     let mut counts = BTreeMap::new();
     count(&value, &mut counts, &mut work, limits, 0)?;
@@ -42,7 +43,7 @@ pub(super) fn run<T: Serialize + ?Sized>(
         work.nodes = 0;
         let root = encode(&value, &indices, &mut objects, &mut work, limits, 0)?;
         let document = Document {
-            schema_version: SCHEMA.into(),
+            schema_version: format.schema().into(),
             source_digest: digest_bytes(&bytes).to_string(),
             root,
             objects,
@@ -51,7 +52,7 @@ pub(super) fn run<T: Serialize + ?Sized>(
         if rejected.is_empty() {
             let raw = work.canonical(&document, limits.encoded)?;
             // Producer and strict consumer must agree on the complete value.
-            if super::decode::run(&raw, limits)? != value {
+            if super::decode::run(&raw, limits, format)? != value {
                 return Err(IntegrityError::Canonicalization);
             }
             return Ok(raw);
@@ -73,7 +74,7 @@ fn count(
     *counts.entry(digest_bytes(&raw).to_string()).or_default() += 1;
     match value {
         Value::Object(map) => {
-            if map.contains_key(REFERENCE) {
+            if map.contains_key(work.format.reference_key()) {
                 return Err(IntegrityError::Canonicalization);
             }
             for child in map.values() {
@@ -104,7 +105,7 @@ fn encode(
     if let Some(index) = index
         && objects.contains_key(index)
     {
-        return Ok(reference(index));
+        return Ok(reference(index, work.format));
     }
     let body = match value {
         Value::Object(map) => Value::Object(
@@ -127,7 +128,7 @@ fn encode(
     };
     if let Some(index) = index {
         objects.insert(index.clone(), body);
-        Ok(reference(index))
+        Ok(reference(index, work.format))
     } else {
         Ok(body)
     }
