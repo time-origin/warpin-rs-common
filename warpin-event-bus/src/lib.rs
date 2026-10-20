@@ -49,10 +49,12 @@ use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
 
 mod attestation;
+mod raw;
 pub use attestation::{
     AttestationConfigurationError, AttestationVerificationError, ProducerAttestationSigner,
     ProducerAttestationVerifier, VerifiedProducerAttestation,
 };
+pub use raw::OwnedRawMessage;
 
 // ---------------------------------------------------------------------------
 // BusEvent envelope
@@ -832,6 +834,20 @@ impl KafkaEventConsumer {
         })
     }
 
+    /// Receive an owned record preserving raw key/value bytes and every header.
+    ///
+    /// Unlike [`Self::recv`], this performs no UTF-8 conversion. Authenticate
+    /// the original bytes before parsing payload claims and commit only after
+    /// the caller's durable inbox transaction succeeds.
+    pub async fn recv_raw(&self) -> Result<OwnedRawMessage> {
+        let message = self
+            .consumer
+            .recv()
+            .await
+            .map_err(|error| anyhow!("Kafka consumer recv error: {error}"))?;
+        Ok(OwnedRawMessage::from_message(&message))
+    }
+
     /// Manually commit the current consumer offsets (synchronous commit).
     ///
     /// Only needed when `enable_auto_commit` is `false`.
@@ -868,6 +884,11 @@ impl NoOpConsumer {
         unreachable!()
     }
 
+    /// Wait for a raw record. The no-op backend remains pending until canceled.
+    pub async fn recv_raw(&self) -> Result<OwnedRawMessage> {
+        futures::future::pending().await
+    }
+
     /// Commit (no-op, always succeeds).
     pub fn commit(&self) -> Result<()> {
         Ok(())
@@ -899,6 +920,14 @@ impl EventConsumerImpl {
         match self {
             EventConsumerImpl::NoOp(inner) => inner.recv().await,
             EventConsumerImpl::Kafka(inner) => inner.recv().await,
+        }
+    }
+
+    /// Receive original raw broker bytes using the selected backend.
+    pub async fn recv_raw(&self) -> Result<OwnedRawMessage> {
+        match self {
+            EventConsumerImpl::NoOp(inner) => inner.recv_raw().await,
+            EventConsumerImpl::Kafka(inner) => inner.recv_raw().await,
         }
     }
 

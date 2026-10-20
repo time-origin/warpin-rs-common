@@ -650,7 +650,6 @@ mod tests {
     use std::fmt::Write as _;
 
     use ed25519_dalek::{SigningKey, VerifyingKey};
-    use sha2::Digest as _;
 
     use super::*;
     use crate::{DurableEventHeader, DurableEventRecord};
