@@ -1,0 +1,225 @@
+{
+  "version": "0.2.11",
+  "published_source_commit": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+  "verification": {
+    "archives": "Downloaded from static.crates.io; SHA-256 matched crates.io API, package and all internal dependency versions matched 0.2.11, VCS source matched published commit, no versions yanked.",
+    "ci": {
+      "url": "https://github.com/time-origin/warpin-rs-common/actions/runs/40678988485",
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "protocols (ubuntu-latest)",
+          "conclusion": "success"
+        },
+        {
+          "name": "protocols (macos-latest)",
+          "conclusion": "success"
+        }
+      ]
+    },
+    "local_workspace_tests": {
+      "default": {
+        "passed": 270,
+        "failed": 0,
+        "ignored": 13
+      },
+      "all_features": {
+        "passed": 334,
+        "failed": 0,
+        "ignored": 16
+      },
+      "explicit_broker_tests": {
+        "passed": 4,
+        "failed": 0
+      },
+      "note": "Explicit broker tests are 4 of the all-features ignored tests; other ignored tests were not counted as passed."
+    },
+    "consumer": {
+      "command": "cargo test --manifest-path <independent-consumer>/Cargo.toml",
+      "passed": 1,
+      "failed": 0,
+      "dependencies": [
+        {
+          "crate": "warpin-config",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "crate": "warpin-errors",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "crate": "warpin-http",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "crate": "warpin-modbus",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "crate": "warpin-mqtt",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "crate": "warpin-transport",
+          "version": "0.2.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ],
+      "manifest": "[package]\nname = \"warpin-protocol-release-smoke\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[dependencies]\nwarpin-http = \"=0.2.11\"\nwarpin-transport = \"=0.2.11\"\nwarpin-mqtt = \"=0.2.11\"\nwarpin-modbus = \"=0.2.11\"\nwarpin-errors = \"=0.2.11\"\n",
+      "test_source": "use std::time::Duration;\nuse warpin_transport::Limits;\nuse warpin_http::transport::{Authentication,HttpLimits,HttpTransport,Security};\npub fn consumer_api_smoke()->Result<(),Box<dyn std::error::Error>>{\n Limits{timeout:Duration::from_secs(1),max_frame_bytes:1024}.validate()?;\n let _http=HttpTransport::new(\"https://example.com/\",Security::Https,Authentication::None,HttpLimits{connect_timeout:Duration::from_secs(1),read_timeout:Duration::from_secs(1),total_timeout:Duration::from_secs(2),max_request_bytes:1024,max_response_bytes:4096,max_in_flight:2})?;\n let layout=warpin_modbus::registers::Layout{words:warpin_modbus::registers::Order::Big,bytes:warpin_modbus::registers::Order::Big};assert_eq!(layout.u32(&[0,42])?,42);\n let _version=warpin_mqtt::Version::V5{clean_start:true,session_expiry_seconds:0};\n let error=warpin_errors::protocol::ProtocolError::new(warpin_errors::protocol::Kind::OutcomeUnknown,warpin_errors::protocol::Phase::Write);assert_eq!(error.service_error().code,503);Ok(())\n}\n#[test]fn standalone_consumer(){consumer_api_smoke().expect(\"published API\");}\n"
+    },
+    "local_lock_sha256": "fbc5f7df68af5b547d8b1aa8f53a41045f92c85d9d8702e9251faba1c2a58ba6",
+    "security": "Active dependency security gates passed on macOS/Linux. Raw cargo audit still reports inactive rkyv/rsa findings; proc-macro-error2 maintenance warning remains. See sibling security document."
+  },
+  "packages": [
+    {
+      "crate": "warpin-errors",
+      "version": "0.2.11",
+      "checksum": "7cc54d869556fd6d9c172694da552389671e8f575ac30564b1137573c0895acf",
+      "bytes": 6988,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:31:41.446735Z"
+    },
+    {
+      "crate": "warpin-transport",
+      "version": "0.2.11",
+      "checksum": "122d425dace64c9992172b44b371687582d4705e71d1ca72ecd17bfd0be1684d",
+      "bytes": 20449,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:31:49.701109Z"
+    },
+    {
+      "crate": "warpin-mqtt",
+      "version": "0.2.11",
+      "checksum": "91441070ca793816b690d75cf4113d4b3ae893bff82e11de2f6bd59d8b1c21f8",
+      "bytes": 23001,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:02.605700Z"
+    },
+    {
+      "crate": "warpin-modbus",
+      "version": "0.2.11",
+      "checksum": "4811e0df2e970c898e221e103f031f1b4aaf98019db5b192a72c304326ef35e5",
+      "bytes": 14908,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:10.029433Z"
+    },
+    {
+      "crate": "warpin-config",
+      "version": "0.2.11",
+      "checksum": "f49442d3bf9fc8d77023b9e24ef5d79d47a8beaa0160f0286194aa256fec7e23",
+      "bytes": 6233,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:14.619873Z"
+    },
+    {
+      "crate": "warpin-http",
+      "version": "0.2.11",
+      "checksum": "95c2c29dbaae86f570d0b281ee04f42d199e94a672f606b6a18f609d13564a78",
+      "bytes": 45416,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:35.993584Z"
+    },
+    {
+      "crate": "warpin-auth",
+      "version": "0.2.11",
+      "checksum": "dbed8a9684882c12ea8700e8d64e3e350616d9243c85a7ecadb3f0c94631d4cc",
+      "bytes": 15454,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:46.726454Z"
+    },
+    {
+      "crate": "warpin-capability",
+      "version": "0.2.11",
+      "checksum": "48064a257c924744ebd9279d8a486b3566719b27f931093c641ffd321c263cfe",
+      "bytes": 3104,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:50.922415Z"
+    },
+    {
+      "crate": "warpin-event-bus",
+      "version": "0.2.11",
+      "checksum": "df64e225993b33e511bff37d9927064d1775a4894e943ce4471a77d7710c3d0a",
+      "bytes": 31829,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:32:59.782338Z"
+    },
+    {
+      "crate": "warpin-grpc",
+      "version": "0.2.11",
+      "checksum": "797f504b01d81337bde2f9e57ec9305d63d80debe605a547dcc500038c9373a6",
+      "bytes": 5726,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:33:16.737523Z"
+    },
+    {
+      "crate": "warpin-integrity",
+      "version": "0.2.11",
+      "checksum": "86c91c100a972a0b31d1d4079b577174fb656813594aaba68cc674cc1a8a85e2",
+      "bytes": 28139,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:35:43.333833Z"
+    },
+    {
+      "crate": "warpin-observability",
+      "version": "0.2.11",
+      "checksum": "7a3e27bc15ecb563242270fd5dae2d447438dbe4d1c2c49b77d34e7e134c047d",
+      "bytes": 15695,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:35:48.301869Z"
+    },
+    {
+      "crate": "warpin-storage",
+      "version": "0.2.11",
+      "checksum": "e127931493bb2a19d2af35bc2db0b95a0edc6fdd446c96dda091df9ff0f1dc06",
+      "bytes": 30246,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:36:37.744007Z"
+    },
+    {
+      "crate": "warpin-types",
+      "version": "0.2.11",
+      "checksum": "16655f41bd79fcf78428ae7ad2e3945a8ad736ba2aeb10fa3eb262924961ca6d",
+      "bytes": 11155,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:36:43.635087Z"
+    },
+    {
+      "crate": "warpin-context",
+      "version": "0.2.11",
+      "checksum": "efa1b9e7b8ba35e4d2cd7315fd1681f7ff4ddbceff51f797fb38a21c5bdd37ad",
+      "bytes": 6839,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:36:50.924032Z"
+    },
+    {
+      "crate": "warpin-dingtalk",
+      "version": "0.2.11",
+      "checksum": "b1ff74d7acfc58ab8b73118a4d6061a88d75e853b8dd35da343c19e072e24c35",
+      "bytes": 33739,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:37:05.736022Z"
+    },
+    {
+      "crate": "warpin-object-storage",
+      "version": "0.2.11",
+      "checksum": "692fb5b5203f1dfdfa2295664c0fcf6289d0025e917f0f5aa0415d01a4dd631c",
+      "bytes": 94926,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:40:08.033542Z"
+    },
+    {
+      "crate": "warpin-workspace",
+      "version": "0.2.11",
+      "checksum": "3cd68d7c43ff97a46dccc4ed5779dc99565e4ec8b9543139086620ace5f85604",
+      "bytes": 66883,
+      "source": "de0d097ea1d22d4f03bda8a2a92093d4c59c13f1",
+      "published_at": "2026-10-28T11:40:33.488179Z"
+    }
+  ]
+}

@@ -1,6 +1,8 @@
 # warpin-workspace
 
-Development candidate, not published or production deployed.
+Development candidate, distributed on crates.io under the unified workspace
+version; not qualified for production deployment. Publication does not remove
+the deployment gates below.
 
 Reusable typed fixed-filesystem budgets, PostgreSQL pool reservations and a Linux
 management-plane allocation backend. It has no business-domain dispatch and no

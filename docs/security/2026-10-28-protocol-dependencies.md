@@ -34,6 +34,8 @@
 
 在线数据库抓取曾因 GitHub IO 失败；最终本地验证显式使用 `--no-fetch` 和本轮已经成功获取的 RustSec 数据库（提交 `40f5be6fb12ed93fc591bf4ab23b7d793b3f2239`）。CI 默认在线更新数据库，抓取失败即失败，绝不静默使用缓存或忽略结果。
 
+发布源码 `de0d097ea1d22d4f03bda8a2a92093d4c59c13f1` 的 [Linux/macOS CI](https://github.com/time-origin/warpin-rs-common/actions/runs/40678988485) 已实际执行并全部通过，包括两个平台的协议测试、真实 Broker 测试及在线安全检查。此结果补充了上面的本机依赖范围核对，不改变原始 audit 的可选依赖报告与停止维护提示。
+
 ## S3 兼容性
 
 object_store 0.14.2 按 URL authority 签名 Host，签名后移除 header，交由 HTTP 客户端生成。原固定 0.14.0 的适配器因此不能原样升级。现在先验证 URL 与预期目标完全一致，再在传输边界把该 authority（含非默认端口）明确写入 Host，随后仍执行原严格签名形状校验。已有显式 Host 必须精确匹配；冲突 Host、错误摘要/路径、缺失绑定、伪造 KMS/header 均继续拒绝。真实 object_store 请求形状与伪造请求回归测试覆盖此变化；没有允许自动重定向。
