@@ -51,7 +51,7 @@ impl Broker {
             .args(["-c"])
             .arg(&path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("broker");
         let mut b = Self {
