@@ -1224,7 +1224,7 @@ pub(crate) struct S3EncryptionObserverService {
 #[cfg(feature = "aws")]
 #[async_trait]
 impl HttpService for S3EncryptionObserverService {
-    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+    async fn call(&self, mut request: HttpRequest) -> Result<HttpResponse, HttpError> {
         let binding = request
             .extensions()
             .get::<ObserverRequestBinding>()
@@ -1237,6 +1237,23 @@ impl HttpService for S3EncryptionObserverService {
                 .map_err(|_| {
                     managed_artifact_request_error(ManagedArtifactRequestRejection::Target)
                 })?;
+            // object_store >= 0.14.1 removes Host after signing: HTTP clients
+            // send the URI authority. Materialize that exact transport header
+            // before verification, preserving any supplied Host for strict checking.
+            if !request.headers().contains_key("host") {
+                let authority = request
+                    .uri()
+                    .authority()
+                    .ok_or_else(|| {
+                        managed_artifact_request_error(ManagedArtifactRequestRejection::Target)
+                    })?
+                    .as_str()
+                    .parse()
+                    .map_err(|_| {
+                        managed_artifact_request_error(ManagedArtifactRequestRejection::Target)
+                    })?;
+                request.headers_mut().insert("host", authority);
+            }
             self.expected_request_target
                 .verify_sigv4(
                     binding,

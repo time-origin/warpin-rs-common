@@ -1,0 +1,15 @@
+[package]
+name = "warpin-modbus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Validated Modbus TCP and RTU clients with explicit register layouts"
+readme = "README.md"
+
+[dependencies]
+tokio.workspace = true
+tokio-modbus.workspace = true
+tokio-serial.workspace = true
+warpin-errors.workspace = true

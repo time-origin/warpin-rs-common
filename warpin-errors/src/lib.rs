@@ -1,3 +1,5 @@
+pub mod protocol;
+
 use serde::Serialize;
 use thiserror::Error;
 use utoipa::ToSchema;

@@ -60,7 +60,7 @@ impl EndpointClient {
     /// Send `body` as a JSON POST to `endpoint`.
     ///
     /// On failure the client walks the endpoint's fallback chain, retrying
-    /// up to [`MAX_FALLBACK_DEPTH`] times.  Each degradation emits a
+    /// up to `MAX_FALLBACK_DEPTH` times.  Each degradation emits a
     /// `tracing::warn`.
     pub async fn call(&self, endpoint: &ResolvedEndpoint, body: Value) -> Result<Value> {
         let mut current = endpoint;

@@ -1967,8 +1967,26 @@ async fn observer_rejects_host_digest_binding_and_kms_presence_forgery_before_io
         TEST_SIGV4_SIGNATURE,
     );
 
+    // object_store 0.14.2 signs the URI authority then removes Host before
+    // invoking the connector. The adapter must materialize that exact value;
+    // a supplied conflicting Host remains a rejection below.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let service = configured.observer_service(HttpClient::new(ActualCredentialShapeService {
+        requests: Arc::clone(&requests),
+    }));
+    service
+        .call(missing_host)
+        .await
+        .expect("materialize URI authority");
+    assert_eq!(
+        requests.lock().expect("requests")[0]
+            .headers
+            .get("host")
+            .expect("wire Host"),
+        "s3.eu-west-1.amazonaws.com"
+    );
+
     for forged in [
-        missing_host,
         conflicting_host,
         random_put_digest,
         random_get_digest,

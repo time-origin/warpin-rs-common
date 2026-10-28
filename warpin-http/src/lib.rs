@@ -25,3 +25,5 @@ pub use server::serve;
 pub use adapter::{ApiAdapter, OpenAICompatibleAdapter};
 pub use client::EndpointClient;
 pub use endpoint::{ResolvedEndpoint, build_auth_headers};
+
+pub mod transport;

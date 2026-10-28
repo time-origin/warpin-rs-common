@@ -8,6 +8,7 @@ repository.workspace = true
 description = "HTTP server, router, and middleware for the Warpin framework"
 
 [dependencies]
+warpin-transport.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -22,6 +23,9 @@ utoipa.workspace = true
 uuid.workspace = true
 warpin-config.workspace = true
 warpin-errors.workspace = true
+
+url.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

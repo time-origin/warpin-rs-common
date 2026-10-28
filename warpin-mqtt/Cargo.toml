@@ -1,0 +1,20 @@
+[package]
+name = "warpin-mqtt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Caller-driven MQTT 3.1.1 and 5.0 sessions with bounded queues and TLS"
+readme = "README.md"
+
+[dependencies]
+native-tls.workspace = true
+rustls.workspace = true
+warpin-transport.workspace = true
+tokio.workspace = true
+rumqttc.workspace = true
+warpin-errors.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

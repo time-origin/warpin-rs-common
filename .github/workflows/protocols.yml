@@ -1,0 +1,26 @@
+name: Protocol adapters
+on:
+  push:
+  pull_request:
+jobs:
+  protocols:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libssl-dev pkg-config mosquitto
+      - if: runner.os == 'macOS'
+        run: brew install mosquitto
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p warpin-http -p warpin-transport -p warpin-mqtt -p warpin-modbus --all-targets --all-features -- -D warnings
+      - run: cargo test -p warpin-http -p warpin-transport -p warpin-mqtt -p warpin-modbus --all-features
+      - run: MOSQUITTO_BIN="$(command -v mosquitto)" cargo test -p warpin-mqtt --test broker -- --ignored
+      - run: cargo run -p warpin-transport --example loopback
+      - run: cargo install cargo-audit --locked
+      - run: python3 scripts/check-protocol-security.py --target "$(rustc -vV | sed -n 's/^host: //p')"

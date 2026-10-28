@@ -2088,6 +2088,14 @@ mod tests {
             let address = listener.local_addr().expect("oversized provider address");
             let provider = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.expect("accept decode request");
+                // Wait for the request before responding; an unsolicited response
+                // can be rejected by hyper before the client writes its headers.
+                use tokio::io::AsyncReadExt;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 4096, "bounded test request");
+                    request.push(socket.read_u8().await.expect("read request header"));
+                }
                 socket
                     .write_all(response_head.as_bytes())
                     .await
@@ -2111,6 +2119,12 @@ mod tests {
             assert_no_sentinel(&rendered);
             assert!(rendered.contains("dingtalk_response_decode_failed"));
             provider.abort();
+            assert!(
+                provider
+                    .await
+                    .expect_err("provider cancelled")
+                    .is_cancelled()
+            );
         }
     }
 
