@@ -1,0 +1,29 @@
+[package]
+name = "warpin-workspace"
+version = "0.1.0"
+edition.workspace = true
+rust-version = "1.94"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Fenced workspace reservations and fixed-capacity Linux filesystem allocations"
+readme = "README.md"
+include = ["src/**", "tests/**", "examples/**", "Cargo.toml", "LICENSE", "README.md"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+warpin-integrity.workspace = true
+warpin-storage = { path = "../warpin-storage", version = "0.2.6" }
+sea-orm.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+url.workspace = true

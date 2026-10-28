@@ -11,6 +11,7 @@ members = [
     "warpin-context",
     "warpin-observability",
     "warpin-storage",
+    "warpin-workspace",
     "warpin-object-storage",
     "warpin-event-bus",
     "warpin-capability",

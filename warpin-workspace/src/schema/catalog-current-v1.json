@@ -1,0 +1,571 @@
+{
+  "columns": [
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": false,
+      "table": "warpin_workspace_allocations_pool_v1",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "notNull": false,
+      "table": "warpin_workspace_allocations_pool_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "allocation_id",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "uuid"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "reserved_bytes",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "reserved_inodes",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "record_json",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "jsonb"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "record_digest",
+      "notNull": true,
+      "table": "warpin_workspace_allocations_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "allocation_id",
+      "notNull": false,
+      "table": "warpin_workspace_allocations_v1_pkey",
+      "type": "uuid"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": true,
+      "table": "warpin_workspace_pool_authorities_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "authority_json",
+      "notNull": true,
+      "table": "warpin_workspace_pool_authorities_v1",
+      "type": "jsonb"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "authority_digest",
+      "notNull": true,
+      "table": "warpin_workspace_pool_authorities_v1",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": false,
+      "table": "warpin_workspace_pool_authorities_v1_pkey",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": true,
+      "table": "warpin_workspace_pools_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "maximum_bytes",
+      "notNull": true,
+      "table": "warpin_workspace_pools_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "maximum_inodes",
+      "notNull": true,
+      "table": "warpin_workspace_pools_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "reserved_bytes",
+      "notNull": true,
+      "table": "warpin_workspace_pools_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "reserved_inodes",
+      "notNull": true,
+      "table": "warpin_workspace_pools_v1",
+      "type": "bigint"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "pool_id",
+      "notNull": false,
+      "table": "warpin_workspace_pools_v1_pkey",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "migration_id",
+      "notNull": true,
+      "table": "warpin_workspace_schema_versions_v1",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "migration_checksum",
+      "notNull": true,
+      "table": "warpin_workspace_schema_versions_v1",
+      "type": "text"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "catalog_digest",
+      "notNull": true,
+      "table": "warpin_workspace_schema_versions_v1",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "CURRENT_TIMESTAMP",
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "installed_at",
+      "notNull": true,
+      "table": "warpin_workspace_schema_versions_v1",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": "collation \"default\"",
+      "default": null,
+      "dimensions": 0,
+      "generated": "",
+      "identity": "",
+      "name": "migration_id",
+      "notNull": false,
+      "table": "warpin_workspace_schema_versions_v1_pkey",
+      "type": "text"
+    }
+  ],
+  "constraints": [
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (allocation_id)",
+      "kind": "p",
+      "name": "warpin_workspace_allocations_v1_pkey",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (pool_id) REFERENCES warpin_workspace_pools_v1(pool_id)",
+      "kind": "f",
+      "name": "warpin_workspace_allocations_v1_pool_id_fkey",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (record_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_allocations_v1_record_digest_check",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (jsonb_typeof(record_json) = 'object'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_allocations_v1_record_json_check",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (reserved_bytes > 0)",
+      "kind": "c",
+      "name": "warpin_workspace_allocations_v1_reserved_bytes_check",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (reserved_inodes > 0)",
+      "kind": "c",
+      "name": "warpin_workspace_allocations_v1_reserved_inodes_check",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (state = ANY (ARRAY['RESERVED'::text, 'PROVISIONED'::text, 'LAUNCHING'::text, 'ACTIVE'::text, 'RETAINED'::text, 'QUIESCENT'::text, 'RELEASED'::text]))",
+      "kind": "c",
+      "name": "warpin_workspace_allocations_v1_state_check",
+      "table": "warpin_workspace_allocations_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (authority_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_pool_authorities_v1_authority_digest_check",
+      "table": "warpin_workspace_pool_authorities_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (jsonb_typeof(authority_json) = 'object'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_pool_authorities_v1_authority_json_check",
+      "table": "warpin_workspace_pool_authorities_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (pool_id)",
+      "kind": "p",
+      "name": "warpin_workspace_pool_authorities_v1_pkey",
+      "table": "warpin_workspace_pool_authorities_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (pool_id) REFERENCES warpin_workspace_pools_v1(pool_id)",
+      "kind": "f",
+      "name": "warpin_workspace_pool_authorities_v1_pool_id_fkey",
+      "table": "warpin_workspace_pool_authorities_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (reserved_bytes >= 0 AND reserved_bytes <= maximum_bytes)",
+      "kind": "c",
+      "name": "warpin_workspace_pools_v1_check",
+      "table": "warpin_workspace_pools_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (reserved_inodes >= 0 AND reserved_inodes <= maximum_inodes)",
+      "kind": "c",
+      "name": "warpin_workspace_pools_v1_check1",
+      "table": "warpin_workspace_pools_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (maximum_bytes > 0)",
+      "kind": "c",
+      "name": "warpin_workspace_pools_v1_maximum_bytes_check",
+      "table": "warpin_workspace_pools_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (maximum_inodes > 0)",
+      "kind": "c",
+      "name": "warpin_workspace_pools_v1_maximum_inodes_check",
+      "table": "warpin_workspace_pools_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (pool_id)",
+      "kind": "p",
+      "name": "warpin_workspace_pools_v1_pkey",
+      "table": "warpin_workspace_pools_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (catalog_digest ~ '^sha256:[0-9a-f]{64}$'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_schema_versions_v1_catalog_digest_check",
+      "table": "warpin_workspace_schema_versions_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (migration_checksum ~ '^sha256:[0-9a-f]{64}$'::text)",
+      "kind": "c",
+      "name": "warpin_workspace_schema_versions_v1_migration_checksum_check",
+      "table": "warpin_workspace_schema_versions_v1",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (migration_id)",
+      "kind": "p",
+      "name": "warpin_workspace_schema_versions_v1_pkey",
+      "table": "warpin_workspace_schema_versions_v1",
+      "validated": true
+    }
+  ],
+  "functions": [],
+  "indexes": [
+    {
+      "accessMethod": "btree",
+      "attributeCount": 2,
+      "keyCount": 2,
+      "keys": [
+        "pool_id",
+        "state"
+      ],
+      "name": "warpin_workspace_allocations_pool_v1",
+      "predicate": null,
+      "primary": false,
+      "ready": true,
+      "table": "warpin_workspace_allocations_v1",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "accessMethod": "btree",
+      "attributeCount": 1,
+      "keyCount": 1,
+      "keys": [
+        "allocation_id"
+      ],
+      "name": "warpin_workspace_allocations_v1_pkey",
+      "predicate": null,
+      "primary": true,
+      "ready": true,
+      "table": "warpin_workspace_allocations_v1",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "accessMethod": "btree",
+      "attributeCount": 1,
+      "keyCount": 1,
+      "keys": [
+        "pool_id"
+      ],
+      "name": "warpin_workspace_pool_authorities_v1_pkey",
+      "predicate": null,
+      "primary": true,
+      "ready": true,
+      "table": "warpin_workspace_pool_authorities_v1",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "accessMethod": "btree",
+      "attributeCount": 1,
+      "keyCount": 1,
+      "keys": [
+        "pool_id"
+      ],
+      "name": "warpin_workspace_pools_v1_pkey",
+      "predicate": null,
+      "primary": true,
+      "ready": true,
+      "table": "warpin_workspace_pools_v1",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "accessMethod": "btree",
+      "attributeCount": 1,
+      "keyCount": 1,
+      "keys": [
+        "migration_id"
+      ],
+      "name": "warpin_workspace_schema_versions_v1_pkey",
+      "predicate": null,
+      "primary": true,
+      "ready": true,
+      "table": "warpin_workspace_schema_versions_v1",
+      "unique": true,
+      "valid": true
+    }
+  ],
+  "inheritance": [],
+  "tables": [
+    {
+      "forceRowSecurity": false,
+      "kind": "r",
+      "name": "warpin_workspace_allocations_v1",
+      "options": null,
+      "persistence": "p",
+      "rowSecurity": false,
+      "rules": false
+    },
+    {
+      "forceRowSecurity": false,
+      "kind": "r",
+      "name": "warpin_workspace_pool_authorities_v1",
+      "options": null,
+      "persistence": "p",
+      "rowSecurity": false,
+      "rules": false
+    },
+    {
+      "forceRowSecurity": false,
+      "kind": "r",
+      "name": "warpin_workspace_pools_v1",
+      "options": null,
+      "persistence": "p",
+      "rowSecurity": false,
+      "rules": false
+    },
+    {
+      "forceRowSecurity": false,
+      "kind": "r",
+      "name": "warpin_workspace_schema_versions_v1",
+      "options": null,
+      "persistence": "p",
+      "rowSecurity": false,
+      "rules": false
+    }
+  ],
+  "triggers": []
+}
