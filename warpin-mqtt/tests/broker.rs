@@ -8,7 +8,7 @@ struct Broker {
     child: Child,
     path: std::path::PathBuf,
     port: u16,
-    tls_dir: Option<tempfile::TempDir>,
+    directory: tempfile::TempDir,
 }
 impl Drop for Broker {
     fn drop(&mut self) {
@@ -26,15 +26,23 @@ impl Broker {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
         let port = socket.local_addr().expect("addr").port();
         drop(socket);
-        let path =
-            std::env::temp_dir().join(format!("warpin-mqtt-{}-{port}.conf", std::process::id()));
-        let tls_dir = tls.then(tls_fixture);
+        let directory = match std::env::var("MOSQUITTO_TEST_ROOT") {
+            Ok(root) => tempfile::tempdir_in(root).expect("authorized broker fixture directory"),
+            Err(std::env::VarError::NotPresent) => {
+                tempfile::tempdir().expect("broker fixture directory")
+            }
+            Err(e) => panic!("invalid test directory: {e}"),
+        };
+        let path = directory.path().join("broker.conf");
+        if tls {
+            tls_fixture(directory.path());
+        }
         std::fs::write(
             &path,
             format!(
                 "listener {port} 127.0.0.1\nallow_anonymous {anonymous}\npersistence false\n{}",
                 if tls {
-                    let dir = tls_dir.as_ref().expect("TLS directory").path();
+                    let dir = directory.path();
                     format!(
                         "certfile {}\nkeyfile {}\ncafile {}\nrequire_certificate true\n",
                         dir.join("localhost.pem").display(),
@@ -58,7 +66,7 @@ impl Broker {
             child,
             path,
             port,
-            tls_dir,
+            directory,
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -271,7 +279,7 @@ async fn tls_and_authentication_rejection() {
         };
         let b = Broker::configured(true, true).await;
         let mut conf = config(b.port, version());
-        let dir = b.tls_dir.as_ref().expect("TLS directory").path();
+        let dir = b.directory.path();
         let identity = warpin_transport::tls::Identity {
             certificate_pem: std::fs::read(dir.join("localhost.pem")).expect("certificate"),
             private_key_pem: std::fs::read(dir.join("localhost.key")).expect("private test key"),
@@ -298,11 +306,10 @@ async fn tls_and_authentication_rejection() {
     }
 }
 
-fn tls_fixture() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("TLS tempdir");
+fn tls_fixture(dir: &std::path::Path) {
     let run = |args: &[&str]| {
         let output = Command::new("openssl")
-            .current_dir(dir.path())
+            .current_dir(dir)
             .args(args)
             .output()
             .expect("openssl test dependency");
@@ -339,7 +346,7 @@ fn tls_fixture() -> tempfile::TempDir {
         "-subj",
         "/CN=localhost",
     ]);
-    std::fs::write(dir.path().join("server.ext"),"subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n").expect("extensions");
+    std::fs::write(dir.join("server.ext"),"subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n").expect("extensions");
     run(&[
         "x509",
         "-req",
@@ -357,7 +364,6 @@ fn tls_fixture() -> tempfile::TempDir {
         "-extfile",
         "server.ext",
     ]);
-    dir
 }
 
 #[tokio::test]

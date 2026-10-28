@@ -24,3 +24,5 @@ warpin-mqtt = "0.2.11"
 容量：队列 `1..65536`、packet `128..16 MiB`、in-flight `1..65535`、保活 `5..65535 s`、连接超时 `1..3600 s`（整秒使用）、退避 `>0..3600 s`。应按 `(queue_capacity + max_in_flight) × max_packet_bytes` 预算出站载荷内存，再计入入站与底层开销。应用保存 Event 的队列仍需自行设上限。
 
 验证：`cargo test -p warpin-mqtt`；真实 Broker 套件需 `MOSQUITTO_BIN=/path/to/mosquitto cargo test -p warpin-mqtt --test broker -- --ignored`。测试自行创建 loopback Broker、清理进程，不连接生产服务。
+
+Linux 的发行版 Mosquitto 若受 AppArmor 约束，可显式设置 `MOSQUITTO_TEST_ROOT` 为系统策略允许且当前用户拥有的测试目录（CI 使用 `/etc/mosquitto/certs/warpin-ci`）。测试在其中创建独立临时子目录并清理；不修改生产配置或关闭系统策略。配置错误及 Broker stderr 会明确显示。
