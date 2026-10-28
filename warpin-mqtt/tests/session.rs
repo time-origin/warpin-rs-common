@@ -49,6 +49,12 @@ fn queue_capacity_validation_and_redaction() {
         assert_eq!(e.kind, Kind::Capacity);
         assert!(!format!("{e:?}").contains("password"));
     }
+    let mut fractional = config();
+    fractional.connect_timeout = Duration::from_millis(1500);
+    assert!(
+        Client::new(fractional).is_err(),
+        "wire seconds must not be silently truncated"
+    );
     let mut conf = config();
     conf.keep_alive = Duration::from_secs(1);
     assert!(Client::new(conf).is_err());

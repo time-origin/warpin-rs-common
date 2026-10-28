@@ -88,9 +88,15 @@ impl Config {
         if !text(&self.client_id)
             || self.host.is_empty()
             || self.host.len() > 253
+            || self
+                .host
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
             || (self.host.parse::<std::net::IpAddr>().is_err()
                 && self.host.contains(['/', ':', '@', '?', '#', ' ']))
             || self.port == 0
+            || self.keep_alive.subsec_nanos() != 0
+            || self.connect_timeout.subsec_nanos() != 0
             || self.keep_alive.as_secs() < 5
             || self.keep_alive > Duration::from_secs(65535)
             || self.connect_timeout.as_secs() == 0
