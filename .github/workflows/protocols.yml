@@ -23,4 +23,8 @@ jobs:
       - run: MOSQUITTO_BIN="$(command -v mosquitto)" cargo test -p warpin-mqtt --test broker -- --ignored
       - run: cargo run -p warpin-transport --example loopback
       - run: cargo install cargo-audit --locked
-      - run: python3 scripts/check-protocol-security.py --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - name: Check active dependency advisories
+        shell: bash
+        run: |
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          python3 scripts/check-protocol-security.py --target "$target"
