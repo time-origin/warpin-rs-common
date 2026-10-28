@@ -9,6 +9,8 @@ pub const BAD_REQUEST: ResultCode = 400;
 pub const UNAUTHORIZED: ResultCode = 401;
 pub const FORBIDDEN: ResultCode = 403;
 pub const NOT_FOUND: ResultCode = 404;
+pub const CONFLICT: ResultCode = 409;
+pub const UNPROCESSABLE_ENTITY: ResultCode = 422;
 pub const INTERNAL_ERROR: ResultCode = 500;
 pub const SERVICE_UNAVAILABLE: ResultCode = 503;
 
@@ -19,6 +21,8 @@ pub fn default_message(code: ResultCode) -> &'static str {
         UNAUTHORIZED => "Unauthorized",
         FORBIDDEN => "Forbidden",
         NOT_FOUND => "Resource not found",
+        CONFLICT => "Conflict",
+        UNPROCESSABLE_ENTITY => "Unprocessable entity",
         INTERNAL_ERROR => "Server internal error, please try again later",
         SERVICE_UNAVAILABLE => "Service unavailable",
         _ => "Server internal error, please try again later",
@@ -27,7 +31,8 @@ pub fn default_message(code: ResultCode) -> &'static str {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ResultObject<T> {
-    /// 业务状态码：200=成功, 400=参数错误, 401=未认证, 403=禁止, 404=未找到, 500=内部错误
+    /// 业务状态码：200=成功, 400=参数错误, 401=未认证, 403=禁止, 404=未找到,
+    /// 409=资源冲突, 422=语义校验失败, 500=内部错误, 503=服务不可用
     pub code: ResultCode,
     /// 业务数据
     pub data: Option<T>,
@@ -115,6 +120,14 @@ impl ServiceError {
         Self::with_message(NOT_FOUND, message)
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::with_message(CONFLICT, message)
+    }
+
+    pub fn unprocessable_entity(message: impl Into<String>) -> Self {
+        Self::with_message(UNPROCESSABLE_ENTITY, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::with_message(INTERNAL_ERROR, message)
     }
@@ -126,3 +139,27 @@ impl ServiceError {
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
 pub type PlatformError = ServiceError;
+
+#[cfg(test)]
+mod tests {
+    use super::{CONFLICT, ServiceError, UNPROCESSABLE_ENTITY, default_message};
+
+    #[test]
+    fn exposes_conflict_error_contract() {
+        let error = ServiceError::conflict("resource revision changed");
+        assert_eq!(error.code, CONFLICT);
+        assert_eq!(error.message, "resource revision changed");
+        assert_eq!(default_message(CONFLICT), "Conflict");
+    }
+
+    #[test]
+    fn exposes_unprocessable_entity_error_contract() {
+        let error = ServiceError::unprocessable_entity("validation failed");
+        assert_eq!(error.code, UNPROCESSABLE_ENTITY);
+        assert_eq!(error.message, "validation failed");
+        assert_eq!(
+            default_message(UNPROCESSABLE_ENTITY),
+            "Unprocessable entity"
+        );
+    }
+}

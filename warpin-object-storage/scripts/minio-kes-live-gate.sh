@@ -241,8 +241,10 @@ load_validated_one_shot_record_file() {
     local LC_ALL=C
     local actual_bytes
     actual_bytes="$(wc -c <"${record_file}")" || return 1
-    if [[ ! "${actual_bytes}" =~ ^[0-9]+$ ]] \
-        || (( actual_bytes > KES_ONE_SHOT_MAX_RECORD_FILE_BYTES )); then
+    # BSD wc pads counts with whitespace; validate before using shell arithmetic.
+    [[ "${actual_bytes}" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]] || return 1
+    actual_bytes="${BASH_REMATCH[1]}"
+    if (( actual_bytes > KES_ONE_SHOT_MAX_RECORD_FILE_BYTES )); then
         return 1
     fi
     local -a validated_records=()

@@ -1,6 +1,6 @@
 [package]
 name = "warpin-workspace"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version = "1.94"
 license.workspace = true
@@ -18,7 +18,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 warpin-integrity.workspace = true
-warpin-storage = { path = "../warpin-storage", version = "0.2.6" }
+warpin-storage.workspace = true
 sea-orm.workspace = true
 tokio.workspace = true
 

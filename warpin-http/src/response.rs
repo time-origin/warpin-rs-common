@@ -122,6 +122,18 @@ impl ApiError {
         }
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            error: ServiceError::conflict(message),
+        }
+    }
+
+    pub fn unprocessable_entity(message: impl Into<String>) -> Self {
+        Self {
+            error: ServiceError::unprocessable_entity(message),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             error: ServiceError::internal(message),
@@ -230,5 +242,40 @@ mod tests {
             body,
             json!({"code":200,"data":{"value":1},"count":0,"msg":"SUCCESS"})
         );
+    }
+}
+
+#[cfg(test)]
+mod local_error_constructor_tests {
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use serde_json::Value;
+
+    use super::ApiError;
+
+    async fn response_json(error: ApiError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should be readable");
+        let json = serde_json::from_slice(&body).expect("response body should be valid JSON");
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn conflict_maps_to_http_409() {
+        let (status, body) = response_json(ApiError::conflict("revision conflict")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], 409);
+        assert_eq!(body["msg"], "revision conflict");
+    }
+
+    #[tokio::test]
+    async fn unprocessable_entity_maps_to_http_422() {
+        let (status, body) =
+            response_json(ApiError::unprocessable_entity("validation failed")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], 422);
+        assert_eq!(body["msg"], "validation failed");
     }
 }
