@@ -41,6 +41,37 @@ fn legacy_bytes_and_explicit_format_are_stable() {
 }
 
 #[test]
+fn references_do_not_double_count_expanded_source_nodes() {
+    // 66,001 source nodes fit the existing bound. Reference indirections used
+    // to count again, rejecting the encoder's own small compressed document.
+    let sources = [
+        json!(vec![
+            vec!["neutral repeated directory reference body"; 10];
+            6000
+        ]),
+        json!(vec!["neutral repeated directory reference body"; 60_000]),
+    ];
+    for (shape, source) in sources.into_iter().enumerate() {
+        for format in [V2, ObjectTableFormat::IndexedV1] {
+            // V1's longer reference key makes this flat document exceed 1 MiB.
+            let wire_budget = if shape == 1 && format == ObjectTableFormat::IndexedV1 {
+                assert!(object_table_encode_with_format(&source, format, limits()).is_err());
+                2 * 1024 * 1024
+            } else {
+                1024 * 1024
+            };
+            let limits = ObjectTableLimits::new(wire_budget, 16 * 1024 * 1024).unwrap();
+            let wire = object_table_encode_with_format(&source, format, limits).unwrap();
+            assert!(wire.len() < wire_budget);
+            assert_eq!(
+                object_table_decode_with_format(&wire, format, limits).unwrap(),
+                source
+            );
+        }
+    }
+}
+
+#[test]
 fn short_references_roundtrip_complete_values_and_capture_once() {
     let value = json!({"rows": (0..95).map(|i| json!({"id":i,"instructions":source(),"parameters":{"required":true,"order":[2,1]}})).collect::<Vec<_>>()});
     let wire = object_table_encode_with_format(&value, V2, limits()).unwrap();

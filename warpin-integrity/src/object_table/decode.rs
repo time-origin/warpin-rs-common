@@ -15,14 +15,14 @@ pub(super) fn run(
     }
     parse_json_strict_with_limits(
         std::str::from_utf8(raw).map_err(|_| IntegrityError::Canonicalization)?,
-        limits.encoded,
+        limits.encoded.object_table_wire(),
     )?;
     let document: Document =
         serde_json::from_slice(raw).map_err(|_| IntegrityError::Canonicalization)?;
     let mut work = Work::with_format(format);
     let _: Sha256Digest = document.source_digest.parse()?;
     if document.schema_version != format.schema()
-        || work.canonical(&document, limits.encoded)? != raw
+        || work.canonical(&document, limits.encoded.object_table_wire())? != raw
         || !unprofitable(&document, limits, &mut work)?.is_empty()
     {
         return Err(IntegrityError::Canonicalization);
@@ -83,8 +83,10 @@ impl Decoder<'_> {
         Ok(())
     }
     fn expand(&mut self, value: &Value, depth: usize) -> Result<Value, IntegrityError> {
-        self.work.node(depth)?;
         if let Some(index) = reference_index(value, self.work.format)? {
+            if depth > super::MAX_DEPTH {
+                return Err(IntegrityError::Canonicalization);
+            }
             let body = self
                 .document
                 .objects
@@ -107,6 +109,9 @@ impl Decoder<'_> {
             }
             return Ok(full);
         }
+        // References are wire indirections; the expanded body accounts for its
+        // own nodes. Counting both rejects valid sources after compression.
+        self.work.node(depth)?;
         match value {
             Value::Object(map) => {
                 self.charge(2 + map.len().saturating_sub(1))?;

@@ -13,7 +13,7 @@ pub(crate) fn parse_captured_json(
     input: &str,
     profile: CanonicalProfile,
 ) -> Result<CapturedValue, IntegrityError> {
-    parse_with_byte_budget(input, profile, MAX_INPUT_BYTES, false)
+    parse_with_byte_budget(input, profile, MAX_INPUT_BYTES, None)
 }
 
 pub(crate) fn parse_captured_json_with_limits(
@@ -21,14 +21,19 @@ pub(crate) fn parse_captured_json_with_limits(
     profile: CanonicalProfile,
     limits: CanonicalLimits,
 ) -> Result<CapturedValue, IntegrityError> {
-    parse_with_byte_budget(input, profile, limits.maximum_document_bytes(), true)
+    parse_with_byte_budget(
+        input,
+        profile,
+        limits.maximum_document_bytes(),
+        Some(limits.maximum_structure_nodes()),
+    )
 }
 
 fn parse_with_byte_budget(
     input: &str,
     profile: CanonicalProfile,
     maximum_bytes: usize,
-    bounded_structure: bool,
+    maximum_structure_nodes: Option<usize>,
 ) -> Result<CapturedValue, IntegrityError> {
     if input.len() > maximum_bytes {
         return Err(IntegrityError::InvalidJson { line: 1, column: 1 });
@@ -38,7 +43,7 @@ fn parse_with_byte_budget(
         bytes: input.as_bytes(),
         index: 0,
         profile,
-        bounded_structure,
+        maximum_structure_nodes,
         nodes: 0,
         collection_items: 0,
     };
@@ -56,7 +61,7 @@ struct Parser<'a> {
     bytes: &'a [u8],
     index: usize,
     profile: CanonicalProfile,
-    bounded_structure: bool,
+    maximum_structure_nodes: Option<usize>,
     nodes: usize,
     collection_items: usize,
 }
@@ -66,8 +71,8 @@ impl Parser<'_> {
         if depth > MAX_NESTING_DEPTH {
             return Err(self.invalid());
         }
-        if self.bounded_structure {
-            if self.nodes >= 100_000 {
+        if let Some(maximum) = self.maximum_structure_nodes {
+            if self.nodes >= maximum {
                 return Err(self.invalid());
             }
             self.nodes += 1;
@@ -218,8 +223,8 @@ impl Parser<'_> {
     }
 
     fn claim_collection_item(&mut self) -> Result<(), IntegrityError> {
-        if self.bounded_structure {
-            if self.collection_items >= 100_000 {
+        if let Some(maximum) = self.maximum_structure_nodes {
+            if self.collection_items >= maximum {
                 return Err(self.invalid());
             }
             self.collection_items += 1;

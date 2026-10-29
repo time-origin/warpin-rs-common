@@ -50,7 +50,7 @@ pub(super) fn run<T: Serialize + ?Sized>(
         };
         let rejected = unprofitable(&document, limits, &mut work)?;
         if rejected.is_empty() {
-            let raw = work.canonical(&document, limits.encoded)?;
+            let raw = work.canonical(&document, limits.encoded.object_table_wire())?;
             // Producer and strict consumer must agree on the complete value.
             if super::decode::run(&raw, limits, format)? != value {
                 return Err(IntegrityError::Canonicalization);

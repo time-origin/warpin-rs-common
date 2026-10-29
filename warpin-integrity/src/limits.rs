@@ -23,6 +23,7 @@ use crate::{CanonicalProfile, DigestBinding, IntegrityError, Sha256Digest, diges
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalLimits {
     maximum_document_bytes: usize,
+    maximum_structure_nodes: usize,
 }
 
 impl CanonicalLimits {
@@ -37,12 +38,26 @@ impl CanonicalLimits {
         }
         Ok(Self {
             maximum_document_bytes,
+            maximum_structure_nodes: 100_000,
         })
     }
 
     /// Returns the caller's exact aggregate byte ceiling.
     pub fn maximum_document_bytes(self) -> usize {
         self.maximum_document_bytes
+    }
+
+    pub(crate) fn object_table_wire(self) -> Self {
+        // Reference wrappers belong to the encoded document, not its expanded
+        // source. Each physical node/item consumes at least one wire byte.
+        Self {
+            maximum_structure_nodes: self.maximum_document_bytes,
+            ..self
+        }
+    }
+
+    pub(crate) fn maximum_structure_nodes(self) -> usize {
+        self.maximum_structure_nodes
     }
 }
 

@@ -12,7 +12,6 @@ use crate::{CanonicalLimits, CanonicalProfile, IntegrityError};
 const MAX_CAPTURE_DEPTH: usize = 128;
 const MAX_CAPTURE_NODES: usize = 100_000;
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
-const MAX_COLLECTION_ITEMS: usize = 100_000;
 
 struct CaptureBudget {
     profile: CanonicalProfile,
@@ -20,16 +19,22 @@ struct CaptureBudget {
     bytes: usize,
     collection_items: usize,
     maximum_bytes: usize,
+    maximum_structure_nodes: usize,
 }
 
 impl CaptureBudget {
-    fn new(profile: CanonicalProfile, maximum_bytes: usize) -> Self {
+    fn new(
+        profile: CanonicalProfile,
+        maximum_bytes: usize,
+        maximum_structure_nodes: usize,
+    ) -> Self {
         Self {
             profile,
             nodes: 0,
             bytes: 0,
             collection_items: 0,
             maximum_bytes,
+            maximum_structure_nodes,
         }
     }
 
@@ -42,7 +47,7 @@ impl CaptureBudget {
 
     fn claim_node(&mut self, depth: usize) -> Result<(), CaptureError> {
         Self::ensure_depth(depth)?;
-        if self.nodes >= MAX_CAPTURE_NODES {
+        if self.nodes >= self.maximum_structure_nodes {
             return Err(CaptureError);
         }
         self.nodes += 1;
@@ -77,7 +82,7 @@ impl CaptureBudget {
     }
 
     fn claim_collection_item(&mut self) -> Result<(), CaptureError> {
-        if self.collection_items >= MAX_COLLECTION_ITEMS {
+        if self.collection_items >= self.maximum_structure_nodes {
             return Err(CaptureError);
         }
         self.collection_items += 1;
@@ -85,7 +90,11 @@ impl CaptureBudget {
     }
 
     fn validate_size_hint(&self, hint: usize) -> Result<(), CaptureError> {
-        if hint > MAX_COLLECTION_ITEMS.saturating_sub(self.collection_items) {
+        if hint
+            > self
+                .maximum_structure_nodes
+                .saturating_sub(self.collection_items)
+        {
             return Err(CaptureError);
         }
         Ok(())
@@ -179,7 +188,7 @@ pub(crate) fn capture_typed<T>(
 where
     T: Serialize + ?Sized,
 {
-    capture_with_byte_budget(value, profile, MAX_CAPTURE_BYTES)
+    capture_with_byte_budget(value, profile, MAX_CAPTURE_BYTES, MAX_CAPTURE_NODES)
 }
 
 pub(crate) fn capture_typed_with_limits<T>(
@@ -190,18 +199,24 @@ pub(crate) fn capture_typed_with_limits<T>(
 where
     T: Serialize + ?Sized,
 {
-    capture_with_byte_budget(value, profile, limits.maximum_document_bytes())
+    capture_with_byte_budget(
+        value,
+        profile,
+        limits.maximum_document_bytes(),
+        limits.maximum_structure_nodes(),
+    )
 }
 
 fn capture_with_byte_budget<T>(
     value: &T,
     profile: CanonicalProfile,
     maximum_bytes: usize,
+    maximum_structure_nodes: usize,
 ) -> Result<CapturedValue, IntegrityError>
 where
     T: Serialize + ?Sized,
 {
-    let mut budget = CaptureBudget::new(profile, maximum_bytes);
+    let mut budget = CaptureBudget::new(profile, maximum_bytes, maximum_structure_nodes);
     value
         .serialize(CaptureSerializer {
             budget: &mut budget,
