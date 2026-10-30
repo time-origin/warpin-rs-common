@@ -13,7 +13,7 @@ pub(crate) fn parse_captured_json(
     input: &str,
     profile: CanonicalProfile,
 ) -> Result<CapturedValue, IntegrityError> {
-    parse_with_byte_budget(input, profile, MAX_INPUT_BYTES, None)
+    parse_with_byte_budget(input, profile, Some(MAX_INPUT_BYTES), None)
 }
 
 pub(crate) fn parse_captured_json_with_limits(
@@ -24,18 +24,25 @@ pub(crate) fn parse_captured_json_with_limits(
     parse_with_byte_budget(
         input,
         profile,
-        limits.maximum_document_bytes(),
+        Some(limits.maximum_document_bytes()),
         Some(limits.maximum_structure_nodes()),
     )
+}
+
+pub(crate) fn parse_captured_json_unbounded(
+    input: &str,
+    profile: CanonicalProfile,
+) -> Result<CapturedValue, IntegrityError> {
+    parse_with_byte_budget(input, profile, None, None)
 }
 
 fn parse_with_byte_budget(
     input: &str,
     profile: CanonicalProfile,
-    maximum_bytes: usize,
+    maximum_bytes: Option<usize>,
     maximum_structure_nodes: Option<usize>,
 ) -> Result<CapturedValue, IntegrityError> {
-    if input.len() > maximum_bytes {
+    if maximum_bytes.is_some_and(|max| input.len() > max) {
         return Err(IntegrityError::InvalidJson { line: 1, column: 1 });
     }
     let mut parser = Parser {
@@ -44,6 +51,7 @@ fn parse_with_byte_budget(
         index: 0,
         profile,
         maximum_structure_nodes,
+        bounded_tokens: maximum_bytes.is_some(),
         nodes: 0,
         collection_items: 0,
     };
@@ -62,13 +70,14 @@ struct Parser<'a> {
     index: usize,
     profile: CanonicalProfile,
     maximum_structure_nodes: Option<usize>,
+    bounded_tokens: bool,
     nodes: usize,
     collection_items: usize,
 }
 
 impl Parser<'_> {
     fn parse_value(&mut self, depth: usize) -> Result<CapturedValue, IntegrityError> {
-        if depth > MAX_NESTING_DEPTH {
+        if self.bounded_tokens && depth > MAX_NESTING_DEPTH {
             return Err(self.invalid());
         }
         if let Some(maximum) = self.maximum_structure_nodes {
@@ -173,7 +182,7 @@ impl Parser<'_> {
                 b'\\' => escaped = true,
                 b'"' => {
                     let raw = &self.input[start..self.index];
-                    if raw.len() > MAX_STRING_BYTES {
+                    if self.bounded_tokens && raw.len() > MAX_STRING_BYTES {
                         return Err(self.invalid());
                     }
                     return serde_json::from_str(raw).map_err(|_| self.invalid());
@@ -216,7 +225,7 @@ impl Parser<'_> {
         }
 
         let lexeme = &self.input[start..self.index];
-        if lexeme.len() > MAX_NUMBER_BYTES {
+        if self.bounded_tokens && lexeme.len() > MAX_NUMBER_BYTES {
             return Err(IntegrityError::Canonicalization);
         }
         parse_json_number(lexeme, self.profile).map(CapturedValue::Number)

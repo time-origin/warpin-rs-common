@@ -58,8 +58,8 @@ impl ObjectTableFormat {
 /// These bounds select a representation; they confer no application authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectTableLimits {
-    encoded: CanonicalLimits,
-    expanded: CanonicalLimits,
+    encoded: Option<CanonicalLimits>,
+    expanded: Option<CanonicalLimits>,
 }
 impl ObjectTableLimits {
     /// Rejects zero or budgets above the public 16 MiB hard ceiling.
@@ -68,8 +68,8 @@ impl ObjectTableLimits {
         maximum_expanded_bytes: usize,
     ) -> Result<Self, IntegrityError> {
         Ok(Self {
-            encoded: CanonicalLimits::new(maximum_encoded_bytes)?,
-            expanded: CanonicalLimits::new(maximum_expanded_bytes)?,
+            encoded: Some(CanonicalLimits::new(maximum_encoded_bytes)?),
+            expanded: Some(CanonicalLimits::new(maximum_expanded_bytes)?),
         })
     }
 }
@@ -87,6 +87,7 @@ struct Work {
     format: ObjectTableFormat,
     bytes: usize,
     nodes: usize,
+    bounded: bool,
 }
 impl Work {
     #[cfg(test)]
@@ -98,6 +99,7 @@ impl Work {
             format,
             bytes: 0,
             nodes: 0,
+            bounded: true,
         }
     }
     fn node(&mut self, depth: usize) -> Result<(), IntegrityError> {
@@ -105,7 +107,7 @@ impl Work {
             .nodes
             .checked_add(1)
             .ok_or(IntegrityError::Canonicalization)?;
-        if depth > MAX_DEPTH || self.nodes > MAX_NODES {
+        if self.bounded && (depth > MAX_DEPTH || self.nodes > MAX_NODES) {
             return Err(IntegrityError::Canonicalization);
         }
         Ok(())
@@ -113,15 +115,21 @@ impl Work {
     fn canonical(
         &mut self,
         value: &impl Serialize,
-        limit: CanonicalLimits,
+        limit: Option<CanonicalLimits>,
     ) -> Result<Vec<u8>, IntegrityError> {
-        let bytes =
-            canonical_bytes_with_profile_and_limits(value, CanonicalProfile::Rfc8785, limit)?;
+        let bytes = match limit {
+            Some(limit) => {
+                canonical_bytes_with_profile_and_limits(value, CanonicalProfile::Rfc8785, limit)?
+            }
+            None => {
+                crate::canonical_bytes_with_profile_unbounded(value, CanonicalProfile::Rfc8785)?
+            }
+        };
         self.bytes = self
             .bytes
             .checked_add(bytes.len())
             .ok_or(IntegrityError::Canonicalization)?;
-        if self.bytes > MAX_WORK_BYTES {
+        if self.bounded && self.bytes > MAX_WORK_BYTES {
             return Err(IntegrityError::Canonicalization);
         }
         Ok(bytes)
@@ -194,6 +202,48 @@ pub fn object_table_decode_with_format(
     limits: ObjectTableLimits,
 ) -> Result<Value, IntegrityError> {
     decode::run(encoded, limits, format)
+}
+
+/// Encodes the same lossless format without wire, expanded, node, depth or work
+/// quotas. Reserved keys, profitability and source-digest rules remain unchanged.
+pub fn object_table_encode_with_format_unbounded<T: Serialize + ?Sized>(
+    source: &T,
+    format: ObjectTableFormat,
+) -> Result<Vec<u8>, IntegrityError> {
+    encode::run(
+        source,
+        ObjectTableLimits {
+            encoded: None,
+            expanded: None,
+        },
+        format,
+    )
+}
+
+/// Strictly decodes the selected object-table format without resource quotas.
+/// Unresolved, cyclic, unused and nonprofitable references remain invalid.
+pub fn object_table_decode_with_format_unbounded(
+    document: &[u8],
+    format: ObjectTableFormat,
+) -> Result<Value, IntegrityError> {
+    decode::run(
+        document,
+        ObjectTableLimits {
+            encoded: None,
+            expanded: None,
+        },
+        format,
+    )
+}
+
+fn deserialize_unbounded<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T, IntegrityError> {
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    decoder.disable_recursion_limit();
+    let value = T::deserialize(&mut decoder).map_err(|_| IntegrityError::Canonicalization)?;
+    decoder
+        .end()
+        .map_err(|_| IntegrityError::Canonicalization)?;
+    Ok(value)
 }
 
 fn reference(index: &str, format: ObjectTableFormat) -> Value {

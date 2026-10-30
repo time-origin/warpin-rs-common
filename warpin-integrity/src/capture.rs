@@ -18,15 +18,15 @@ struct CaptureBudget {
     nodes: usize,
     bytes: usize,
     collection_items: usize,
-    maximum_bytes: usize,
-    maximum_structure_nodes: usize,
+    maximum_bytes: Option<usize>,
+    maximum_structure_nodes: Option<usize>,
 }
 
 impl CaptureBudget {
     fn new(
         profile: CanonicalProfile,
-        maximum_bytes: usize,
-        maximum_structure_nodes: usize,
+        maximum_bytes: Option<usize>,
+        maximum_structure_nodes: Option<usize>,
     ) -> Self {
         Self {
             profile,
@@ -38,16 +38,19 @@ impl CaptureBudget {
         }
     }
 
-    fn ensure_depth(depth: usize) -> Result<(), CaptureError> {
-        if depth > MAX_CAPTURE_DEPTH {
+    fn ensure_depth(&self, depth: usize) -> Result<(), CaptureError> {
+        if self.maximum_bytes.is_some() && depth > MAX_CAPTURE_DEPTH {
             return Err(CaptureError);
         }
         Ok(())
     }
 
     fn claim_node(&mut self, depth: usize) -> Result<(), CaptureError> {
-        Self::ensure_depth(depth)?;
-        if self.nodes >= self.maximum_structure_nodes {
+        self.ensure_depth(depth)?;
+        if self
+            .maximum_structure_nodes
+            .is_some_and(|max| self.nodes >= max)
+        {
             return Err(CaptureError);
         }
         self.nodes += 1;
@@ -61,7 +64,10 @@ impl CaptureBudget {
     }
 
     fn ensure_bytes(&self, bytes: usize) -> Result<(), CaptureError> {
-        if bytes > self.maximum_bytes.saturating_sub(self.bytes) {
+        if self
+            .maximum_bytes
+            .is_some_and(|max| bytes > max.saturating_sub(self.bytes))
+        {
             return Err(CaptureError);
         }
         Ok(())
@@ -70,7 +76,7 @@ impl CaptureBudget {
     fn ensure_string_bytes(&self, bytes: usize) -> Result<(), CaptureError> {
         // Expanding a document never expands one typed string/key beyond the
         // original aggregate bound. The default behavior remains identical.
-        if bytes > MAX_CAPTURE_BYTES {
+        if self.maximum_bytes.is_some() && bytes > MAX_CAPTURE_BYTES {
             return Err(CaptureError);
         }
         self.ensure_bytes(bytes)
@@ -82,7 +88,10 @@ impl CaptureBudget {
     }
 
     fn claim_collection_item(&mut self) -> Result<(), CaptureError> {
-        if self.collection_items >= self.maximum_structure_nodes {
+        if self
+            .maximum_structure_nodes
+            .is_some_and(|max| self.collection_items >= max)
+        {
             return Err(CaptureError);
         }
         self.collection_items += 1;
@@ -90,10 +99,9 @@ impl CaptureBudget {
     }
 
     fn validate_size_hint(&self, hint: usize) -> Result<(), CaptureError> {
-        if hint
-            > self
-                .maximum_structure_nodes
-                .saturating_sub(self.collection_items)
+        if self
+            .maximum_structure_nodes
+            .is_some_and(|max| hint > max.saturating_sub(self.collection_items))
         {
             return Err(CaptureError);
         }
@@ -188,7 +196,12 @@ pub(crate) fn capture_typed<T>(
 where
     T: Serialize + ?Sized,
 {
-    capture_with_byte_budget(value, profile, MAX_CAPTURE_BYTES, MAX_CAPTURE_NODES)
+    capture_with_byte_budget(
+        value,
+        profile,
+        Some(MAX_CAPTURE_BYTES),
+        Some(MAX_CAPTURE_NODES),
+    )
 }
 
 pub(crate) fn capture_typed_with_limits<T>(
@@ -202,16 +215,23 @@ where
     capture_with_byte_budget(
         value,
         profile,
-        limits.maximum_document_bytes(),
-        limits.maximum_structure_nodes(),
+        Some(limits.maximum_document_bytes()),
+        Some(limits.maximum_structure_nodes()),
     )
+}
+
+pub(crate) fn capture_typed_unbounded<T: Serialize + ?Sized>(
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<CapturedValue, IntegrityError> {
+    capture_with_byte_budget(value, profile, None, None)
 }
 
 fn capture_with_byte_budget<T>(
     value: &T,
     profile: CanonicalProfile,
-    maximum_bytes: usize,
-    maximum_structure_nodes: usize,
+    maximum_bytes: Option<usize>,
+    maximum_structure_nodes: Option<usize>,
 ) -> Result<CapturedValue, IntegrityError>
 where
     T: Serialize + ?Sized,
@@ -731,14 +751,14 @@ impl MapKeySerializer<'_> {
     where
         T: fmt::Display,
     {
-        CaptureBudget::ensure_depth(self.depth)?;
+        self.budget.ensure_depth(self.depth)?;
         let value = value.to_string();
         self.budget.ensure_string_bytes(value.len())?;
         Ok(value)
     }
 
     fn capture_str(self, value: &str) -> Result<String, CaptureError> {
-        CaptureBudget::ensure_depth(self.depth)?;
+        self.budget.ensure_depth(self.depth)?;
         self.budget.ensure_string_bytes(value.len())?;
         Ok(value.to_owned())
     }
@@ -747,7 +767,7 @@ impl MapKeySerializer<'_> {
     where
         T: Serialize + ?Sized,
     {
-        CaptureBudget::ensure_depth(self.depth)?;
+        self.budget.ensure_depth(self.depth)?;
         value.serialize(Self {
             budget: self.budget,
             depth: self.depth + 1,

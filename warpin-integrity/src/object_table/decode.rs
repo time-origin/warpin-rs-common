@@ -10,19 +10,29 @@ pub(super) fn run(
     limits: ObjectTableLimits,
     format: ObjectTableFormat,
 ) -> Result<Value, IntegrityError> {
-    if raw.is_empty() || raw.len() > limits.encoded.maximum_document_bytes() {
+    if raw.is_empty()
+        || limits
+            .encoded
+            .is_some_and(|limit| raw.len() > limit.maximum_document_bytes())
+    {
         return Err(IntegrityError::Canonicalization);
     }
-    parse_json_strict_with_limits(
-        std::str::from_utf8(raw).map_err(|_| IntegrityError::Canonicalization)?,
-        limits.encoded.object_table_wire(),
-    )?;
-    let document: Document =
-        serde_json::from_slice(raw).map_err(|_| IntegrityError::Canonicalization)?;
+    let text = std::str::from_utf8(raw).map_err(|_| IntegrityError::Canonicalization)?;
+    let document: Document = if let Some(limit) = limits.encoded {
+        parse_json_strict_with_limits(text, limit.object_table_wire())?;
+        serde_json::from_slice(raw).map_err(|_| IntegrityError::Canonicalization)?
+    } else {
+        crate::parse_json_strict_unbounded(text)?;
+        super::deserialize_unbounded(raw)?
+    };
     let mut work = Work::with_format(format);
+    work.bounded = limits.expanded.is_some();
     let _: Sha256Digest = document.source_digest.parse()?;
     if document.schema_version != format.schema()
-        || work.canonical(&document, limits.encoded.object_table_wire())? != raw
+        || work.canonical(
+            &document,
+            limits.encoded.map(|limit| limit.object_table_wire()),
+        )? != raw
         || !unprofitable(&document, limits, &mut work)?.is_empty()
     {
         return Err(IntegrityError::Canonicalization);
@@ -40,7 +50,7 @@ pub(super) fn run(
         active: BTreeSet::new(),
         used: BTreeSet::new(),
         hashes: BTreeMap::new(),
-        remaining: limits.expanded.maximum_document_bytes(),
+        remaining: limits.expanded.map(|limit| limit.maximum_document_bytes()),
     };
     let full = decoder.expand(&document.root, 0)?;
     if decoder.used.len() != document.objects.len() {
@@ -72,19 +82,20 @@ struct Decoder<'a> {
     active: BTreeSet<String>,
     used: BTreeSet<String>,
     hashes: BTreeMap<String, String>,
-    remaining: usize,
+    remaining: Option<usize>,
 }
 impl Decoder<'_> {
     fn charge(&mut self, amount: usize) -> Result<(), IntegrityError> {
-        self.remaining = self
-            .remaining
-            .checked_sub(amount)
-            .ok_or(IntegrityError::Canonicalization)?;
+        if let Some(remaining) = &mut self.remaining {
+            *remaining = remaining
+                .checked_sub(amount)
+                .ok_or(IntegrityError::Canonicalization)?;
+        }
         Ok(())
     }
     fn expand(&mut self, value: &Value, depth: usize) -> Result<Value, IntegrityError> {
         if let Some(index) = reference_index(value, self.work.format)? {
-            if depth > super::MAX_DEPTH {
+            if self.work.bounded && depth > super::MAX_DEPTH {
                 return Err(IntegrityError::Canonicalization);
             }
             let body = self

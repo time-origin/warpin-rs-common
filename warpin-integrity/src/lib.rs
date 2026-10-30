@@ -32,7 +32,8 @@ pub use crate::limits::{
 
 pub use crate::object_table::{
     ObjectTableFormat, ObjectTableLimits, object_table_decode, object_table_decode_with_format,
-    object_table_encode, object_table_encode_with_format,
+    object_table_decode_with_format_unbounded, object_table_encode,
+    object_table_encode_with_format, object_table_encode_with_format_unbounded,
 };
 
 use crate::capture::{CapturedValue, capture_typed};
@@ -172,6 +173,44 @@ where
     canonicalize_captured(&capture_typed(value, profile)?)
 }
 
+/// Captures once without byte, string, node or depth quotas. Numeric profile
+/// semantics are unchanged; allocation and platform resource failures still apply.
+pub fn canonical_bytes_with_profile_unbounded<T: Serialize + ?Sized>(
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<Vec<u8>, IntegrityError> {
+    canonicalize_captured(&capture::capture_typed_unbounded(value, profile)?)
+}
+
+/// Strict JSON parsing without document or token quotas. Duplicate decoded keys
+/// and invalid RFC 8785 numbers are rejected exactly as in the bounded parser.
+pub fn parse_json_strict_unbounded(input: &str) -> Result<serde_json::Value, IntegrityError> {
+    json::parse_captured_json_unbounded(input, CanonicalProfile::Rfc8785)?.into_json()
+}
+
+/// Digests the same domain/profile wrapper without document or capture quotas.
+pub fn digest_bound_with_profile_unbounded<T: Serialize + ?Sized>(
+    binding: &DigestBinding,
+    value: &T,
+    profile: CanonicalProfile,
+) -> Result<Sha256Digest, IntegrityError> {
+    #[derive(Serialize)]
+    struct BoundValue<'a, T: ?Sized> {
+        domain: &'a str,
+        profile: &'a str,
+        value: &'a T,
+    }
+    canonical_bytes_with_profile_unbounded(
+        &BoundValue {
+            domain: &binding.domain,
+            profile: &binding.profile,
+            value,
+        },
+        profile,
+    )
+    .map(|bytes| digest_bytes(&bytes))
+}
+
 /// Strictly parses untrusted JSON using the complete RFC 8785 number model.
 ///
 /// Raw numbers are interpreted as ECMAScript binary64 values. Protocols that
@@ -283,3 +322,6 @@ mod tests;
 
 #[cfg(test)]
 mod limits_tests;
+
+#[cfg(test)]
+mod unbounded_tests;
