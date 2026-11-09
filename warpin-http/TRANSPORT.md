@@ -8,6 +8,8 @@
 
 `request(Method,path,HeaderMap,Vec<u8>)` 返回有界 `Response`。配置 `connect_timeout/read_timeout/total_timeout` 和请求/响应字节数、最大并发数；容量满立即报错，不排无限队列。HTTP 状态原样提供，4xx/5xx 不会伪装成业务成功；调用方必须检查 `status()` 后按厂商协议处理。JSON 请求可用 serde_json 显式编码，响应可用 `json::<T>()`。
 
+`download(Url)` 用于可信供应商返回的完整文件下载地址，保留其编码路径和签名查询参数。调用方为供应商文件 origin/path 建立 `Authentication::None` transport；入口仅执行 GET，目标必须仍在该 origin/path 内，并且不能包含用户信息或 fragment。此入口复用相同的连接、响应限长和截止时间处理。
+
 响应 `chunk/bytes/json` 共享请求开始时的总截止时间；逐块累计限长，不信任 Content-Length。持有 Response 期间占用并发许可，读取完成并释放/Drop 后归还。读取失败或被取消后该 Response 不可复用。默认禁用重定向、环境代理、自动重试和自动解压；压缩载荷作为原始有界字节返回，调用方若再解压必须设置解压后限制。
 
 POST/PUT/PATCH/DELETE 等可能改变状态的方法在发送期间超时/断连返回 OutcomeUnknown；不自动重发。收到状态/响应不代表设备动作完成。外部错误使用稳定 `ProtocolError.kind/phase`，转换成 ServiceError 后由现有 ApiError 边界展示 code/msg，原始 source 仅供内部诊断。

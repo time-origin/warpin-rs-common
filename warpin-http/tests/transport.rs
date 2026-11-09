@@ -188,3 +188,51 @@ async fn private_ca_https_and_wrong_name() {
     );
     h.await.expect("join");
 }
+
+#[tokio::test]
+async fn signed_download_preserves_exact_encoded_url_without_bearer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/files/", listener.local_addr().unwrap());
+    let client = HttpTransport::new(
+        &base,
+        Security::PlaintextAllowed,
+        Authentication::None,
+        limits(),
+    )
+    .unwrap();
+    let url = url::Url::parse(&format!(
+        "{base}image%20one.png?Signature=a%2Bb%2Fc%3D&Expires=123"
+    ))
+    .unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0u8; 4096];
+        let count = socket.read(&mut bytes).await.unwrap();
+        let request = String::from_utf8(bytes[..count].to_vec()).unwrap();
+        assert!(request.starts_with(
+            "GET /files/image%20one.png?Signature=a%2Bb%2Fc%3D&Expires=123 HTTP/1.1\r\n"
+        ));
+        assert!(!request.to_lowercase().contains("authorization:"));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\npng")
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        client.download(url).await.unwrap().bytes().await.unwrap(),
+        b"png"
+    );
+    peer.await.unwrap();
+    let wrong = url::Url::parse("http://other.invalid/files/image.png?Signature=sample").unwrap();
+    assert!(matches!(client.download(wrong).await, Err(e) if e.kind == Kind::Configuration));
+    let authenticated = HttpTransport::new(
+        &base,
+        Security::PlaintextAllowed,
+        Authentication::Bearer("sample".into()),
+        limits(),
+    )
+    .unwrap();
+    assert!(
+        matches!(authenticated.download(url::Url::parse(&format!("{base}x")).unwrap()).await, Err(e) if e.kind == Kind::Configuration)
+    );
+}

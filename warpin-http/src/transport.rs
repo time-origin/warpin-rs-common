@@ -170,6 +170,32 @@ impl HttpTransport {
         body: Vec<u8>,
     ) -> Result<Response> {
         let url = self.url(path)?;
+        self.execute(method, url, headers, body).await
+    }
+
+    /// GET an exact provider-issued URL, preserving its encoded path and signature.
+    /// Use an unauthenticated transport scoped to that trusted origin and path.
+    pub async fn download(&self, url: Url) -> Result<Response> {
+        if !self.headers.is_empty()
+            || url.origin() != self.base.origin()
+            || !url.path().starts_with(self.base.path())
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(error(Kind::Configuration, Phase::Configure));
+        }
+        self.execute(Method::GET, url, HeaderMap::new(), Vec::new())
+            .await
+    }
+
+    async fn execute(
+        &self,
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<Response> {
         if body.len() > self.limits.max_request_bytes {
             return Err(error(Kind::Capacity, Phase::Write));
         }
