@@ -965,7 +965,7 @@ fn validate_write(
     Ok(())
 }
 
-fn validate_content_type(content_type: &str) -> Result<(), ObjectStorageError> {
+pub(crate) fn validate_content_type(content_type: &str) -> Result<(), ObjectStorageError> {
     if content_type.is_empty()
         || content_type.len() > 255
         || content_type != content_type.trim()

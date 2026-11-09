@@ -60,7 +60,7 @@ builder construction or network I/O. Any future support requires a typed,
 self-owned, version-pinned credential provider with its own reviewed outbound
 contract; the AstroNexus Runtime R4 contract does not promise EKS or IRSA.
 
-The AWS feature pins `object_store` exactly to 0.14.0. That release retains the
+The AWS feature pins `object_store` exactly to 0.14.2. That release retains the
 URI authority as the real signed Host request header, which this security
 observer verifies. A dependency upgrade requires a contract review and real
 request-shape regression evidence.
@@ -74,6 +74,16 @@ warpin-object-storage = { version = "0.2", features = ["aws"] }
 
 `fs` is enabled by default. Enable `aws` for native AWS S3 or the reviewed
 MinIO/KES compatibility profile.
+
+Enable `references` for `objects::ObjectStorage` and serializable
+`objects::ObjectReference`. This ordinary object API uses the exact physical
+key supplied by the application, without prepending a context or directory.
+Persist the reference's bucket, complete key, available version/ETag, digest,
+size and media type in business metadata. Reads use that stored key directly;
+whole reads verify the content digest and Range reads use the stored version
+or ETag. The application owns key allocation, versioning and idempotency.
+These writes are normal PUTs and do not claim atomic create or encryption
+attestation. The existing `VerifiedObjectStorage` contract remains separate.
 
 ## Managed S3 usage
 

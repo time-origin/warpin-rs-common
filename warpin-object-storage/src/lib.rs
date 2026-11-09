@@ -1,4 +1,6 @@
 mod contract;
+#[cfg(feature = "references")]
+pub mod objects;
 #[cfg(feature = "obs")]
 pub mod obs_adapter;
 pub mod s3_adapter;
