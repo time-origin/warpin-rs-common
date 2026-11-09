@@ -42,6 +42,75 @@ pub struct ObjectStoreSettings {
 }
 
 impl ObjectStoreSettings {
+    /// Builds the common transport abstraction using complete bucket-relative keys.
+    /// This does not create a verified-write or managed-encryption attestation.
+    /// Callers of the verified artifact API must continue using `VerifiedObjectStorage`.
+    pub fn build_object_store(self) -> Result<Arc<dyn ObjectStore>, ObjectStorageError> {
+        let url = Url::parse(&self.url).map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+        if !matches!(url.path(), "" | "/") {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
+        if self.managed_encryption_profile_id.is_some()
+            || self.expected_observed_key_identity_fingerprint.is_some()
+            || !self.trusted_root_certificate_pems.is_empty()
+        {
+            return Err(ObjectStorageError::InvalidConfiguration);
+        }
+        if url.scheme() != "obs" {
+            self.validate()?;
+            let (store, _) = object_store::parse_url_opts(&url, self.options)
+                .map_err(map_backend_configuration_error)?;
+            return Ok(Arc::from(store));
+        }
+        #[cfg(not(feature = "obs"))]
+        return Err(ObjectStorageError::UnsupportedBackend);
+        #[cfg(feature = "obs")]
+        {
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(ObjectStorageError::InvalidConfiguration);
+            }
+            let mut options = self.options;
+            let endpoint = options
+                .remove("obs_endpoint")
+                .ok_or(ObjectStorageError::InvalidConfiguration)?;
+            let access_key_id = options
+                .remove("obs_access_key_id")
+                .ok_or(ObjectStorageError::InvalidConfiguration)?;
+            let secret_access_key = options
+                .remove("obs_secret_access_key")
+                .ok_or(ObjectStorageError::InvalidConfiguration)?;
+            let security_token = options.remove("obs_security_token");
+            let timeout = options
+                .remove("obs_request_timeout_seconds")
+                .ok_or(ObjectStorageError::InvalidConfiguration)?
+                .parse::<u64>()
+                .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+            if !options.is_empty() {
+                return Err(ObjectStorageError::InvalidConfiguration);
+            }
+            let credentials = crate::obs_adapter::ObsCredentials::new(
+                access_key_id,
+                secret_access_key,
+                security_token,
+            )
+            .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+            let store = crate::obs_adapter::ObsObjectStore::new(
+                &endpoint,
+                url.host_str()
+                    .ok_or(ObjectStorageError::InvalidConfiguration)?
+                    .to_owned(),
+                credentials,
+                std::time::Duration::from_secs(timeout),
+            )
+            .map_err(|_| ObjectStorageError::InvalidConfiguration)?;
+            Ok(Arc::new(store))
+        }
+    }
+
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),

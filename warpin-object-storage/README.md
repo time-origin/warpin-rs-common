@@ -278,3 +278,30 @@ recovery policy remain application responsibilities.
 
 Legacy 0.2.6 objects continue using `read_verified`; existing Bytes-based APIs and
 formats remain available. Upgrade readers before enabling chunked producers.
+# Native Huawei OBS transport
+
+Enable the optional `obs` feature to use `obs_adapter::ObsObjectStore`. It
+implements the same `ObjectStore` transport abstraction used by the S3/MinIO
+backend. `ObjectStoreSettings::build_object_store()` selects `obs://bucket`
+or an existing backend. Transport settings use bucket-only URLs: callers supply
+and persist the entire object key, including every directory component, without
+the bucket name. No hidden prefix is added.
+
+The calling application supplies `obs_endpoint`, `obs_access_key_id`,
+`obs_secret_access_key`, `obs_request_timeout_seconds`, and optionally
+`obs_security_token`. Configure actual values in the application's environment
+or Kubernetes Secret. The library has no application credential, environment
+variable name, or secret-file path. Native requests use the OBS signature and
+virtual-hosted HTTPS, with redirects and automatic retries disabled.
+
+The transport supports ordinary PUT, streamed GET, HEAD, standard byte ranges,
+conditional reads, exact-version reads/deletes, metadata, and expiring signed
+download URLs. Store bucket, complete key, version, ETag, length, and content
+digest in application metadata; never use a signed URL as the durable identity.
+
+Native OBS PUT does not document atomic create/update conditions. `PutMode::Create`
+and `PutMode::Update` return `NotSupported` before I/O. This transport does not
+claim the existing `VerifiedObjectStorage` immutable-write/encryption-attestation
+contract. Application adoption of that stronger API must resolve the backend
+semantics explicitly; a HEAD-then-PUT sequence is not an atomic substitute.
+Copy, bucket listing, and provider multipart upload are currently unsupported.

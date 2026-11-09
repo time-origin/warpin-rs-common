@@ -1,4 +1,6 @@
 mod contract;
+#[cfg(feature = "obs")]
+pub mod obs_adapter;
 pub mod s3_adapter;
 mod storage;
 
@@ -8,6 +10,10 @@ pub use contract::{
     EncryptionRequirementView, EncryptionVerifiedObjectWriteReceipt, ImmutableObjectWrite,
     ManagedEncryptionProfileId, ObjectDeleteOutcome, ObjectDeleteReceipt, ObjectKey,
     ObjectStorageError, ObjectWriteReceipt, VerifiedObject, VerifiedObjectDelete,
+};
+pub use object_store::{
+    Attribute, Attributes, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutOptions,
+    path::Path as ObjectPath,
 };
 pub use storage::{ObjectStoreSettings, VerifiedObjectStorage};
 
